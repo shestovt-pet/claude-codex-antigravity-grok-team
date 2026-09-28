@@ -5,7 +5,7 @@ const { z } = require('zod');
 const { Grok } = require('../../common/grok');
 const { format } = require('../../common/format');
 const access = require('../../common/access');
-const grok = new Grok(), server = new McpServer({ name: 'grok', version: '0.5.7' });
+const grok = new Grok(), server = new McpServer({ name: 'grok', version: '0.5.8' });
 function register(name, title, schema, fn) {
   if (!access.allowed('grok', name)) return;
   server.registerTool(name, { title, description: title,

@@ -14,7 +14,7 @@ const { format } = require('../../common/format');
 const { classifyCodex, retryPlan, codexQuota, quotaText, command } = require('../../common/quota');
 const { readCard, logFailure, guarded } = require('../../common/cards');
 const access = require('../../common/access');
-const VERSION = '0.5.7',
+const VERSION = '0.5.8',
   dir = path.resolve(process.env.MOST_CODEX_JOBS_DIR || path.join(stateDir, 'codex-jobs'));
 const archive =
   process.env.MOST_CODEX_ARCHIVE_DIR ||

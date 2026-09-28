@@ -141,6 +141,15 @@ test('Р4 случаи 8–9: отпечаток прежний по значе�
     assert.equal(fp.fingerprint(r), v, 'то же значение при внешних переменных');
   } finally { for (const [k, x] of [['GIT_OBJECT_DIRECTORY', saved.o], ['GIT_ALTERNATE_OBJECT_DIRECTORIES', saved.a]]) if (x === undefined) delete process.env[k]; else process.env[k] = x; }
   assert.deepEqual(fs.readdirSync(ext), [], 'во внешнюю папку объектов тоже ничего не записано');
+  // team-v13 Р2 (Codex 01dc3c59): только внешний GIT_OBJECT_DIRECTORY без alternates; только внешние alternates без объектов клона.
+  const only = path.join(RUN, 'fp-only-objects'), alt = path.join(RUN, 'fp-only-alt'); fs.mkdirSync(only); fs.mkdirSync(alt);
+  for (const [name, env] of [['только GIT_OBJECT_DIRECTORY', { GIT_OBJECT_DIRECTORY: only }], ['только alternates', { GIT_ALTERNATE_OBJECT_DIRECTORIES: alt }]]) {
+    const keep = { o: process.env.GIT_OBJECT_DIRECTORY, a: process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES };
+    delete process.env.GIT_OBJECT_DIRECTORY; delete process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES; Object.assign(process.env, env);
+    try { assert.equal(fp.fingerprint(r), v, name); }
+    finally { for (const [k, x] of [['GIT_OBJECT_DIRECTORY', keep.o], ['GIT_ALTERNATE_OBJECT_DIRECTORIES', keep.a]]) if (x === undefined) delete process.env[k]; else process.env[k] = x; }
+  }
+  assert.deepEqual([fs.readdirSync(only), fs.readdirSync(alt)], [[], []], 'во внешние папки ничего не записано');
   assert.deepEqual(files(path.join(r, '.git')), before);
 });
 
@@ -182,7 +191,7 @@ test('Р5–Р6: правила, README и порядок публикации',
     /только после этого/i, /state\\public-export\.json/, /2e8a6260/, /git read-tree HEAD/, /git add -A -f \./, /один в один/, /Отклонён/]) assert.match(p, re);
   assert.match(t('lessons.md'), /## 56\. /); assert.match(t('lessons.md'), /## 57\. /); assert.match(t('lessons.md'), /Повтор 28\.09 ~02:00/);
   assert.match(read(path.join(__dirname, 'run.js')), /'team-v12\.js'/);
-  assert.equal(require('../package.json').version, '0.5.7');
+  assert.match(require('../package.json').version, /^0\.5\.\d+$/);
 });
 
 (async () => {

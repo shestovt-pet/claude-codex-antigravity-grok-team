@@ -1,6 +1,6 @@
 {
   "name": "most",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "description": "Мост Cowork ↔ Antigravity: файлы возит мост, Antigravity на диск не пишет.",
   "main": "servers/antigravity/index.js",
   "private": true,

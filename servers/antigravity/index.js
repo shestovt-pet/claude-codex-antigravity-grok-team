@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Мост: Cowork ↔ Antigravity, версия 0.5.7.
+// Мост: Cowork ↔ Antigravity, версия 0.5.8.
 //
 // Файлы между диском и Antigravity возит мост, а не Claude:
 //   most_poruchit  — мост сам читает файл, сам отдаёт текст Antigravity;
@@ -34,7 +34,7 @@ const path = require("path");
 const crypto = require("crypto");
 
 const access = require('../../common/access');
-const VERSION = "0.5.7";
+const VERSION = "0.5.8";
 const isWindows = process.platform === "win32";
 const isLinux = process.platform === "linux";
 

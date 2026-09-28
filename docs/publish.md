@@ -19,11 +19,33 @@
    (глобальный git config не участвует); `git log -1 --format="%an <%ae> / %cn <%ce>"` — только noreply.
 3. Поиск запрещённых строк: `git grep -i -F -c <строка> HEAD` и по `git ls-files` — все 0.
 4. `git clone "$w\repo" "$w\check"`; там `npm ci`, `$env:MOST_AFTER_DEPLOY='off'`, `node tests/run.js` — 0 провалов.
-5. Установка в изолированном профиле в `"$w\check"`: USERPROFILE, APPDATA, LOCALAPPDATA — папки внутри `$w` с
-   поддельными конфигами Claude, Codex и Antigravity; `MOST_SETUP_NOPAUSE=1`; `.\setup.cmd --dry-run`, `.\setup.cmd`,
-   повтор `.\setup.cmd`. Настоящие конфиги не меняются (сверка LastWriteTime до и после).
+5. Установка в изолированном профиле в `"$w\check"`, всё в одном процессе PowerShell:
+   - убрать ВСЕ переменные MOST_* — среди них переопределения путей, которые важнее USERPROFILE и APPDATA
+     (Env:MOST_CLAUDE_CONFIGS, Env:MOST_CODEX_CONFIG, Env:MOST_AGY_MCP_CONFIG, Env:MOST_AGY_CONFIG,
+     Env:MOST_CODEX_RULES, Env:MOST_AGY_RULES, Env:MOST_REPO_ROOT, Env:MOST_STATE_DIR), и MOST_AFTER_DEPLOY из п. 4:
+     `Get-ChildItem Env:MOST_* | ForEach-Object { Remove-Item "Env:$($_.Name)" }`;
+   - `$p = "$w\profile"`; `$env:USERPROFILE=$p`; `$env:APPDATA="$p\AppData\Roaming"`; `$env:LOCALAPPDATA="$p\AppData\Local"`;
+     `$env:MOST_SETUP_NOPAUSE='1'`; проверка `Get-ChildItem Env:MOST_*` — нет ничего, кроме MOST_SETUP_NOPAUSE,
+     иначе остановка;
+   - поддельные файлы всех трёх приложений, в каждом — «чужая» запись для проверки сохранности:
+     `$p\AppData\Roaming\Claude\claude_desktop_config.json` = `{"mcpServers":{"other":{"command":"keep"}}}`;
+     `$p\.codex\config.toml` = строка `# мой текст`;
+     `$p\.gemini\config\mcp_config.json` = `{"mcpServers":{"mine":{"command":"keep"}}}`; `$p\.gemini\config\config.json` = `{}`;
+   - `.\setup.cmd --dry-run`, `.\setup.cmd`, повтор `.\setup.cmd`. Ожидается: найдены и подключены Claude, Codex и
+     Antigravity; записи `other`, `mine` и строка `# мой текст` сохранены; рядом с каждым файлом `.prev`; созданы
+     `$p\.codex\AGENTS.md` и `$p\.gemini\config\AGENTS.md`; повтор — «раздел связки актуален»; строки DEP0190 нет;
+     настоящие конфиги не меняются: до и после — `Test-Path`, и для существующих `(Get-Item <файл>).LastWriteTimeUtc`.
 6. Только после этого: `gh repo view <логин>/<имя>` — репозитория нет; затем в `"$w\repo"`
-   `gh repo create <логин>/<имя> --public --source . --remote origin --push --description "…"`.
+   `gh repo create <логин>/<имя> --public --source . --remote origin --description "…"` — БЕЗ `--push`
+   (его дочерний git push не получает `-c` и может открыть окно входа), затем явный push, как ниже.
+
+Вход для push — только через gh, без окна входа git и без изменения глобального git config. PowerShell:
+`git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin main`; cmd:
+`git -c credential.helper= -c "credential.helper=!gh auth git-credential" push origin main`. Голый `git push`
+не использовать.
+Клонирование публичного репозитория (`git clone`, `git clone --no-checkout`) — обычной командой без этого
+префикса: вход не нужен. Если команда ждёт окно входа дольше минуты — остановить её и сообщить
+(team-v12: первый push завис на git-credential-manager).
 7. `git ls-remote https://github.com/<логин>/<имя>.git main` — тот же хеш; клон с GitHub — тот же хеш, поиск
    запрещённых строк — 0.
 
@@ -41,12 +63,13 @@
 4. Коммит noreply как в п. 2 первой публикации; проверка автора и коммитера; родитель нового коммита — `$old`.
 5. Пп. 3–5 первой публикации (поиск запрещённых строк, прогон в клоне, установка в изолированном профиле).
    Любой провал — остановка, push не делается.
-6. `git push origin main` без `--force`. Отклонён — ветка на GitHub сдвинулась после п. 2: остановиться и
+6. Push через gh, как выше (PowerShell: `git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin main`), без `--force`. Отклонён — ветка на GitHub сдвинулась после п. 2: остановиться и
    сообщить, ничего не перезаписывать.
 7. `git ls-remote` и клон с GitHub — новый хеш, `HEAD^` = `$old`, поиск запрещённых строк — 0, состав файлов —
    как у выгрузки.
 
 Опубликованные коммиты: 2e8a6260 (28.09.2026, team-v11, первая публикация; в неё не попал
-`tests/.tmp-v6-restart-parse.ps1` — `git add -A` без `-f`, исправлено в порядке выше).
+`tests/.tmp-v6-restart-parse.ps1` — `git add -A` без `-f`, исправлено в порядке выше); 6016aa2d (28.09.2026,
+team-v12, обновление 0.5.7).
 
 Временные папки `$w` после сверки удаляются; оставить можно только по просьбе Claude для разбора сбоя.

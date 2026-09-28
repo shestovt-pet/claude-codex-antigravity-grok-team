@@ -767,7 +767,7 @@ class Team {
     });
     await section('Версия team', async () => {
       rows.push(
-        'team: версия процесса 0.5.7; версия на диске ' +
+        'team: версия процесса 0.5.8; версия на диске ' +
           read(path.join(__dirname, '../package.json')).version +
           '; файл процесса: ' +
           path.join(__dirname, '../servers/team/index.js'),

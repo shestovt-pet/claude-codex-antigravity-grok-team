@@ -118,6 +118,28 @@ test('Grok: чужой номер и материал, нет подписи, п
   }
   write(file, signed(job)); assert.equal((await grok.refresh(job.id)).status, 'done');
 });
+// team-v13 Р1, случаи 1–4: метка подписи в любом регистре, hex в любом регистре; подлинность — только HMAC.
+test('Grok: «Контроль» и «контроль» с верным HMAC приняты, с неверным — нет; hex заглавными; неполная строка', async () => {
+  const relabel = (buf, label, upper = false) => Buffer.from(buf.toString('utf8').replace(/КОНТРОЛЬ ([0-9a-f]{64})/, (m, h) => label + ' ' + (upper ? h.toUpperCase() : h)));
+  for (const [label, upper, body, eol] of [['Контроль', false], ['контроль', false], ['КОНТРОЛЬ', true], ['кОнТрОлЬ', false, 'Ёж и 😀 вне BMP\r\nПРИНЯТО', '\r\n']]) {
+    const job = await send(), p = captured.get(job.id);
+    write(p.reply_path, relabel(signed(job, body, p.secret_hex, eol), label, upper));
+    const done = await grok.refresh(job.id);
+    assert.equal(done.status, 'done', label); assert.equal(done.verdict, 'ПРИНЯТО');
+  }
+  const job = await send(), other = await send(), p = captured.get(job.id);
+  for (const answer of [relabel(signed(job, 'ПРИНЯТО', captured.get(other.id).secret_hex), 'контроль'),
+    Buffer.from(signed(job).toString('utf8').replace(/КОНТРОЛЬ ([0-9a-f]{64})/, (m, h) => 'Контроль ' + h.slice(1))),
+    Buffer.from(signed(job).toString('utf8').replace(/КОНТРОЛЬ ([0-9a-f]{64})/, (m, h) => 'Контроль ' + h.slice(1) + 'z')),
+    relabel(Buffer.from(signed(job).toString('utf8').replace('ПРИНЯТО', 'ПРИНЯТ0')), 'контроль')]) {
+    write(p.reply_path, answer);
+    const current = await grok.refresh(job.id);
+    assert.equal(current.status, 'running'); assert.match(current.reason, /подложный/);
+  }
+  write(p.reply_path, Buffer.from(signed(job).toString('utf8').replace('КОНЕЦ ОТВЕТА', '')));
+  assert.equal((await grok.refresh(job.id)).status, 'running', 'без «КОНЕЦ ОТВЕТА» — ещё пишется');
+  write(p.reply_path, signed(job)); assert.equal((await grok.refresh(job.id)).status, 'done');
+});
 test('Grok: изменённый бриф и секрет в ответе не принимаются', async () => {
   const job = await send(), p = captured.get(job.id);
   write(p.reply_path, signed(job, p.secret_hex + '\nПРИНЯТО'));

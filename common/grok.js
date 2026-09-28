@@ -47,7 +47,8 @@ function parseReply(snapshot) {
     .filter(line => line.text.trim());
   if (lines.at(-1)?.text !== 'КОНЕЦ ОТВЕТА') return null;
   const control = lines.at(-2);
-  const signature = control?.text.match(/^КОНТРОЛЬ ([a-f0-9]{64})$/)?.[1];
+  // Метка подписи — без учёта регистра (team-v13 Р1): подлинность даёт HMAC по байтам до этой строки, не слово.
+  const signature = control?.text.match(/^контроль ([0-9a-f]{64})$/iu)?.[1]?.toLowerCase();
   if (!signature) throw Error('подложный ответ: нет или неверна подпись');
   return { text, signature, payload: Buffer.from(text.slice(0, control.offset), 'utf8'),
     verdict: lines.at(-3)?.text, header: lines[0]?.text };
