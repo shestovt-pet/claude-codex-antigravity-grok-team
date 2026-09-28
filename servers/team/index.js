@@ -5,7 +5,7 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { z } = require('zod');
 const { Team } = require('../../common/team'),
   { format } = require('../../common/format');
-const server = new McpServer({ name: 'team', version: '0.5.6' }),
+const server = new McpServer({ name: 'team', version: '0.5.7' }),
   team = new Team();
 function register(name, title, description, inputSchema, fn) {
   if (!require('../../common/access').allowed('team', name)) return;

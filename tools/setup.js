@@ -7,16 +7,21 @@ const fs = require('fs'),
   path = require('path'),
   { execFileSync } = require('child_process');
 
-function run(cmd, args, cwd, shell = false) {
-  return execFileSync(cmd, args, { cwd, encoding: 'utf8', windowsHide: true, shell, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+function run(cmd, args, cwd) {
+  return execFileSync(cmd, args, { cwd, encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 // Проверки окружения: [{ ok, name, text }]. deps позволяют подменять проверки в тестах.
 function checks(root, deps = {}) {
   const platform = deps.platform || process.platform, node = deps.nodeVersion || process.versions.node;
   const has = deps.has || ((cmd) => {
-    // npm на Windows — npm.cmd; .cmd запускается только через оболочку.
-    const win = platform === 'win32' && cmd === 'npm';
-    try { run(win ? 'npm.cmd' : cmd, ['--version'], root, win); return true; } catch { return false; }
+    if (cmd === 'npm') {
+      // Установка ставит зависимости через npm-cli.js рядом с node (common/deploy.js install) — проверяется то же самое,
+      // без оболочки (team-v12 Р1: прежний вызов через оболочку печатал предупреждение Node.js DEP0190).
+      const cli = path.join(path.dirname(deps.execPath || process.execPath), 'node_modules/npm/bin/npm-cli.js');
+      try { if (fs.statSync(cli).isFile()) return true; } catch {}
+      if (platform === 'win32') return false;
+    }
+    try { run(cmd, ['--version'], root); return true; } catch { return false; }
   });
   const git = deps.git || ((args) => run('git', args, root));
   const exists = deps.exists || fs.existsSync;
@@ -24,8 +29,8 @@ function checks(root, deps = {}) {
   out.push({ ok: platform === 'win32', name: 'Windows', text: platform === 'win32' ? 'Windows' : 'нужен Windows 10 или 11: перезапуск Claude и подключения рассчитаны только на него' });
   const major = Number(node.split('.')[0]);
   out.push({ ok: major >= 18, name: 'Node.js', text: 'Node.js ' + node + (major >= 18 ? '' : ' — нужна версия 18 или новее: https://nodejs.org') });
-  const hint = { git: ' — поставьте Git for Windows: https://git-scm.com', tar: ' — в Windows 10/11 tar встроен, проверьте PATH', npm: ' — npm ставится вместе с Node.js: https://nodejs.org' };
-  for (const cmd of ['git', 'tar', 'npm']) { const ok = has(cmd); out.push({ ok, name: cmd, text: ok ? cmd + ' найден' : cmd + ' не найден в PATH' + hint[cmd] }); }
+  const hint = { git: ' — поставьте Git for Windows: https://git-scm.com', tar: ' — в Windows 10/11 tar встроен, проверьте PATH', npm: ' — рядом с Node.js нет npm: переустановите Node.js вместе с npm (https://nodejs.org)' };
+  for (const cmd of ['git', 'tar', 'npm']) { const ok = has(cmd); out.push({ ok, name: cmd, text: ok ? cmd + ' найден' : cmd + (cmd === 'npm' ? ' не найден' : ' не найден в PATH') + hint[cmd] }); }
   if (!exists(path.join(root, '.git'))) {
     out.push({ ok: true, name: 'клон', zip: true, text: 'папка без .git (скачана архивом ZIP): будет создан локальный репозиторий с одним коммитом' });
     return out;

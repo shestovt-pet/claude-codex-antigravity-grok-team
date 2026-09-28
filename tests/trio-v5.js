@@ -336,7 +336,7 @@ test('Р4 Р8: полный ответ краткой сводки уклады�
 test('Д3 Д5 Д6 Д7 Д8: собственные тексты, версия и уроки', () => {
   const root = path.resolve(__dirname, '..');
   assert.deepEqual(require('./interface-texts').inspect(root), []);
-  assert.equal(require('../package.json').version, '0.5.6');
+  assert.equal(require('../package.json').version, '0.5.7');
   const lessons = fs.readFileSync(path.join(root, 'lessons.md'), 'utf8');
   for (let n = 28; n <= 32; n++) { const section = lessons.split('## ' + n + '.')[1]?.split('\n## ')[0]; assert(section?.includes('Где закрыто:') && section.includes('Проверка')); }
   assert.match(fs.readFileSync(path.join(root, 'rules/common.md'), 'utf8'), /уже созданных изменений/);

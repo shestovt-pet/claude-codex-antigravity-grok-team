@@ -293,7 +293,7 @@ class Team {
     catch (e) { return 'Самопроверка: уроки не проверены — ' + e.message; }
     let print;
     try { print = 'Отпечаток кандидата: ' + require('./fingerprint').fingerprint(p.folder); } catch (e) { print = 'Отпечаток кандидата не получен: ' + e.message.split('\n')[0]; }
-    return pc.precheckText(pc.precheck({ folder: p.folder, designFile: p.c.designFile, lessonsDiff: diff })) + '\n' + print;
+    return pc.precheckText(pc.precheck({ folder: p.folder, designFile: p.c.designFile, lessonsDiff: diff, change: p.c })) + '\n' + print;
   }
   checkPair(a, p) {
     if (a.base !== p.c.base || a.candidate !== p.candidate || p.c.candidate !== p.candidate)
@@ -450,7 +450,8 @@ class Team {
         if (c.request && ['codex', 'antigravity'].some(who => {
           const v = (c.designVotes || []).filter(v => (v.replaces || v.who) === who).at(-1);
           return v?.decision !== 'ПРИНЯТО' || v.designHash !== c.designHash;
-        })) throw Error('Сначала ворота замысла: нужно ПРИНЯТО от Codex и Antigravity по замыслу ' + c.designHash);
+        })) throw Error('Сначала ворота замысла: нужно ПРИНЯТО от Codex и Antigravity по замыслу ' + c.designHash +
+          '\n' + require('./precheck').designVoteWarnings(c).map((w) => '- ' + w).join('\n'));
         if (!a.message?.trim()) throw Error('Нужно сообщение коммита.');
         const self = this.precheck(p);
         // Отпечаток прогона Grok (team-v9 Р1): кандидат должен совпасть с проверенным содержимым.
@@ -766,7 +767,7 @@ class Team {
     });
     await section('Версия team', async () => {
       rows.push(
-        'team: версия процесса 0.5.6; версия на диске ' +
+        'team: версия процесса 0.5.7; версия на диске ' +
           read(path.join(__dirname, '../package.json')).version +
           '; файл процесса: ' +
           path.join(__dirname, '../servers/team/index.js'),

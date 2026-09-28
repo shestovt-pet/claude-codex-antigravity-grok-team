@@ -298,7 +298,7 @@ test('Р5: README для новичка — установка git и ZIP, Grok 
     /state\\grok`, `works` и `.work`/, /Grok: мост настроен/, /Смена ключа/, /считается чужой/, /телеметрии нет/, /English summary/,
     /github\.com\/shestovt-pet\/claude-codex-antigravity-grok-team/]) assert.match(t, re);
   assert.match(read(path.join(ROOT, 'docs/architecture.md')), /## Что изменилось в версии 0\.5\.0/);
-  assert.match(read(path.join(ROOT, 'package.json')), /"version": "0\.5\.6"/);
+  assert.match(read(path.join(ROOT, 'package.json')), /"version": "0\.5\.\d+"/);
 });
 
 (async () => {

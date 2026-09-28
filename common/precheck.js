@@ -115,8 +115,38 @@ function checkLessons(folder, diff) {
   return { warnings, unrecognized };
 }
 
-function precheck({ folder, designFile, lessonsDiff }) {
+// team-v12 Р3: голоса по ТЕКУЩЕЙ редакции замысла видны до commit и merge. Хеш берётся из файла (карточка не
+// сохраняется); обязательные голоса — с учётом replaces, как в commit; Grok — по bound и состоянию записанного запроса.
+function designVoteWarnings(c) {
+  if (!c?.request || !c.designHash) return [];
+  let hash = c.designHash;
+  const out = [];
+  if (c.designFile) {
+    try {
+      hash = require('crypto').createHash('sha256').update(fs.readFileSync(c.designFile)).digest('hex');
+      if (hash !== c.designHash) out.push('файл замысла изменён после записи: ' + hash.slice(0, 8) + ' вместо ' + c.designHash.slice(0, 8) +
+        ' — голоса по прежней редакции не считаются, отправьте новую всем троим');
+    } catch (e) { return ['файл замысла не прочитан (' + e.message.split('\n')[0] + ') — голоса по замыслу не проверены']; }
+  }
+  const short = hash.slice(0, 8), names = { codex: 'Codex', antigravity: 'Antigravity' };
+  for (const who of ['codex', 'antigravity']) {
+    const v = (c.designVotes || []).filter((x) => (x.replaces || x.who) === who).at(-1);
+    if (!v || v.designHash !== hash) out.push(names[who] + ' не голосовал по замыслу ' + short + ': commit откажет — отправьте ему эту редакцию');
+    else if (v.decision !== 'ПРИНЯТО') out.push(names[who] + ': по замыслу ' + short + ' — ' + v.decision + '; commit откажет');
+  }
+  const g = c.grokDesign;
+  if (!g || g.designHash !== hash) out.push('Grok не запрошен по замыслу ' + short + ': merge откажет — отправьте ему эту редакцию');
+  else if (g.status === 'недоступен') out.push('Grok недоступен по замыслу ' + short + ': merge потребует абзац «Grok недоступен ' + (c.name || '<имя>') + ':» в lessons.md');
+  else if (['running', 'queued', 'delivery_unclear'].includes(g.status)) out.push('Grok: ждём ответ по замыслу ' + short + ' (' + g.job_id + ')');
+  // Допустимые решения — как в grok-gate.check: при отказе поручения — «Отклонено:» или «Grok недоступен:».
+  else if (g.status === 'failed') out.push('Grok: отказ поручения по замыслу ' + short + ' — merge потребует абзац с «Отклонено:» или «Grok недоступен:» для ' + String(g.job_id).slice(0, 8));
+  else if (g.decision !== 'ПРИНЯТО') out.push('Grok: ' + (g.decision || g.status) + ' по замыслу ' + short + ' — merge потребует абзац с «Где закрыто:» или «Отклонено:» для ' + String(g.job_id).slice(0, 8));
+  return out;
+}
+
+function precheck({ folder, designFile, lessonsDiff, change }) {
   const warnings = [], unrecognized = [];
+  warnings.push(...designVoteWarnings(change));
   try {
     if (designFile) warnings.push(...checkDesign(designFile));
   } catch (e) { warnings.push('замысел не прочитан: ' + e.message); }
@@ -132,4 +162,4 @@ function precheckText(r) {
     (r.unrecognized.length ? '\nНе распознано (проверьте сами):\n' + r.unrecognized.map((w) => '- ' + w).join('\n') : '');
 }
 
-module.exports = { precheck, precheckText, checkDesign, checkLessons, addedLines, plainLines, declaredTests };
+module.exports = { designVoteWarnings, precheck, precheckText, checkDesign, checkLessons, addedLines, plainLines, declaredTests };
