@@ -1,0 +1,12 @@
+node_modules/
+state/
+most_zhurnal.txt
+.work/
+live/
+works/*.lock
+
+tests/.tmp-*
+
+works/*.json
+works/status.md
+_antigravity_result.txt
