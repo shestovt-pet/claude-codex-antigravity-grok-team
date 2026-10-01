@@ -6,7 +6,7 @@
 
 Только человек: `confirm-request` → `confirm-reveal` (через `scripts\fallback.cmd` / `MOST_FALLBACK_HUMAN=1`) → команда с `--confirm-id/--confirm-token`.
 Агентам запрещено читать `confirm/*.token` и выставлять `MOST_FALLBACK_HUMAN=1`.
-Авто-failover запрещён.
+Авто-failover запрещён. Допустим только `advise_and_confirm` через `fallback.cmd detect` (советует enter/leave; переключение — человек + confirm).
 
 ## Роли
 

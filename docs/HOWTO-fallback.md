@@ -4,6 +4,18 @@
 
 ## Status / List / Access
 
+## Detect (advise only, инкремент detect)
+
+Авто-enter/leave **запрещены**. Команда только советует:
+
+```
+C:\most\scripts\fallback.cmd detect
+```
+
+Сигналы enter: нет процесса Claude Desktop; мёртв `state/ready/team.json`; опционально `claude-quota.json` с `percent=0` (не журнал calls).  
+Сигналы leave: процесс Claude жив + team ready жив + (желательно) очередь host jobs пуста.  
+Agy/Codex quota ≠ подписка Claude Desktop — не триггерят Desktop fallback.
+
 ```
 C:\most\scripts\fallback.cmd status
 C:\most\scripts\fallback.cmd list

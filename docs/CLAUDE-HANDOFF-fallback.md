@@ -90,7 +90,7 @@ State host: `C:\most\.work\_grok_fallback_conductor\state` (и `state-smoke` д�
 - HOWTO: `docs/HOWTO-fallback.md`.
 - Репозиторий: https://github.com/shestovt-pet/claude-codex-antigravity-grok-team
 
-*(После push в этот файл допишутся итоговые GitHub SHA.)*
+GitHub push: fd9797fb90e3f7366298e0c25673045ea71f87b3 — https://github.com/shestovt-pet/claude-codex-antigravity-grok-team/commit/fd9797fb90e3f7366298e0c25673045ea71f87b3
 
 ## Что Claude сделать при возврате (reconcile)
 

@@ -12,6 +12,7 @@ const { randomUUID } = require('crypto');
 const confirm = require('../common/user-confirm');
 const proposed = require('../common/proposed-actions');
 const accessDraft = require('../common/access');
+const fallbackDetect = require('../common/fallback-detect');
 
 const SERVERS = ['team', 'codex', 'antigravity', 'grok'];
 const INCREMENT = 4;
@@ -420,6 +421,17 @@ function supervise(repo, stateDir, fallbackDir, generation, token) {
   }, 5000).unref();
 }
 
+
+function detect(opts = {}) {
+  const d = defaults(opts);
+  const sharedStateDir = opts.sharedStateDir || path.join(d.repo, 'state');
+  return fallbackDetect.evaluate({
+    repo: d.repo,
+    sharedStateDir,
+    fallbackDir: d.fallbackDir,
+  });
+}
+
 function parseConfirmOpts(argv) {
   const get = (flag) => {
     const i = argv.indexOf(flag);
@@ -501,12 +513,18 @@ async function enter(opts = {}) {
     const supervisor = startSupervisor(d, generation, token);
     const deadline = Date.now() + 8000;
     let ready = [];
+    // After leave, session.json still holds the previous token; ownedByHost(session) would
+    // reject the new markers. Match the enter generation/token + live node PID instead.
+    const readyForEnter = (r) =>
+      r && r.alive === true && r.generation === generation && r.token === token &&
+      Number.isInteger(r.pid) && !!processImage(r.pid) &&
+      (process.platform !== 'win32' || /node/.test(processImage(r.pid)));
     while (Date.now() < deadline) {
       ready = hostReady(d.fallbackDir);
-      if (ready.length >= SERVERS.length && ready.every((r) => r.owned && r.generation === generation && r.token === token)) break;
+      if (ready.length >= SERVERS.length && ready.every(readyForEnter)) break;
       await new Promise((r) => setTimeout(r, 200));
     }
-    const ok = ready.length >= SERVERS.length && ready.every((r) => r.owned && r.generation === generation && r.token === token);
+    const ok = ready.length >= SERVERS.length && ready.every(readyForEnter);
     if (!ok) {
       stopSupervisor(d.fallbackDir, { forceWipe: true });
       throw new Error('enter: long-lived servers did not confirm ownership (owned/generation/token)');
@@ -805,6 +823,7 @@ async function main() {
   }
   try {
     if (cmd === 'status') console.log(JSON.stringify(status(base), null, 2));
+    else if (cmd === 'detect') console.log(JSON.stringify(detect(base), null, 2));
     else if (cmd === 'list') console.log(JSON.stringify(list(base), null, 2));
     else if (cmd === 'access-describe') console.log(JSON.stringify(accessDraft.describe(), null, 2));
     else if (cmd === 'confirm-request') {
@@ -859,7 +878,7 @@ async function main() {
         id: argValue(argv, '--id'),
       }), null, 2));
     } else {
-      throw new Error('commands: status|list|enter|leave|confirm-request|confirm-status|jobs-list|jobs-stop|actions-ingest|actions-list|actions-apply|access-describe');
+      throw new Error('commands: status|list|enter|leave|detect|confirm-request|confirm-status|jobs-list|jobs-stop|actions-ingest|actions-list|actions-apply|access-describe');
     }
   } catch (e) {
     console.error(e.message);
@@ -869,7 +888,7 @@ async function main() {
 
 if (require.main === module) main();
 module.exports = {
-  status, list, enter, leave, readyAges, hostReady, SERVERS, INCREMENT,
+  status, list, enter, leave, detect, readyAges, hostReady, SERVERS, INCREMENT,
   confirmRequest, confirmStatus, listJobs, stopJob, enqueueJob,
   actionsIngest, actionsList, actionsApply, accessDraft,
 };
