@@ -62,7 +62,7 @@ register(
   'team_rules',
   'Правила команды',
   'Получить правила из зафиксированной версии основной ветки.',
-  { part: z.enum(['brief', 'common', 'claude', 'antigravity', 'grok', 'roles', 'all']).default('brief').describe('Часть правил.') },
+  { part: z.enum(['brief', 'common', 'claude', 'antigravity', 'grok', 'roles', 'fallback', 'all']).default('brief').describe('Часть правил.') },
   (a) => team.rules(a.part),
 );
 const stage = z.object({

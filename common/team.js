@@ -291,7 +291,7 @@ class Team {
     });
   }
   rules(part = 'brief') {
-    if (!['brief', 'common', 'claude', 'antigravity', 'grok', 'roles', 'all'].includes(part)) throw Error('Неизвестная часть правил.');
+    if (!['brief', 'common', 'claude', 'antigravity', 'grok', 'roles', 'fallback', 'all'].includes(part)) throw Error('Неизвестная часть правил.');
     repository(this.root);
     const commit = hash(this.root);
     // Зафиксированный хеш исключает смесь редакций, если main сменился между чтениями.
@@ -299,10 +299,10 @@ class Team {
       'Версия правил (main): ' +
       commit +
       '\n' +
-      (part === 'all' ? ['common', 'claude', 'antigravity', 'grok', 'roles'] : [part])
+      (part === 'all' ? ['common', 'claude', 'antigravity', 'grok', 'roles', 'fallback'] : [part])
         .map((p) => {
           const file = 'rules/' + p + '.md';
-          if (!git(this.root, ['ls-tree', '--name-only', commit, '--', file]).trim()) return p === 'brief' ? 'Памятка не найдена. Части: brief — памятка; common — общие правила; claude — дирижёр; antigravity — работа с текстом; roles — распределение ролей; all — полные правила.' : 'в main нет ' + file;
+          if (!git(this.root, ['ls-tree', '--name-only', commit, '--', file]).trim()) return p === 'brief' ? 'Памятка не найдена. Части: brief — памятка; common — общие правила; claude — дирижёр; antigravity — работа с текстом; roles — распределение ролей; fallback — режим без Claude Desktop; all — полные правила.' : 'в main нет ' + file;
           return '\nПравила ' + p + ':\n' + require('./paths').withRoot(git(this.root, ['show', commit + ':' + file]), this.root);
         })
         .join('\n')

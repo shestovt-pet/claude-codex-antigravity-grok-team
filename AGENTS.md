@@ -7,6 +7,11 @@
 - **Codex**: Инженер. Пишет код, покрывает тестами, осуществляет поиск по диску.
 - **Antigravity**: Аналитик и критик. Вычитывает длинные тексты, проверяет фактуру, проводит глубокое ревью замысла.
 
+
+## Fallback без Claude Desktop
+По умолчанию дирижёр — Claude. Если Desktop недоступен, человек включает штатный fallback (`docs/HOWTO-fallback.md`, `rules/fallback.md`, `scripts/fallback.cmd`).
+Судья gate — человек; host крутит MCP на изолированном state; Grok предлагает действия (не shell); Codex и Antigravity — ревьюеры. Подделка `who=claude` и auto-failover запрещены.
+Обычный путь Claude (`MOST_CLIENT=claude`, нет fallback-сессии) не меняется.
 ## Обязательно к прочтению
 Агентам, работающим в этой папке, **обязательно** прочитать файл `rules/common.md`.
 
