@@ -13,6 +13,7 @@ const confirm = require('../common/user-confirm');
 const proposed = require('../common/proposed-actions');
 const accessDraft = require('../common/access');
 const fallbackDetect = require('../common/fallback-detect');
+const taskRoles = require('../common/task-roles');
 
 const SERVERS = ['team', 'codex', 'antigravity', 'grok'];
 const INCREMENT = 4;
@@ -794,6 +795,22 @@ async function actionsApply(opts = {}) {
         who: a.who,
         id: a.id,
       });
+    } else if (a.type === 'roles.propose') {
+      const work = (a.args && a.args.work) || a.work;
+      const kind = (a.args && a.args.kind) || a.kind || 'code';
+      const by = (a.args && a.args.by) || a.by || 'grok';
+      const st = status(opts);
+      results.push({
+        type: a.type,
+        result: taskRoles.propose({
+          repoRoot: defaults(opts).repo || 'C:\\most',
+          worksRoot: path.join(defaults(opts).repo || 'C:\\most', 'works'),
+          fallbackDir: defaults(opts).fallbackDir,
+          work, kind, by,
+          slots: (a.args && a.args.slots) || a.slots || undefined,
+          generation: (st.session && st.session.generation) || 0,
+        }),
+      });
     } else if (a.type === 'confirm-request') {
       results.push({ type: a.type, result: confirmRequest({ ...opts, action: a.action, meta: a.args || null }) });
     } else {
@@ -877,8 +894,29 @@ async function main() {
         ...base, ...conf,
         id: argValue(argv, '--id'),
       }), null, 2));
+
+    } else if (cmd === 'roles-propose') {
+      const work = argValue(argv, '--work');
+      const kind = argValue(argv, '--kind') || 'code';
+      const by = argValue(argv, '--by') || 'rules';
+      const slots = argValue(argv, '--slots');
+      const st = status(base);
+      const rec = taskRoles.propose({
+        repoRoot: defaults(base).repo || defaults(base).repoRoot || 'C:\\most',
+        worksRoot: argValue(argv, '--works-root') || path.join((defaults(base).repo || 'C:\\most'), 'works'),
+        fallbackDir: defaults(base).fallbackDir,
+        work, kind, by, slots: slots || undefined,
+        generation: (st.session && st.session.generation) || 0,
+      });
+      console.log(JSON.stringify({ ok: true, cmd: 'roles-propose', roles: rec }, null, 2));
+    } else if (cmd === 'roles-get') {
+      console.log(JSON.stringify({ ok: true, cmd: 'roles-get', ...taskRoles.get({
+        repoRoot: defaults(base).repo || 'C:\\most',
+        worksRoot: argValue(argv, '--works-root') || path.join((defaults(base).repo || 'C:\\most'), 'works'),
+        work: argValue(argv, '--work'),
+      }) }, null, 2));
     } else {
-      throw new Error('commands: status|list|enter|leave|detect|confirm-request|confirm-status|jobs-list|jobs-stop|actions-ingest|actions-list|actions-apply|access-describe');
+      throw new Error('commands: status|list|enter|leave|detect|confirm-request|confirm-status|jobs-list|jobs-stop|actions-ingest|actions-list|actions-apply|access-describe|roles-propose|roles-get');
     }
   } catch (e) {
     console.error(e.message);

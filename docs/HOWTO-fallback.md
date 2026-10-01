@@ -1,4 +1,4 @@
-# HOWTO: fallback-дирижёр (фаза 1 / инкременты 1–4)
+﻿# HOWTO: fallback-дирижёр (фаза 1 / инкременты 1–4)
 
 Установлено в `C:\most`. Host не трогает Desktop state; enter только с confirm и только в allowlist dirs.
 
@@ -76,3 +76,21 @@ node C:\most\tests\fallback-smoke-enterleave.js
 1. `fallback.cmd leave` (с confirm) — гасит host-owned процессы, generation++.
 2. Сверка deploy-ops / jobs / частичных результатов.
 3. Desktop продолжает на своём `live\<release>`; при необходимости reconcile — отдельная команда человека / Claude.
+
+## Roles per-task (гибкие роли)
+
+Не «навсегда Claude=дирижёр», а **на эту задачу**: кто оркестрирует / пишет / ревьюит / судья / кто offline.
+
+```
+C:\most\scripts\roles.cmd propose --work my-task --kind code
+C:\most\scripts\roles.cmd get --work my-task
+C:\most\scripts\roles.cmd confirm-request --work my-task
+C:\most\scripts\roles.cmd confirm-reveal <id>
+C:\most\scripts\roles.cmd confirm --work my-task --confirm-id <id> --confirm-token <token>
+```
+
+`--kind`: code | review | design | ops | fallback. Без `--slots` — эвристика + `fallback detect` (если Claude offline → orchestrator≠claude).
+Подтверждает **только человек** (как enter/leave). Запись: `works/<work>/roles.json`.
+Запреты: self-review; judge на ops/fallback = user; не подделывать who=claude.
+
+Smoke: `node C:\most\tests\roles-smoke.js` и `node C:\most\tests\roles-e2e-confirm.js`.

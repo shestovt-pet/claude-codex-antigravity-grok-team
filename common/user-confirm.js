@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 // Independent user-confirm channel (increment 2, hardened).
 // Token is NEVER returned to callers unless MOST_FALLBACK_HUMAN=1 (set by fallback.cmd).
 // Consume is atomic (rename). Bound to action+generation+optional targetHash.
@@ -8,7 +8,7 @@ const crypto = require('crypto');
 
 const TTL_MS = 15 * 60 * 1000;
 const ACTIONS = new Set([
-  'enter', 'leave', 'jobs.stop', 'jobs.enqueue', 'actions.apply', 'generation.transfer',
+  'enter', 'leave', 'jobs.stop', 'jobs.enqueue', 'actions.apply', 'generation.transfer', 'roles.confirm', 'roles.clear',
 ]);
 
 function sha(s) {
@@ -52,6 +52,17 @@ function createChallenge(fallbackDir, { action, generation, meta, targetHash } =
   if (action === 'actions.apply') {
     if (!meta || !meta.id || !targetHash) {
       throw new Error('confirm: actions.apply requires meta.id and targetHash (proposal content)');
+    }
+  }
+
+  if (action === 'roles.confirm') {
+    if (!meta || !meta.work || !targetHash) {
+      throw new Error('confirm: roles.confirm requires meta.work and targetHash');
+    }
+  }
+  if (action === 'roles.clear') {
+    if (!meta || !meta.work) {
+      throw new Error('confirm: roles.clear requires meta.work');
     }
   }
   const id = crypto.randomBytes(8).toString('hex');
@@ -129,7 +140,7 @@ function listPending(fallbackDir) {
   }).filter(Boolean).filter((r) => r.status === 'pending');
 }
 
-function consume(fallbackDir, { id, token, action, generation, targetHash } = {}) {
+function consume(fallbackDir, { id, token, action, generation, targetHash, meta } = {}) {
   assertAction(action);
   if (!/^[a-f0-9]{16}$/.test(String(id || ''))) throw new Error('confirm: bad id');
   const dir = confirmDir(fallbackDir);
@@ -157,6 +168,21 @@ function consume(fallbackDir, { id, token, action, generation, targetHash } = {}
     if (rec.targetHash) {
       if (!targetHash || targetHash !== rec.targetHash) {
         throw new Error('confirm: targetHash mismatch (content changed or missing)');
+      }
+    }
+    if (rec.meta && rec.meta.work) {
+      if (!meta || meta.work !== rec.meta.work) {
+        throw new Error('confirm: meta.work mismatch (bound to work ' + rec.meta.work + ')');
+      }
+    }
+    if (rec.meta && rec.meta.who) {
+      if (!meta || meta.who !== rec.meta.who) {
+        throw new Error('confirm: meta.who mismatch');
+      }
+    }
+    if (rec.meta && rec.meta.id) {
+      if (!meta || meta.id !== rec.meta.id) {
+        throw new Error('confirm: meta.id mismatch');
       }
     }
     if (Date.parse(rec.expiresAt) < Date.now()) {

@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 // Increment 3: Grok/webhook structured proposals -> host actions.
 // Free-form reply text is NEVER executed as shell. who=claude is forbidden.
 const fs = require('fs');
@@ -6,7 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const ALLOWED_TYPES = new Set([
-  'status', 'list', 'jobs.list', 'jobs.stop', 'confirm-request',
+  'status', 'list', 'jobs.list', 'jobs.stop', 'confirm-request', 'roles.propose',
 ]);
 
 const BEGIN = 'FALLBACK_ACTIONS_BEGIN';

@@ -1,4 +1,4 @@
-# Handoff: штатный fallback-дирижёр (инкременты 1–4)
+﻿# Handoff: штатный fallback-дирижёр (инкременты 1–4)
 
 Дата: 2026-10-01 (Asia/Nicosia). Автор установки: Grok Bot по явной команде человека «ставь и проверяй…».
 
@@ -118,3 +118,7 @@ node C:\most\tests\run.js
 ```
 
 Webhook secrets и содержимое `state/grok-webhook.json` в этот бриф **не** включались.
+
+## Roles per-task (incr1)
+
+Гибкие роли на задачу: `scripts/roles.cmd propose|get|confirm-*`. Артефакт `works/<work>/roles.json`. Confirm только человек (`roles.confirm`). Модуль `common/task-roles.js`. См. HOWTO § Roles и `.work/_grok_flexible_roles/design.md`.
