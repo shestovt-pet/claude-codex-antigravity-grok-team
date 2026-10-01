@@ -123,13 +123,16 @@ class Grok {
   async send(args) {
     require('./access').guard('grok', 'grok_send', args);
     return require('./work-owner').withWork(args, async () => {
+      const support = require('./brief-support');
+      args.text = (args.text || '') + support.text(support.support(args.folder, args.opora));
       const settings = config(this.state); // До записи карточки и отправки ключа.
       if (!args.task?.trim()) throw Error('Нужно поручение.');
       if (args.work && !args.stage) throw Error('Для работы укажите этап.');
       if (args.retry_of) this.load(args.retry_of);
+      await require('./stage-gate').prepareJob(args, 'grok');
       const id = crypto.randomUUID(), secret = crypto.randomBytes(32);
       const job = { id, task: args.task, text: args.text || '', materialHash: sha(args.text || args.task),
-        work: args.work, stage: args.stage, retry_of: args.retry_of, from: require('./access').client(),
+        work: args.work, stage: args.stage, stageTitle: args.stageTitle, stageId: args.stageId, gateOrder: args.gateOrder, scopeTask: args.scopeTask, role: args.role, replaces: args.replaces, replacementEvidence: args.replacementEvidence, folder: args.folder, retry_of: args.retry_of, from: require('./access').client(),
         status: 'delivery_unclear', startedAt: new Date().toISOString(),
         reason: 'Отправка начата; подтверждение ещё не сохранено.' };
       const brief = this.brief(job);

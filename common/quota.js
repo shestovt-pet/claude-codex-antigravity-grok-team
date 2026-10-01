@@ -203,7 +203,7 @@ function quotaText(q) {
     const rows = q.all.map(w => (q.plans?.length > 1 ? w.limitId + ' ' : '') + (w.minutes >= 295 && w.minutes <= 305 ? '5 ч' : w.minutes === 10080 ? 'неделя' : w.minutes + ' мин') + ': использовано ' + w.used_percent + ' %, сброс ' + (w.resets_at ? new Date(w.resets_at).toLocaleString('ru-RU') : 'данные не предоставлены'));
     for (const p of q.plans || [{ planType: q.planType || 'неизвестен', five_hour: !!q.five_hour }])
       if (!p.five_hour) rows.unshift((q.plans?.length > 1 ? p.id + ' ' : '') + '5 ч: источник не возвращает это окно (тариф ' + p.planType + ', secondary отсутствует)');
-    return rows.join(', ') + ' · источник ' + q.source;
+    return rows.join(', ') + ' · источник ' + q.source + '; снимок: ' + (q.taken_at || 'данные не предоставлены');
   }
   return (
     [

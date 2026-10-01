@@ -15,7 +15,7 @@ process.env.MOST_REPO_ROOT = RUN;
 fs.mkdirSync(path.join(RUN, 'works'));
 fs.writeFileSync(path.join(RUN, 'works/bridge.json'), JSON.stringify({name:'bridge', revision:1,
   goal:'Проверка', done_criteria:'Проверено', next_step:'Проверка', reminders:[],
-  stages:[{title:'Ревью',weight:100,state:'идёт',accept_criteria:'Проверено'}]}));
+  stages:['Ревью', 'Код'].map(title => ({title,weight:50,state:'идёт',accept_criteria:'Проверено'}))}));
 const q = require('../common/quota'),
   { format } = require('../common/format'),
   states = require('../common/states'),
@@ -68,7 +68,10 @@ async function call(b, name, args = {}) {
   return { text: r.content.map((c) => c.text || '').join('\n'), error: r.isError };
 }
 function id(r) {
-  return r.text.match(/Номер поручения: ([\w-]+)/)?.[1] || r.text.match(/поручение ([\w-]+)/)?.[1];
+  assert(!r.error, r.text);
+  const value = r.text.match(/Номер поручения: ([\w-]+)/)?.[1] || r.text.match(/поручение ([\w-]+)/)?.[1];
+  assert(value, 'Нет номера поручения: ' + r.text);
+  return value;
 }
 async function result(b, j, predicate = /ОТВЕТ ПОЛУЧЕН|НЕ УДАЛОСЬ|НУЖНО РЕШЕНИЕ/, ms = 10000) {
   let r;
@@ -230,9 +233,16 @@ async function test(name, fn) {
       ok(t.tools.length === (kind === 'codex' ? 4 : 5), 'число инструментов');
       for (const tool of t.tools) {
         ok(/[А-Яа-яЁё]/.test(tool.title), 'русский title');
+        // opora — точное имя переключателя из договора v14; остальные имена и весь текст проверяем прежним выражением.
+        const publicTool = structuredClone(tool);
+        if (tool.name === kind + '_send') {
+          assert.equal(publicTool.inputSchema.properties.opora.type, 'boolean');
+          publicTool.inputSchema.properties.support = publicTool.inputSchema.properties.opora;
+          delete publicTool.inputSchema.properties.opora;
+        }
         ok(
           !/most_|poruch|itog|perenesti|papka|rezhim|fayl|stroki|opora|zamechaniya|pravka|tekst|kuda|polno|zhdat|chernovik/.test(
-            JSON.stringify(tool),
+            JSON.stringify(publicTool),
           ),
           'нет транслита ' + tool.name,
         );
@@ -308,6 +318,7 @@ async function test(name, fn) {
         text: 'Проверить',
         stage: 'Ревью',
         work: 'bridge',
+        role: 'проверка',
       });
       const done = await result(a, id(r));
       ok(!done.text.includes('со вступления'), 'вердикт без предупреждения');
@@ -339,7 +350,7 @@ async function test(name, fn) {
   });
   await test('Codex: ответ, продолжение, страницы и архив', async () => {
     const folder = project();
-    const r = await call(c, 'codex_send', { folder, task: 'OK', text: 'материал', stage: 'Код', work: 'bridge' });
+    const r = await call(c, 'codex_send', { folder, task: 'OK', text: 'материал', stage: 'Код', work: 'bridge', role: 'проверка' });
     const done = await result(c, id(r));
     ok(done.text.includes('ПРИНЯТО') && done.text.includes('Этап: Код (работа bridge)'), 'ответ/этап');
     const r2 = await call(c, 'codex_send', { folder, task: 'Продолжить', continue_id: id(r) });

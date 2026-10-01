@@ -5,7 +5,7 @@ const { z } = require('zod');
 const { Grok } = require('../../common/grok');
 const { format } = require('../../common/format');
 const access = require('../../common/access');
-const grok = new Grok(), server = new McpServer({ name: 'grok', version: '0.5.8' });
+const grok = new Grok(), server = new McpServer({ name: 'grok', version: '0.5.9' }, require('../../common/server-instructions').options('grok'));
 function register(name, title, schema, fn) {
   if (!access.allowed('grok', name)) return;
   server.registerTool(name, { title, description: title,
@@ -21,6 +21,7 @@ function register(name, title, schema, fn) {
   });
 }
 register('grok_send', 'Поручить Grok', {
+  ...require('../../common/stage-schema').send, folder: z.string().optional(),
   task: z.string().min(1), text: z.string().optional(), work: z.string().optional(),
   stage: z.string().optional(), owner: z.string().optional(), retry_of: z.string().optional(),
 }, async args => { const job = await grok.send(args); return { job, text: job.reason }; });

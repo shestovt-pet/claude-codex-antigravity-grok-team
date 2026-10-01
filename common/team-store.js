@@ -35,6 +35,7 @@ function list(who, includeArchive = true) {
         const j = read(file);
         result.push({ ...j, archived, cardFile: file });
       } catch (e) {
+        // Карточка могла исчезнуть после перечисления; это не сбой её чтения.
         if (e.code !== 'ENOENT') errors.push(file + ': ' + e.message);
       }
     }
@@ -42,16 +43,18 @@ function list(who, includeArchive = true) {
   return { jobs: result, errors };
 }
 
-function review(who, id, base, candidate, decision = 'ПРИНЯТО', requestMark, designHash) {
+function review(who, id, base, candidate, decision = 'ПРИНЯТО', requestMark, designHash, workReview = false) {
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id || '')) throw Error('Некорректный номер ревью.');
   if (fs.existsSync(path.join(path.dirname(roots()[who]), 'quarantine', id, 'card.json')))
     throw Error('ПЕРЕНОС: ПОВРЕЖДЁН — задание находится в карантине.');
-  const j = list(who, false).jobs.find((j) => j.id === id);
+  const listed = list(who, false);
+  if (listed.errors.length) throw Object.assign(Error(id + ': нельзя прочитать поручения: ' + listed.errors.join('; ')), { code: 'STAGE_READ_FAILED' });
+  const j = listed.jobs.find((j) => j.id === id);
   if (!j || j.status !== 'done' || j.archived)
     throw Error('Нужно завершённое задание ревью из действующего хранилища.');
-  if (who === 'codex' && (j.write || j.previous))
+  if (who === 'codex' && (j.write || j.previous) && (!workReview || j.role !== 'совет'))
     throw Error('Ревью Codex должно быть новым сеансом только для чтения.');
-  if (who === 'antigravity' && !['review', 'zamechaniya'].includes(j.mode || j.rezhim))
+  if (!workReview && who === 'antigravity' && !['review', 'zamechaniya'].includes(j.mode || j.rezhim))
     throw Error('Нужно задание Antigravity в режиме ревью.');
   const task = (j.task || j.poruchenie || '') + (who === 'grok' ? '\n' + (j.text || '') : '');
   if (requestMark && !task.includes(requestMark)) throw Error('В поручении ревью нет метки запроса ' + requestMark + '.');
@@ -99,4 +102,20 @@ function resultPath(job, dir = roots().codex) {
   if (!filename.startsWith(job.id + '.')) throw Error('Результат не относится к номеру поручения.');
   return path.join(base, filename);
 }
-module.exports = { list, review, roots, resultPath };
+// Проверка источника текста не требует вердикта, но использует те же сохранённые байты и хеши.
+function source(who, id) {
+  const listed = list(who, false);
+  if (listed.errors.length) throw Object.assign(Error(id + ': нельзя прочитать источник: ' + listed.errors.join('; ')), { code: 'STAGE_READ_FAILED' });
+  const j = listed.jobs.find(j => j.id === id);
+  if (!j || j.status !== 'done' || j.cancelled || j.lateHash) throw Error(id + ': нет принятого сервером результата текста.');
+  const dir = roots()[who];
+  const file = who === 'antigravity' ? path.join(path.dirname(j.cardFile), 'result.txt') : who === 'grok' ? path.join(dir, id + '.result.txt') : resultPath(j, dir);
+  if (!isInsideReal(file, dir)) throw Error('Результат вне хранилища.');
+  const text = fs.readFileSync(file, 'utf8'), hash = crypto.createHash('sha256').update(text).digest('hex');
+  if ((j.migration?.resultHash && j.migration.resultHash !== hash) ||
+      (who === 'antigravity' && read(path.join(path.dirname(j.cardFile), 'meta.json')).hash !== hash) ||
+      (who === 'grok' && (j.resultHash !== hash || !require('./grok').parseReply(Buffer.from(text)))))
+    throw Error(id + ': хеш результата текста не совпадает.');
+  return text;
+}
+module.exports = { list, review, roots, resultPath, source };

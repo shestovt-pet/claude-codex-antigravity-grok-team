@@ -2,6 +2,7 @@
 const fs = require('fs'), path = require('path');
 const { repoRoot } = require('./paths');
 const { inside, name, atomic } = require('./team-git');
+const workLock = new (require('async_hooks').AsyncLocalStorage)();
 
 function check(work, owner) {
   if (work.owner && work.owner !== owner) {
@@ -24,9 +25,13 @@ function touch(workName, owner, root = repoRoot) {
 // Проверка и действие держат один замок с claim: передача между ними невозможна.
 async function withWork(args, action, root = repoRoot) {
   if (!args.work) return action();
+  const held = workLock.getStore();
+  if (held?.active && held.root === root) { touch(args.work, args.owner, root); return action(); }
   return require('./deploy').locked(root, async () => {
     touch(args.work, args.owner, root);
-    return action();
+    const lease = { root, active: true };
+    try { return await workLock.run(lease, action); }
+    finally { lease.active = false; }
   });
 }
 

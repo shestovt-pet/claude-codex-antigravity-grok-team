@@ -23,16 +23,18 @@ const job = s => modelFields(selectModel(undefined, s, list));
 const tests = [], test = (label, fn) => tests.push({ label, fn });
 test('Р1: отсутствующий ключ — 0 %, сброс сохранён, свободные модели видны', () => {
   const s = snapshot(), text = aq.parseQuota(s.data, s.accountEmail);
-  assert.match(text, /Gemini Test \(High\): исчерпано \(осталось 0 %\), сброс/);
-  assert.match(text, /Claude Test, GPT-OSS: осталось 100 %/);
+  assert.match(text, /Gemini Test \(High\) \[семья google\]: исчерпано \(осталось 0 %\), сброс/);
+  assert.match(text, /Claude Test \[семья anthropic\].*GPT-OSS \[семья openai\]: осталось 100 %/);
   assert.match(agyAdvice(s), /осталось 0 %.*только обязательные голоса/);
   assert.equal(aq.modelQuota(rows(s)[0].quotaInfo).resetTime, future);
+  assert(!text.includes('окно 5 ч'), 'источник не сообщает длительность окна');
+  assert(text.includes(new Date(future).toLocaleDateString('ru-RU')), 'сброс не сегодня содержит дату');
 });
 test('Р1: null, строка, неверные числа и время изолированы по модели', () => {
   for (const value of [null, '0', -0.01, 1.01, NaN, Infinity, undefined]) {
     const s = snapshot(); rows(s)[0].quotaInfo.remainingFraction = value;
     assert.match(aq.parseQuota(s.data), /Gemini Test \(High\): формат ответа изменился/);
-    assert.match(aq.parseQuota(s.data), /Claude Test, GPT-OSS: осталось 100 %/);
+    assert.match(aq.parseQuota(s.data), /Claude Test \[семья anthropic\].*GPT-OSS \[семья openai\]: осталось 100 %/);
     assert.match(agyAdvice(s), /формат ответа изменился/);
     assert.match(agyAdvice(s, 'MODEL_1'), /осталось 100 %/);
   }

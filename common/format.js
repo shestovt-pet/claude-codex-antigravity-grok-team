@@ -32,7 +32,7 @@ function format(assistant, job = {}, body = '', next = 'Проверьте ре�
       ' · ' +
       duration(elapsed),
     job.stage
-      ? 'Этап: ' + job.stage + ' (работа ' + require('./summary').workTitle(job.workName || (typeof job.work === 'string' ? job.work : '—')) + ')'
+      ? 'Этап: ' + (job.stageTitle || job.stage) + ' (работа ' + require('./summary').workTitle(job.workName || (typeof job.work === 'string' ? job.work : '—')) + ')'
       : '',
     job.id ? 'Номер поручения: ' + job.id : '',
     job.from ? 'Отправитель: ' + job.from : '',

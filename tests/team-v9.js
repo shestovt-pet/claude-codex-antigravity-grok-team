@@ -120,6 +120,7 @@ test('Р3: краткий ответ team_work и одно сообщение н
   assert.match(created, /Краткость \(brief\) · редакция 1\nПринято 0 % плана · этап 1 из 3 — Этап 1\nСледующий шаг: Шаг 1\nДля следующего обновления: expected_revision 1/);
   assert(!/Цель:|Сделано:|Критерий завершения:/.test(created), created);
   const accepted = stages.map((s, i) => i < 2 ? { ...s, state: 'принят', evidence: 'Доказательство ' + (i + 1), version: 'v1' } : s);
+  require('./legacy-work')(team, 'brief');
   const before = fs.existsSync(path.join(RUN, 'notifications.jsonl')) ? fs.readFileSync(path.join(RUN, 'notifications.jsonl'), 'utf8').split('\n').filter(Boolean).length : 0;
   const out = await team.work({ owner: 'o', action: 'update', name: 'brief', expected_revision: 1, next_step: 'Шаг 3', stages: accepted });
   assert.equal((out.match(/Сообщение пользователю/g) || []).length, 1, out);

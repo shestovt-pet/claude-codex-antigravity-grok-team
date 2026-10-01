@@ -14,7 +14,7 @@ const { format } = require('../../common/format');
 const { classifyCodex, retryPlan, codexQuota, quotaText, command } = require('../../common/quota');
 const { readCard, logFailure, guarded } = require('../../common/cards');
 const access = require('../../common/access');
-const VERSION = '0.5.8',
+const VERSION = '0.5.9',
   dir = path.resolve(process.env.MOST_CODEX_JOBS_DIR || path.join(stateDir, 'codex-jobs'));
 const archive =
   process.env.MOST_CODEX_ARCHIVE_DIR ||
@@ -384,6 +384,9 @@ async function stop(id, reason = 'cancel') {
 
 async function send(a) {
   access.guard('codex', 'codex_send', a);
+  const support = require('../../common/brief-support');
+  const extra = support.text(support.support(a.folder, a.opora));
+  if (extra) a.text = (a.text || '') + extra;
   if (!binary && !access.guest()) throw Error('Исполнитель Codex не найден. Укажите CODEX_PATH.');
   if (closing) throw Error('Сервер останавливается.');
   if (!path.isAbsolute(a.folder) || !fs.statSync(a.folder).isDirectory())
@@ -422,12 +425,13 @@ async function send(a) {
         }
       }
     }
+    await require('../../common/stage-gate').prepareJob(a, 'codex');
     const job = {
       id,
       folder,
       write: a.write,
       task: a.task,
-      stage: a.stage,
+      stage: a.stage, stageTitle: a.stageTitle, stageId: a.stageId, gateOrder: a.gateOrder, scopeTask: a.scopeTask, role: a.role, replaces: a.replaces, replacementEvidence: a.replacementEvidence,
       work: a.work,
       from: access.client(),
       status: access.guest() ? 'queued' : 'running',
@@ -490,7 +494,7 @@ async function queue() {
     scanning = false;
   }
 }
-const server = new McpServer({ name: 'codex', version: VERSION });
+const server = new McpServer({ name: 'codex', version: VERSION }, require('../../common/server-instructions').options('codex'));
 function register(name, title, description, inputSchema, fn) {
   if (!access.allowed('codex', name)) return;
   server.registerTool(name, { title, description, inputSchema: require('../../common/schema').compatible(inputSchema) }, async (a) => {
@@ -513,6 +517,7 @@ register(
   'Начать отдельное поручение или явно продолжить сеанс.',
   {
     folder: z.string().describe('Абсолютная папка проекта.'),
+    ...require('../../common/stage-schema').send,
     task: z.string().min(1).describe('Поручение.'),
     text: z.string().optional().describe('Материал для работы.'),
     write: z.boolean().default(false).describe('Разрешить изменения по поручению.'),

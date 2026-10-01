@@ -122,6 +122,7 @@ test('F5: без closes используется критерий приёмки
   const stages=[{title:'Этап',weight:100,accept_criteria:'Проверенный итог для пользователя',state:'план'}];
   await t.work({owner: 'test-owner', action: 'create',name:'fallback',expected_revision:0,goal:'Цель',done_criteria:'Итог',next_step:'Дальше',stages});
   stages[0]={...stages[0],state:'принят',evidence:'Доказательство',version:'1'};
+  require('./legacy-work')(t, 'fallback');
   const out=await t.work({owner: 'test-owner', action: 'update',name:'fallback',expected_revision:1,stages});assert.match(out,/сделано: Доказательство · это закрывает: Проверенный итог для пользователя · дальше: Дальше/);
   assert.match(fs.readFileSync(path.join(RUN,'notify.jsonl'),'utf8'),/это закрывает: Проверенный итог для пользователя/);
 });

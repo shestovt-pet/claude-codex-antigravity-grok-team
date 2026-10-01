@@ -149,6 +149,7 @@ test('Работы: создание, гонка редакций, доказа�
     reminders: ['a', 'a'],
   });
   const accepted = structuredClone(stages);
+  require('./legacy-work')(team, 'work');
   accepted[0] = { ...accepted[0], state: 'принят', evidence: 'Тест выполнен', version: 'v1' };
   const results = await Promise.allSettled([
     team.work({ owner: 'test-owner', action: 'update', name: 'work', expected_revision: 1, stages: accepted }),
@@ -714,7 +715,7 @@ test('Статус: сбои квот, работ, репозитория, ре�
   team.works = () => { throw Error('сбой работ'); };
   try {
     const out = await team.status(undefined, undefined, undefined, true);
-    for (const text of ['Claude — ошибка чтения снимка', 'таймаут квоты', 'Работы: ошибка: сбой работ',
+    for (const text of ['Claude — данные не предоставлены: ошибка чтения снимка', 'таймаут квоты', 'Работы: ошибка: сбой работ',
       'Репозиторий:', 'Релизы: ошибка:', 'сбой поручений', 'Поручения antigravity:', 'team: версия процесса'])
       assert(out.includes(text), text + '\n' + out);
   } finally { quota.codexQuota = oldQuota; stores.list = oldList; team.works = oldWorks; }

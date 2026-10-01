@@ -114,7 +114,7 @@ test('B1: все limitId и окна; отсутствие пятичасово�
 });
 const agyData = {userStatus:{email:'test@example.invalid',cascadeModelConfigData:{clientModelConfigs:[{label:'Gemini 3.1 Pro (High)',quotaInfo:{remainingFraction:.95,resetTime:'2027-01-01T00:00:00Z'}},{label:'Gemini 3.8 Flash (Medium)',quotaInfo:{remainingFraction:.95,resetTime:'2027-01-01T00:00:00Z'}},{label:'Другая модель',quotaInfo:{remainingFraction:.95,resetTime:'2027-01-01T00:00:00Z'}}]}}};
 test('B2: группировка моделей, аккаунт, отсутствие личных данных', () => {
-  const out=aq.parseQuota(agyData,'other@example.invalid'); assert.match(out,/не совпадает/); assert.match(out,/и ещё 1/); assert.match(out,/осталось 95 %/); assert(!out.includes('@'));
+  const out=aq.parseQuota(agyData,'other@example.invalid'); assert.match(out,/не совпадает/); assert.match(out,/Другая модель \[семья не определена\]/); assert.match(out,/осталось 95 %/); assert(!out.includes('@'));
   assert.match(aq.parseQuota(agyData,'test@example.invalid'),/аккаунт agy совпадает/);
   assert.equal(aq.parseQuota({csrf_token:'SECRET'}),'формат ответа изменился');
 });
@@ -151,6 +151,7 @@ test('D3: первое принятие этапа уведомляет один
   const stages=[{title:'Этап',weight:100,accept_criteria:'Проверка',closes:'Пункт 2 запроса',state:'план'}];
   await t.work({owner: 'test-owner', action: 'create',name:'work',expected_revision:0,goal:'Цель',done_criteria:'Итог',next_step:'Готово',stages});
   stages[0]={...stages[0],state:'принят',evidence:'Проверено',version:'1'};
+  require('./legacy-work')(t, 'work');
   const accepted=await t.work({owner: 'test-owner', action: 'update',name:'work',expected_revision:1,stages});
   assert.match(accepted,/сделано: Проверено · это закрывает: Пункт 2 запроса · дальше: Готово/);
   assert.match(fs.readFileSync(path.join(RUN,'notifications.jsonl'),'utf8'),/это закрывает: Пункт 2 запроса/);
@@ -195,7 +196,7 @@ test('E1: гостевые списки инструментов, очередь
       const listed=(await guest.listTools()).tools.map(t=>t.name);assert.deepEqual(listed.sort(),[who+'_send',who+'_status',who+'_result'].sort());
       const forbidden=await guest.callTool({name:who+'_cancel',arguments:{id:'none'}});assert(forbidden.isError);
       if(who==='codex')assert((await guest.callTool({name:'codex_send',arguments:{folder,task:'Проверка',write:true}})).isError);
-      const out=await guest.callTool({name:who+'_send',arguments:{folder,task:'[[FAKE:accept]] Проверка',stage:'Этап',work:'work',owner:'test-owner',...(who==='antigravity'?{mode:'text'}:{write:'false'})}});
+      const out=await guest.callTool({name:who+'_send',arguments:{folder,task:'[[FAKE:accept]] Проверка',role:'совет',stage:'Этап',work:'work',owner:'test-owner',...(who==='antigravity'?{mode:'text'}:{write:'false'})}});
       assert(!out.isError,JSON.stringify(out));const text=out.content[0].text;assert.match(text,/В ОЧЕРЕДИ/);assert.match(text,/выполнит основной сервер/);assert.match(text,/Принято 100 %/);
       const id=text.match(/Номер поручения: (\S+)/)[1];
       write(path.join(folder,'_antigravity_result.txt'),'ЧУЖОЙ ЧЕРНОВИК');

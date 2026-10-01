@@ -87,8 +87,15 @@ async function compact(team, quota) {
   rows.push('Рутина за сутки (этап «рутина»): ' + ['codex', 'antigravity', 'grok'].map(who => who + ' — ' +
     (jobs[who] || []).filter(j => Date.parse(j.startedAt) > Date.now() - 86400000 && /^рутина(?:$|\s*[:—-])/i.test(j.stage || '')).length).join('; '));
   await section(() => {
-    const works = team.works(), done = works.filter(w => !w.error && w.stages.every(s => s.state === 'принят'));
+    const works = team.works(), done = works.filter(w => !w.error && (w.closed || w.stages.every(s => s.state === 'принят')));
     rows.push('Работы: завершено ' + done.length);
+    for (const w of works.filter(w => !w.error)) {
+      for (const s of w.stages) {
+        if (s.state === 'выдан без принятия') rows.push(title(w) + ': ' + s.title + ' — выдан без принятия; ' + (s.gate?.reasons || []).join('; '));
+        if (s.gate?.files?.length) rows.push(title(w) + ': ' + s.title + ' — место помощника с чистой памятью заполнено файлом Claude; сервер его не проверял');
+        if (s.gate?.warning) rows.push(title(w) + ': ' + s.title + ' — ' + s.gate.warning);
+      }
+    }
     for (const w of works.filter(w => !done.includes(w))) {
       if (w.error) { rows.push(w.error); continue; }
       const i = w.stages.findIndex(s => s.state !== 'принят');

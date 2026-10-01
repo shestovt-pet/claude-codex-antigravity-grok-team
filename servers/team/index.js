@@ -5,7 +5,7 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const { z } = require('zod');
 const { Team } = require('../../common/team'),
   { format } = require('../../common/format');
-const server = new McpServer({ name: 'team', version: '0.5.8' }),
+const server = new McpServer({ name: 'team', version: '0.5.9' }, require('../../common/server-instructions').options('team')),
   team = new Team();
 function register(name, title, description, inputSchema, fn) {
   if (!require('../../common/access').allowed('team', name)) return;
@@ -66,11 +66,12 @@ register(
   (a) => team.rules(a.part),
 );
 const stage = z.object({
+  ...require('../../common/stage-schema').stage,
   title: z.string().min(1),
   weight: z.number().positive(),
   accept_criteria: z.string().min(1),
   closes: z.string().trim().min(1).optional().describe('Какой пункт запроса закрывает этап.'),
-  state: z.enum(['план', 'идёт', 'принят']),
+  state: z.enum(['план', 'идёт', 'принят', 'выдан без принятия']),
   evidence: z.string().optional(),
   version: z.string().optional(),
 });
@@ -79,12 +80,13 @@ register(
   'Работа и этапы',
   'Создать, прочитать или обновить работу с проверкой редакции. Процент растёт при принятии с доказательством.',
   {
-    action: z.enum(['create', 'update', 'get', 'list', 'claim']),
+    action: z.enum(['create', 'update', 'get', 'list', 'claim', 'close']),
     title: z.string().trim().min(1).optional().describe('Русский заголовок работы.'),
     name: z.string().optional(),
     owner: z.string().trim().min(1).optional().describe('Метка сеанса владельца.'),
     expected_revision: z.number().int().nonnegative().optional().describe('Ожидаемая редакция; для создания 0.'),
     status_sent: z.boolean().optional().describe('Статус уже отправлен пользователю.'),
+    folder: z.string().optional().describe('Необязательная абсолютная существующая папка материала работы; автоматически не подставляется, задаётся один раз.'),
     goal: z.string().optional(),
     done_criteria: z.string().optional(),
     stages: z.array(stage).optional(),

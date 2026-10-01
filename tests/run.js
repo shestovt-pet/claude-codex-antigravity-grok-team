@@ -28,7 +28,10 @@ function finishLog() {
   fs.writeFileSync(log, fs.readFileSync(log, 'utf8').replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, ''));
 }
 (async () => {
-  for (const file of ['antigravity.js', 'part1.js', 'part2.js', 'trio-v2.js', 'trio-review.js', 'trio-v4.js', 'trio-v4-fix1.js', 'trio-v4-fix2.js', 'trio-v5.js', 'team-v6.js', 'team-v7.js', 'team-v8.js', 'team-v9.js', 'team-v10.js', 'team-v11.js', 'team-v12.js', 'team-v13.js']) {
+  const files = ['antigravity.js', 'part1.js', 'part2.js', 'trio-v2.js', 'trio-review.js', 'trio-v4.js', 'trio-v4-fix1.js', 'trio-v4-fix2.js', 'trio-v5.js', 'team-v6.js', 'team-v7.js', 'team-v8.js', 'team-v9.js', 'team-v10.js', 'team-v11.js', 'team-v12.js', 'team-v13.js', 'team-v14.js', 'team-v14-bridges.js'];
+  const selected = process.argv.slice(2);
+  if (selected.some(f => !files.includes(f))) throw Error('Неизвестный набор тестов.');
+  for (const file of selected.length ? selected : files) {
     let text = '';
     const child = spawn(process.execPath, [path.join(__dirname, file)], {
       env: { ...process.env, MOST_TEST_KEEP: '1', TEMP: temp, TMP: temp },

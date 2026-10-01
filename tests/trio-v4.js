@@ -251,7 +251,7 @@ test('Владение: живое поручение старше часа бл
       expected_revision: work.revision }), /Работа жива/);
   }
   json(jobFile, { id: 'live', work: 'owned', status: 'done' });
-  await grok.send({ task: 'Проверка', work: 'owned', stage: 'Проверка', owner: work.owner });
+  await grok.send({ task: 'Проверка', work: 'owned', stage: 'Проверка', role: 'совет', owner: work.owner });
   assert(Date.now() - Date.parse(read(file).heartbeat_at) < 5000);
 });
 test('Статус: 15 минут, первая строка всех ответов, status_sent и завершённая работа', async () => {

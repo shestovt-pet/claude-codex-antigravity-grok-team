@@ -31,7 +31,8 @@ function parseQuota(data, email = accountEmail()) {
   return [...invalid, ...[...groups.values()].map(({q, models}) => {
     const named = models.filter(m => m.explicit);
     for (const m of models) { if (named.length >= 2) break; if (!named.includes(m)) named.push(m); }
-    return named.map(m => m.label).join(', ') + (models.length > named.length ? ' и ещё ' + (models.length - named.length) : '') + (q.remainingFraction === 0 ? ': исчерпано (осталось 0 %)' : ': осталось ' + Math.round(q.remainingFraction * 100) + ' %') + ', сброс ' + new Date(q.resetTime).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    const reset = new Date(q.resetTime), today = reset.toDateString() === new Date().toDateString();
+    return models.map(m => m.label + ' [семья ' + (require('./model-family').family(m.label) || 'не определена') + ']' + (require('./model-family').family(m.label) === 'anthropic' ? ' (та же семья, что ведущий — не проверяет работу Claude; расходует квоту Antigravity, а не лимит Claude пользователя)' : '')).join(', ') + (q.remainingFraction === 0 ? ': исчерпано (осталось 0 %)' : ': осталось ' + Math.round(q.remainingFraction * 100) + ' %') + ', сброс ' + (today ? '' : reset.toLocaleDateString('ru-RU') + ' ') + reset.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
   })].join('; ') + ' · ' + (!email || !status.email ? 'аккаунт agy не удалось сверить' : email.toLowerCase() === status.email.toLowerCase() ? 'аккаунт agy совпадает' : 'аккаунт agy не совпадает');
 }
 function ps(code, deadline) {
@@ -55,7 +56,7 @@ function post(protocol, port, token, deadline) {
     req.end(JSON.stringify({ metadata: { ideName: 'antigravity', extensionName: 'antigravity', locale: 'ru' } }));
   });
 }
-const snapshot = data => { const email = accountEmail(); return { text: parseQuota(data, email), data, accountEmail: email }; };
+const snapshot = data => { const email = accountEmail(); return { text: parseQuota(data, email) + ' · снимок ' + new Date().toISOString(), data, accountEmail: email, taken_at: new Date().toISOString() }; };
 async function collectSnapshot() {
   if (process.env.MOST_AGY_QUOTA_FILE) {
     try { const data = JSON.parse(fs.readFileSync(process.env.MOST_AGY_QUOTA_FILE, 'utf8')); return data.closed ? closed : snapshot(data); }

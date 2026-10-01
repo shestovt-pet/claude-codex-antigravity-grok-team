@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Мост: Cowork ↔ Antigravity, версия 0.5.8.
+// Мост: Cowork ↔ Antigravity, версия 0.5.9.
 //
 // Файлы между диском и Antigravity возит мост, а не Claude:
 //   most_poruchit  — мост сам читает файл, сам отдаёт текст Antigravity;
@@ -34,7 +34,7 @@ const path = require("path");
 const crypto = require("crypto");
 
 const access = require('../../common/access');
-const VERSION = "0.5.8";
+const VERSION = "0.5.9";
 const isWindows = process.platform === "win32";
 const isLinux = process.platform === "linux";
 
@@ -1064,6 +1064,7 @@ function register(oldName, description, schema, fn) {
         : val.describe(publicText(val.description || ''));
   if (oldName === 'most_poruchit')
     Object.assign(inputSchema, {
+      ...require('../../common/stage-schema').send,
       text: z.string().optional().describe('Текст для проверки или опоры.'),
       stage: z.string().optional().describe('Этап работы.'),
       owner: z.string().optional().describe('Метка сеанса владельца работы.'),
@@ -1088,6 +1089,7 @@ function register(oldName, description, schema, fn) {
           if (oldName === 'most_poruchit' && args.work && !args.stage) return fail('Для зарегистрированной работы укажите этап.');
           const old = { ...args };
           for (const [a, b] of Object.entries(argNames)) if (b in args) old[a] = args[b];
+          if (oldName === 'most_poruchit') old.opora = args.refs;
           if (args.mode) old.rezhim = Object.keys(modeNames).find((k) => modeNames[k] === args.mode);
           if (oldName === 'most_poruchit' && args.text !== undefined) {
             if (args.file) return fail('Укажите либо файл, либо текст.');
@@ -1113,13 +1115,14 @@ function register(oldName, description, schema, fn) {
         }
         };
         try {
+          access.guard('antigravity', publicNames[oldName], args);
           return oldName === 'most_poruchit'
             ? await require('../../common/work-owner').withWork(args, perform) : await perform();
         } catch (e) { return fail(errText(e)); }
       }),
   );
 }
-const server = new McpServer({ name: 'antigravity', version: VERSION });
+const server = new McpServer({ name: 'antigravity', version: VERSION }, require('../../common/server-instructions').options('antigravity'));
 function reply(text) {
   const ctx = context.getStore() || {},
     args = ctx.args || {};
@@ -1255,7 +1258,7 @@ register(
       }
     } catch (e) { return fail(errText(e)); }
 
-    const opList = [];
+    const opList = require('../../common/brief-support').support(papka, context.getStore()?.args.opora);
     for (const [k, p] of (opora || []).entries()) {
       try {
         if (!fs.existsSync(p) || !fs.statSync(p).isFile()) return fail("файла опоры нет: " + p);
@@ -1281,6 +1284,14 @@ register(
     if (STREAM_INPUT) baseArgs.push("--input-format", "stream-json");
     let stdin;
     try {
+      const stageArgs = context.getStore()?.args;
+      if (stageArgs) {
+        stageArgs.model = m.id;
+        const originalTask = stageArgs.task || '';
+        await require('../../common/stage-gate').prepareJob(stageArgs, 'antigravity');
+        // poruchenie уже содержит материал режима text; добавляем только замечания замены.
+        if (stageArgs.task !== originalTask) poruchenie += stageArgs.task.slice(originalTask.length);
+      }
       prompt = buildInlinePrompt(poruchenie, rezhim, work, opList, markers);
       if (STREAM_INPUT) prompt = agyInput.INLINE_NOTICE + '\n' + prompt;
       const event = agyInput.userEvent(prompt);
@@ -1302,12 +1313,12 @@ register(
     const args = STREAM_INPUT ? baseArgs : baseArgs.concat(fileMode ? ["--add-dir", inputDir] : [], ["--print", prompt]);
 
     const job = {
-      id, stage: context.getStore()?.args.stage, workName: context.getStore()?.args.work, textInput: !!context.getStore()?.textFile, retry: { args, inputDir, stdin, ...(STREAM_INPUT ? { refs: opList } : {}) }, version: VERSION, from: access.client(), status: access.guest() ? "queued" : "running", startedAt: nowIso(), rezhim,
+      id, gateOrder: context.getStore()?.args.gateOrder, stageTitle: context.getStore()?.args.stageTitle, stageId: context.getStore()?.args.stageId, scopeTask: context.getStore()?.args.scopeTask, role: context.getStore()?.args.role, replaces: context.getStore()?.args.replaces, replacementEvidence: context.getStore()?.args.replacementEvidence, stage: context.getStore()?.args.stage, workName: context.getStore()?.args.work, textInput: !!context.getStore()?.textFile, retry: { args, inputDir, stdin, ...(STREAM_INPUT ? { refs: opList } : {}) }, version: VERSION, from: access.client(), status: access.guest() ? "queued" : "running", startedAt: nowIso(), rezhim,
       papka, papkaCanon, draftPath,
       work: work ? { path: work.path, range: work.range, fileHash: work.fileHash, bom: work.bom, text: work.text } : null,
       ...modelFields(m), modelSelectionPending: access.guest(), requestedModel: model || null,
       fileMode, poruchenieFile, promptChars: prompt.length, markers,
-      poruchenie, task: poruchenie,
+      poruchenie, task: context.getStore()?.args.scopeTask ?? poruchenie,
       owner: { instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT },
     };
     try { fs.mkdirSync(jobDir(id), { recursive: true }); saveJob(job); }

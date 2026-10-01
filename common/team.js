@@ -24,6 +24,18 @@ function systemic(c, who, id, text) {
 }
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
 const save = (file, value) => atomic(file, JSON.stringify(value, null, 2) + '\n');
+function stageFailure(s, before, previous, error) {
+  const unreadable = error.code === 'STAGE_READ_FAILED' || ['EACCES', 'EPERM', 'ENOENT', 'EBUSY', 'EIO'].includes(error.code);
+  for (const key of Object.keys(s)) delete s[key];
+  Object.assign(s, unreadable && ['принят', 'выдан без принятия'].includes(previous?.state) ? structuredClone(previous) : before);
+  s.state = unreadable ? (previous?.state || 'план') : previous?.state === 'выдан без принятия' ? previous.state : 'идёт';
+  const message = 'Этап [' + s.id + '] ' + (unreadable ? 'не удалось проверить; прежнее состояние сохранено: ' : 'не принят: ') + error.message;
+  s.gate ||= { files: [], reasons: [] };
+  if (unreadable) s.gate.warning = message;
+  else { s.gate.message = message; delete s.gate.warning; }
+  delete s.override; delete s.one_family; delete s.criterion_met; delete s.fresh_review_file;
+  return message;
+}
 function percent(w) {
   return Math.round(w.stages.filter((s) => s.state === 'принят').reduce((n, s) => n + s.weight, 0) * 100) / 100;
 }
@@ -61,6 +73,7 @@ function workText(w) {
     w.stages.length +
     ' — ' +
     (i < 0 ? 'все приняты' : w.stages[i].title) +
+    '\nЭтапы: ' + w.stages.map(s => s.title + ' [' + (s.id || 'старый этап') + '] · ' + s.state + ' · version ' + (s.version || 'не задана') + '\n' + [s.gate?.message, s.gate?.warning].filter(Boolean).join('\n')).join('\n') +
     '\nЦель: ' +
     w.goal +
     '\nСделано: ' +
@@ -115,11 +128,27 @@ class Team {
       return { error: 'карточка повреждена: ' + path.basename(file) };
     }
   }
+  async refreshWork(file) {
+    const w = this.readWork(file);
+    if (w.error) return w;
+    const before = JSON.stringify(w);
+    for (const s of w.stages.filter(s => s.level && ['принят', 'выдан без принятия'].includes(s.state))) {
+      const old = structuredClone(s);
+      try { s.gate.message = await require('./stage-gate').evaluate(w, s, old); delete s.gate.warning; }
+      catch (e) { stageFailure(s, old, old, e); }
+    }
+    if (w.closed && w.stages.some(s => !['принят', 'выдан без принятия'].includes(s.state))) w.closed = false;
+    if (JSON.stringify(w) !== before) {
+      if (JSON.stringify(w.stages.map(s => s.state)) !== JSON.stringify(JSON.parse(before).stages.map(s => s.state))) w.revision++;
+      save(file, w);
+    }
+    return w;
+  }
   async work(a) {
     require('./access').guard('team', 'team_work', a);
     if (a.action === 'create' && !a.owner?.trim()) throw Error('Для новой работы нужна метка владельца owner.');
     if (a.action === 'list') return deployer.locked(this.root, async () => {
-      const works = this.works();
+      const works = await Promise.all(this.works().map(w => w.error ? w : this.refreshWork(this.workFile(w.name))));
       for (const w of works.filter(w => !w.error && w.previous_owners?.includes(a.owner))) {
         require('./work-owner').check(w, a.owner);
       }
@@ -130,7 +159,7 @@ class Team {
     });
     const file = this.workFile(a.name);
     if (a.action === 'get') return deployer.locked(this.root, async () => {
-      const current = this.readWork(file);
+      const current = await this.refreshWork(file);
       if (current.error) return workText(current);
       return workText(require('./work-owner').touch(a.name, a.owner, this.root));
     });
@@ -164,13 +193,14 @@ class Team {
           'Работу уже изменил другой чат. Текущее состояние:\n' +
             (old ? workText(old) : 'Редакция 0: работа не создана.'),
         );
-      const w = { ...old, name: a.name, revision: (old?.revision || 0) + 1 };
+      const w = { ...old, stages: structuredClone(old?.stages), name: a.name, revision: (old?.revision || 0) + 1 };
+      if (a.action === 'close') w.closed = true;
       if (!w.title && w.name === 'trio-v2') w.title = 'Связка четырёх: 8 пунктов запроса';
       w.created_at ||= old?.updated_at || new Date().toISOString();
       w.owner ||= a.owner || null;
       w.heartbeat_at = new Date().toISOString();
       if (a.status_sent === true) w.status_sent_at = w.heartbeat_at;
-      for (const k of ['title', 'goal', 'done_criteria', 'stages', 'next_step', 'reminders'])
+      for (const k of ['title', 'folder', 'goal', 'done_criteria', 'stages', 'next_step', 'reminders'])
         if (a[k] !== undefined) w[k] = structuredClone(a[k]);
       if (
         !w.goal?.trim() ||
@@ -182,6 +212,23 @@ class Team {
         throw Error('Укажите цель, критерий завершения, этапы и следующий шаг.');
       if (Math.abs(w.stages.reduce((n, s) => n + s.weight, 0) - 100) > 0.000001)
         throw Error('Сумма весов этапов должна быть 100.');
+      if (a.folder !== undefined && (typeof a.folder !== 'string' || !path.isAbsolute(a.folder) || !fs.existsSync(a.folder) || !fs.statSync(a.folder).isDirectory()))
+        throw Error('folder: нужна абсолютная существующая папка.');
+      if (old?.folder && !require('./paths').samePath(w.folder, old.folder)) throw Error('Папку работы менять нельзя.');
+      const gate = require('./stage-gate');
+      gate.normalize(w, old, a.plan_change);
+      const stageMessages = [], stageErrors = [];
+      for (const s of w.stages) {
+        const previous = old?.stages.find(p => p.id === s.id), before = structuredClone(s);
+        let msg;
+        try { msg = await gate.evaluate(w, s, previous); delete s.gate.warning; }
+        catch (e) { msg = stageFailure(s, before, previous, e); stageErrors.push(msg); }
+        if (msg) {
+          if (!s.gate.warning) s.gate.message = msg;
+          if (s.state !== previous?.state && (['принят', 'выдан без принятия'].includes(s.state) || previous?.state === 'принят'))
+            stageMessages.push(s.title + ' [' + s.id + '] · ' + s.state + '\n' + msg);
+        }
+      }
       for (const s of w.stages) {
         if (
           !s.title?.trim() ||
@@ -189,11 +236,15 @@ class Team {
           (s.closes !== undefined && (typeof s.closes !== 'string' || !s.closes.trim())) ||
           !Number.isFinite(s.weight) ||
           s.weight <= 0 ||
-          !['план', 'идёт', 'принят'].includes(s.state)
+          !['план', 'идёт', 'принят', 'выдан без принятия'].includes(s.state)
         )
           throw Error('Некорректный этап.');
         if (s.state === 'принят' && (!s.evidence?.trim() || !s.version?.trim()))
           throw Error('Принятый этап требует доказательства проверки и версии.');
+      }
+      if (w.closed && w.stages.some(s => !['принят', 'выдан без принятия'].includes(s.state))) {
+        if (a.action === 'close') throw Error('Закрыть можно работу только с принятыми или выданными без принятия этапами.');
+        w.closed = false;
       }
       const structure = (stages) =>
         stages.map(({ title, weight, accept_criteria, closes }) => ({ title, weight, accept_criteria, closes }));
@@ -202,7 +253,10 @@ class Team {
         (JSON.stringify(structure(old.stages)) !== JSON.stringify(structure(w.stages)) ||
           old.goal !== w.goal ||
           old.done_criteria !== w.done_criteria ||
-          old.stages.some((s, i) => s.state === 'принят' && JSON.stringify(s) !== JSON.stringify(w.stages[i])));
+          (a.stages && old.stages.some(s => s.state === 'принят' && ['title', 'accept_criteria', 'version', 'evidence', 'state'].some(k => {
+            const submitted = a.stages.find(p => p.id === s.id || (!p.id && p.title === s.title));
+            return submitted?.[k] !== undefined && s[k] !== submitted[k] && !(k === 'version' && s.material?.length);
+          }))));
       if (changed && !a.plan_change?.trim())
         throw Error('Изменение плана или принятого этапа требует пояснения plan_change.');
       w.plan_changes = [
@@ -222,14 +276,15 @@ class Team {
       w.reminders = [...new Set(w.reminders || [])];
       w.updated_at = new Date().toISOString();
       save(file, w);
-      let warning = '';
+      let warning = stageErrors.length ? '\n' + stageErrors.join('\n') : '';
       try {
         atomic(inside(this.root, 'works', 'status.md'), this.works().map(workText).join('\n\n') + '\n');
       } catch (e) {
-        warning = '\nКарточка сохранена; представление status.md не обновлено: ' + e.message;
+        warning += '\nКарточка сохранена; представление status.md не обновлено: ' + e.message;
       }
-      const accepted = w.stages.map((s, i) => ({ s, i })).filter(({s, i}) => s.state === 'принят' && old?.stages[i]?.state !== 'принят');
-      if (!accepted.length) return workBrief(w) + warning;
+      if (stageMessages.length) warning += '\nСообщение пользователю (передайте дословно):\n' + stageMessages.join('\n');
+      const accepted = w.stages.map((s, i) => ({ s, i })).filter(({s}) => s.state === 'принят' && old?.stages.find(p => p.id === s.id)?.state !== 'принят');
+      if (!accepted.length) return workBrief(w) + warning + w.stages.filter(s => s.state === 'выдан без принятия').map(s => '\n' + s.title + ': выдан без принятия; ' + (s.gate.reasons || []).join('; ')).join('');
       const message = acceptedMessage(w, accepted);
       await require('./notify').notify(require('./summary').title(w) + ': принято ' + percent(w) + ' % плана', message);
       return workBrief(w) + warning + '\nСообщение пользователю (отправьте в чат):\n' + message;
@@ -639,8 +694,11 @@ class Team {
         }),
       );
     }
+    await section('Проверка этапов', () => deployer.locked(this.root, async () => {
+      for (const w of this.works().filter(w => !w.error)) await this.refreshWork(this.workFile(w.name));
+    }));
     const quota = await require('./quota-line').quotaLine({ state: this.state, binary: process.env.CODEX_PATH || findCodex(), advice: !full, agyModel: scope.agy_model });
-    const warning = require('./work-owner').reminder(this.root, undefined, scope);
+    const warning = [require('./server-instructions').read().warning, require('./work-owner').reminder(this.root, undefined, scope)].filter(Boolean).join('\n');
     if (!full) {
       const text = await require('./summary').compact(this, quota);
       return (warning ? warning + '\n' : '') + text + (notifyTest ? '\nПробное уведомление: ' + await require('./notify').notify('Связка: пробное уведомление', 'Уведомления команды работают.') : '');

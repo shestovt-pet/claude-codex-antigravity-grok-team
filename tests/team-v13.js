@@ -36,7 +36,7 @@ test('Р3–Р5: порядок публикации, уроки, версия',
   const l = read('lessons.md');
   assert.match(l, /## 58\. Верный ответ Grok отвергнут из-за регистра слова/);
   assert.match(read('tests/run.js'), /'team-v13\.js'/);
-  assert.equal(require('../package.json').version, '0.5.8');
+  assert.equal(require('../package.json').version, '0.5.9');
 });
 
 (async () => {
