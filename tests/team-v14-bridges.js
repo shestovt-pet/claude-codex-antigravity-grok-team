@@ -63,7 +63,7 @@ for (const who of ['codex', 'antigravity', 'grok']) test('12е: оба after_job
   const replaced = who === 'codex' ? 'antigravity' : 'codex';
   const codex = path.join(state, replaced === 'codex' ? 'codex-jobs' : 'jobs');
   for (const [id, task, status, n] of [['negative-a', 'Альфа', 'done', 1], ['negative-b', 'Бета', 'done', 2], ['failed-a', '', 'failed', 3], ['failed-b', '', 'failed', 4]]) {
-    const card = { id, work: w.name, workName: w.name, model: 'gemini-3.1-pro-high', stageId: s.id, stage: s.id, role: 'проверка', status, startedAt: new Date(Date.now() - 10000 + n * 10).toISOString(), task: s.version + ' ' + task, resultFile: id + '.result.txt' };
+    const card = { id, work: w.name, workName: w.name, model: replaced === 'codex' ? 'gpt-6' : 'gemini-3.1-pro-high', stageId: s.id, stage: s.id, role: 'проверка', status, startedAt: new Date(Date.now() - 10000 + n * 10).toISOString(), task: s.version + ' ' + task, resultFile: id + '.result.txt' };
     const text = 'ЗАМЕЧАНИЕ-' + id + '\nНЕ ПРИНЯТО: 1 блокирующих';
     json(path.join(codex, replaced === 'codex' ? id + '.json' : id + '/card.json'), card);
     write(path.join(codex, replaced === 'codex' ? id + '.result.txt' : id + '/result.txt'), text);

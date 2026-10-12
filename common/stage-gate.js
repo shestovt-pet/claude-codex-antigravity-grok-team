@@ -12,6 +12,10 @@ const task = j => j.scopeTask ?? ((j.task || j.poruchenie || '') + '\n' + (j.tex
 const at = j => Date.parse(j.startedAt || j.created_at || j.createdAt || j.at);
 const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const folded = s => s.trim().toLowerCase().replace(/ё/g, 'е');
+const sameDecision = (a, b) => {
+  const key = d => JSON.stringify(Object.entries(d).filter(([, v]) => v !== undefined).sort(([a], [b]) => a.localeCompare(b)));
+  return key(a) === key(b);
+};
 const tokenPattern = v => new RegExp('(^|[^\\p{L}\\p{N}_.-])' + escape(v) + '($|[^\\p{L}\\p{N}_.-])', 'u');
 function hasVersion(text, v) {
   const declarations = [...text.matchAll(/^version:\s*([^\r\n]+)$/gmu)].map(m => m[1].trim());
@@ -40,7 +44,9 @@ function allJobs() {
 }
 const belongs = (j, w, s) => (j.workName || j.work) === w.name && (j.stageId === s.id || (!j.stageId && (j.stage === s.id || j.stage === s.title)));
 function reviewerFamily(j) {
-  const f = j.who === 'codex' ? 'openai' : j.who === 'grok' ? 'xai' : require('./model-family').family(j.model);
+  const info = require('./provenance').reviewerInfo(j, j.who);
+  if (info.mismatch) throw Error(j.id + ': requested/reported model mismatch; вердикт требует выяснения маршрута.');
+  const f = info.family;
   if (!f) throw Error(j.id + ': семья не определена; модель запуска ' + (j.model || 'не указана'));
   return f;
 }
@@ -64,6 +70,7 @@ function reviewed(j, advisory = false) {
     reviewText: result.reviewText, at: at(j), readyAt: Date.parse(j.finishedAt) || undefined };
 }
 function parts(s) {
+  if (s.rules_version >= 15) return require('./stage-gate-v15').parts(s);
   const rows = Array.isArray(s.author) ? s.author : [{ ...s.author, part: '' }];
   if (!rows.length || rows.some(p => !families.includes(p.family) || !p.model?.trim() || (Array.isArray(s.author) && !p.part?.trim())) || new Set(rows.map(p => folded(p.part || ''))).size !== rows.length)
     throw Error('Укажите author: семью, модель и уникальные названия частей.');
@@ -98,13 +105,24 @@ function normalize(w, old, planChange = '') {
     if (raw.id && !prev) throw Error('Неизвестный id этапа: ' + raw.id);
     if (seen.has(prev?.id || raw.title)) throw Error('Повтор этапа.');
     seen.add(prev?.id || raw.title);
-    const s = { ...prev, ...raw, id: prev?.id || crypto.randomUUID(), rules_version: prev ? (prev.rules_version || 13) : 14 };
+    const s = { ...prev, ...raw, id: prev?.id || crypto.randomUUID(), rules_version: prev ? (prev.rules_version || 13) : 15 };
     if (prev?.state === 'принят' && raw.state !== 'принят' && raw.evidence === undefined) delete s.evidence;
     s.gate = structuredClone(prev?.gate || { files: [], reasons: [] });
-    if (prev && s.gate.locked && ['level', 'author', 'material'].some(k => JSON.stringify(s[k]) !== JSON.stringify(prev[k])))
+    if (s.rules_version >= 15) {
+      const previousDecisions = prev?.decisions || [], decisions = s.decisions || [];
+      if (!Array.isArray(decisions) || decisions.length < previousDecisions.length ||
+          previousDecisions.some((d, i) => !sameDecision(d, decisions[i])))
+        throw Error('Журнал решений неизменяем: допускается только добавление.');
+      s.decisions = decisions.map((d, i) => i < previousDecisions.length ? d : { ...d, at: new Date().toISOString() });
+    }
+    if (prev && s.gate.locked && ['level', 'author', 'material', 'artifact_manifest'].some(k => JSON.stringify(s[k]) !== JSON.stringify(prev[k])))
       throw Error('После первого поручения на проверку level, author и material не меняются.');
     if (s.level && !['мелочь', 'обычный', 'высокий'].includes(s.level)) throw Error('Неизвестный level.');
     if (s.author) parts(s);
+    if (s.artifact_manifest) {
+      if (!w.folder || !s.material?.some(f => samePath(path.resolve(w.folder, f), path.resolve(w.folder, s.artifact_manifest))))
+        throw Error('artifact_manifest должен входить в material для привязки ревью к хешу манифеста.');
+    }
     const paths = [w.folder, ...(s.material || []).map(f => path.resolve(w.folder || repoRoot, f))].filter(Boolean);
     if (s.rules_version >= 14 && paths.some(f => samePath(f, repoRoot) || isInsideReal(f, repoRoot)) && s.level && s.level !== 'высокий')
       throw Error('Работа над C:\\most требует уровень «высокий».');
@@ -124,10 +142,10 @@ function normalize(w, old, planChange = '') {
 function sources(w, s, jobs, ps) {
   const ids = list(s.source_jobs);
   if (new Set(ids).size !== ids.length) throw Error('Повтор source_jobs.');
-  const found = jobs.filter(j => belongs(j, w, s) && j.role === 'текст' && j.status === 'done');
+  const found = jobs.filter(j => belongs(j, w, s) && j.role === 'текст' && ['done', 'applied'].includes(j.status) && !j.cancelled);
   for (const id of ids) {
     const j = jobs.find(j => j.id === id);
-    if (!j || (j.workName || j.work) !== w.name || j.status !== 'done' || (j.role && j.role !== 'текст')) throw Error(id + ': source_jobs требует готовый текст этой работы.');
+    if (!j || (j.workName || j.work) !== w.name || !['done', 'applied'].includes(j.status) || j.cancelled || (j.role && j.role !== 'текст')) throw Error(id + ': source_jobs требует готовый текст этой работы.');
     if (!found.some(x => x.id === id)) found.push(j);
   }
   const seen = new Set();
@@ -150,6 +168,7 @@ function registerFile(w, s, file, v) {
   if (!hasVersion(text, v)) throw Error('В файле помощника нет version.');
   const row = { path: real, hash, count: verdict(text), at: new Date().toISOString(), gateOrder: nextOrder(s), version: v, reviewText: text };
   s.gate.files.push(row);
+  if (s.rules_version >= 15) s.gate.locked = true;
   return 'Место помощника с чистой памятью заполнено файлом Claude; сервер его не проверял. Защита от случайного повтора; нарочно изменённую копию сервер отличить не может.';
 }
 function freshRows(s) { return s.gate.files.map(f => ({ ...f, id: f.hash, who: 'fresh', family: 'anthropic', at: Date.parse(f.at), readyAt: Date.parse(f.at) })); }
@@ -239,7 +258,19 @@ async function replacement(w, s, j, rows, jobs, ps, verifyAvailability = true) {
     throw Error('after_job/after_file: нужны последние неснятые отказы заменяемого по каждой части.');
   return { note, files: suppliedFiles, after: [...neededJobs, ...neededFiles], text: rows.filter(x => neededJobs.has(x.id) || neededFiles.has(x.hash)).map(x => x.reviewText).join('\n\n') };
 }
+function checkArtifacts(w, s) {
+  if (!s.artifact_manifest) return null;
+  if (!w.folder) throw Error('artifact_manifest требует папку работы.');
+  const artifacts = require('./artifact-manifest');
+  const snapshot = artifacts.readLocal(w.folder, s.artifact_manifest, 8 * 1024 * 1024);
+  const report = artifacts.validateManifest(JSON.parse(snapshot.bytes.toString('utf8')), w.folder);
+  if (!report.ready) throw Error('Артефакты не готовы: ' + report.errors.join('; '));
+  return { manifest: s.artifact_manifest, sha256: sha(snapshot.bytes), ready: true };
+}
 async function evaluate(w, s, old, jobs = allJobs()) {
+  if (s.rules_version > 15) throw Error('Неизвестная версия правил этапа.');
+  if (s.rules_version >= 15) return require('./stage-gate-v15').evaluate(w, s, old, jobs);
+  if (s.artifact_manifest && (s.state === 'принят' || s.criterion_met)) s.artifact_verification = checkArtifacts(w, s);
   if (s.rules_version < 14 && !s.level) return '';
   if (s.state === 'выдан без принятия' && old?.state !== 'выдан без принятия' && !s.override && !s.one_family)
     throw Error('Состояние «выдан без принятия» требует override или one_family.');
@@ -248,7 +279,7 @@ async function evaluate(w, s, old, jobs = allJobs()) {
   if (!s.material?.length && s.level === 'высокий') throw Error('Этап «высокий» требует material.');
   if (!s.author) { if (action) throw Error('Укажите author.'); return ''; }
   const ps = parts(s), v = version(w, s), messages = [];
-  const changed = old?.state === 'принят' && (old.version !== v || ['title', 'accept_criteria', 'source_jobs', 'author', 'material'].some(k => JSON.stringify(old[k]) !== JSON.stringify(s[k])));
+  const changed = old?.state === 'принят' && (old.version !== v || ['title', 'accept_criteria', 'source_jobs', 'author', 'material', 'artifact_manifest'].some(k => JSON.stringify(old[k]) !== JSON.stringify(s[k])));
   s.version = v;
   if (changed) { s.state = 'идёт'; messages.push('Этап изменён после «принят» — снова не принят.'); }
   const linked = jobs.filter(j => belongs(j, w, s));
@@ -354,9 +385,9 @@ async function evaluate(w, s, old, jobs = allJobs()) {
   }
   if (s.gate.criterion) reasons.push('выдано без принятия: не выполнен критерий этапа — ' + s.gate.criterion);
   s.gate.reasons = [...new Set(reasons)];
-  s.gate.votes = rows.map(j => ({ id: j.id, who: j.who, family: j.family, model: j.model, count: j.count, at: j.at, version: v }));
+  s.gate.votes = rows.map(j => ({ id: j.id, who: j.who, family: j.family, model: j.model, provenance: require('./provenance').forJob(j, j.who), count: j.count, at: j.at, version: v }));
   messages.push(...s.gate.reasons);
-  for (const j of rows) messages.push(j.who + ': ' + j.family + (j.who === 'antigravity' ? '; модель запуска ' + j.model + '; ответ моделью мост не подтверждает' : '; модель ' + (j.model || j.who)));
+  for (const j of rows) messages.push(j.who + ': ' + j.family + '; ' + require('./provenance').format(j, j.who));
   if (rows.some(j => j.who === 'fresh')) messages.push('место помощника с чистой памятью заполнено файлом Claude; сервер его не проверял');
   if (!s.material?.length) messages.push('версия заявлена Claude; сервер её не вычислял');
   if (ps.some(p => p.family === 'anthropic') && !s.source_jobs?.length) messages.push('автор заявлен Claude');
@@ -386,6 +417,7 @@ async function prepareLocked(a, who, root) {
     if (!hasVersion(task(a), v)) throw Error('В поручении нужна текущая version: ' + v);
     s.version = v; s.gate.locked = true;
     if (a.replaces) {
+      if (s.rules_version >= 15) throw Error('В версии 15 место замены занимает только файл помощника Claude с чистой памятью.');
       for (const file of list(a.replaces.after_file)) {
         const hash = sha(fs.readFileSync(file));
         if (!s.gate.files.some(f => f.hash === hash)) registerFile(w, s, file, v);
@@ -401,4 +433,5 @@ async function prepareLocked(a, who, root) {
   atomic(file, JSON.stringify(w, null, 2) + '\n');
   return a;
 }
-module.exports = { normalize, evaluate, prepareJob, allJobs, parts, version, covers, verdict, registerFile, replacement, currentRows };
+module.exports = { checkArtifacts, reviewerFamily, normalize, evaluate, prepareJob, allJobs, parts, version, covers, verdict, registerFile, replacement, currentRows,
+  belongs, hasVersion, task, at, compare, named, reviewed, freshRows, sources, sameDecision };

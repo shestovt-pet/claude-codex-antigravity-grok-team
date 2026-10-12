@@ -11,7 +11,7 @@ async function quotaLine({ state = path.join(require('./paths').stateDir, 'team'
   catch (e) { claude = e.code === 'ENOENT' ? 'данные не предоставлены; процент пятичасового лимита не виден' : 'данные не предоставлены: ошибка чтения снимка'; }
   const q = require('./quota');
   const [c, a] = await Promise.all([Promise.resolve().then(() => codex || (binary ? q.codexQuota(binary) : q.rollout() || { source: 'данные не предоставлены' })).catch(e => ({source:'ошибка источника квоты', error:e.message})), require('./agy-quota').agySnapshot()]);
-  const line = 'Квоты: Claude — ' + (claude.includes('данные не предоставлены') ? '' : 'семья anthropic · ') + claude + '; Codex — ' + ((c.all?.length || c.five_hour || c.weekly ? 'семья openai · ' : '') + (c.error ? 'данные не предоставлены: ' + c.error : q.quotaText(c).replace(/\n/g, ', '))) + '; Antigravity — ' + (a.data ? a.text : 'данные не предоставлены: ' + a.text) + ' · снимок ' + new Date().toLocaleString('ru-RU');
+  const line = 'Квоты: Claude Desktop (отдельно от Claude через Antigravity) — ' + (claude.includes('данные не предоставлены') ? '' : 'семья anthropic · ') + claude + '; Codex — ' + ((c.all?.length || c.five_hour || c.weekly ? 'семья openai · ' : '') + (c.error ? 'данные не предоставлены: ' + c.error : q.quotaText(c).replace(/\n/g, ', '))) + '; Antigravity — ' + (a.data ? a.text : 'данные не предоставлены: ' + a.text) + ' · Квота не удостоверяет модель ответа · снимок ' + new Date().toLocaleString('ru-RU');
   return line + (advice ? '\n' + require('./quota-advice').codexAdvice(c) + '\n' + require('./quota-advice').agyAdvice(a, agyModel) + '\nGrok: квота не видна' : '');
 }
 module.exports = { quotaLine, claudeText };

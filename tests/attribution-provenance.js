@@ -1,0 +1,32 @@
+'use strict';
+const assert = require('node:assert/strict');
+const p = require('../common/provenance');
+const legacy = { id: 'job-1', from: 'codex', role: 'проверка', modelId: 'claude-opus-5-5-high', task: 'Ты Claude, судья' };
+assert.equal(p.forJob(legacy, 'antigravity').evidence_level, 'requested_only');
+assert.equal(p.forJob(legacy, 'antigravity').authenticated_client, 'codex');
+assert.equal(p.forJob(legacy, 'antigravity').orchestration_role, 'проверка');
+assert.equal(p.forJob(legacy, 'antigravity').artifact_generator_service, 'unknown');
+const changed = {...legacy};
+p.observe(changed, 'antigravity', {source: 'structured_provider_model_field', reportedModel: 'gemini-3.1-pro'});
+assert.equal(p.reviewerInfo(changed, 'antigravity').mismatch, true);
+assert.equal(p.reviewerInfo(changed, 'antigravity').family, 'google');
+const raw = JSON.stringify({event:'step_update',step_update:{step_type:'tool',tool_info:{name:'invoke_subagent',arguments:{secret:'TOP_SECRET'},output:'PRIVATE'}}});
+const obs = p.agyObservation(raw,{response:'I am Claude. generate_image TOP_SECRET',model:'gemini-3.1-pro',tool_calls:[{name:'generate_image',arguments:'TOP_SECRET'},{name:'secret-tool-TOP_SECRET'}]});
+assert.deepEqual(obs.toolNames,['generate_image','invoke_subagent']);
+p.observe(legacy,'antigravity',obs);
+assert(!JSON.stringify(legacy.provenance).includes('TOP_SECRET'));
+assert.equal(legacy.provenance.provider_reported_text_model,'unknown');
+assert.deepEqual(p.forJob(JSON.parse(JSON.stringify(legacy)), 'antigravity'), legacy.provenance);
+assert.equal(p.agyObservation('{bad json',null).toolNames.length,0);
+assert.deepEqual(p.agyObservation('',{tool_calls:[{name:'generate_image'}]}).toolNames,['generate_image']);
+assert.equal(p.reviewerInfo({model:'claude-opus-5'},'antigravity').family,'anthropic');
+for (const who of ['codex','grok']) {
+ const j={id:'j'}; j.provenance=p.forJob(j,who); j.provenance=p.forJob(j,who);
+ assert.equal(j.provenance.evidence_level,'unknown');
+ assert.equal(p.reviewerInfo(j,who).family_evidence,'configured_route');
+}
+const codex = p.codexObservation({type:'item.completed',item:{type:'command_execution',command:'SECRET',aggregated_output:'SECRET'}});
+assert.deepEqual(codex,{toolNames:['command_execution']});
+assert.equal(p.codexObservation({type:'item.completed',item:{type:'agent_message',text:'generate_image'}}).toolNames.length,0);
+assert.equal(p.reviewerInfo({modelId:'claude-sonnet'},'antigravity').family,p.reviewerInfo({modelId:'claude-opus'},'antigravity').family);
+console.log('attribution-provenance: passed');

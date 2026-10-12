@@ -36,6 +36,7 @@ function format(assistant, job = {}, body = '', next = 'Проверьте ре�
       : '',
     job.id ? 'Номер поручения: ' + job.id : '',
     job.from ? 'Отправитель: ' + job.from : '',
+    !summary ? require('./provenance').format(job, ({ Antigravity: 'antigravity', Codex: 'codex', Grok: 'grok' })[assistant] || 'unknown') : '',
     require('./progress').progress(job),
     body,
     job.stopUnconfirmed && normalized ? 'ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА: проверьте оставшийся процесс исполнителя.' : '',

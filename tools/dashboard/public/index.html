@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="ru" data-hour22="r-c-verify" data-hour23="h-walk" data-hour24="f-final">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Мост — дерево дел</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body class="tree-closed">
+  <header class="top">
+    <div class="top-left">
+      <button type="button" id="btnHome" class="brand" title="К дереву дел">Мост</button>
+      <button type="button" id="treeToggle" class="btn-tree-toggle" aria-expanded="false" aria-controls="treePane">Каталог</button>
+      <nav class="crumbs" id="crumbs" aria-label="Путь"></nav>
+    </div>
+    <div class="top-right">
+      <span id="hubStatus" class="hub-status hub-status-unknown" role="status" aria-live="polite" title="Состояние связи с хабом" data-hour22="r-c-verify" data-hour23="h-walk">
+        <span class="hub-status-chip" id="hubStatusChip">Проверяю связь…</span>
+        <span class="hub-status-when" id="hubStatusWhen"></span>
+      </span>
+      <span class="meta" id="clock"></span>
+      <button type="button" id="btnRefresh" class="btn-ghost">Обновить</button>
+      <button type="button" id="btnService" class="btn-ghost">Служебное</button>
+    </div>
+  </header>
+  <div id="statusBanner" class="banner banner-hidden" role="status" aria-live="polite"></div>
+
+  <div id="treeBackdrop" class="tree-backdrop" hidden aria-hidden="true"></div>
+
+  <main id="shell" class="shell">
+    <aside id="treePane" class="tree-pane" aria-label="Дерево дел">
+      <div class="tree-head">
+        <h1 id="treeRootLabel">Мои дела</h1>
+        <p class="lead small">Сначала рубрики «В работе» и «Завершённые», затем дела и разговоры — как папки в Проводнике. Справа — содержание.</p>
+        <div class="tree-actions">
+          <button type="button" id="btnNewProject" class="btn-primary">Новое дело</button>
+        </div>
+      </div>
+      <div id="explorerTree" class="explorer-tree" role="tree"></div>
+      <p class="muted small" id="treeMeta"></p>
+    </aside>
+
+    <section id="contentPane" class="content-pane" aria-label="Содержание">
+      <div id="pane-welcome" class="pane active">
+        <h2>Выберите дело слева</h2>
+        <p class="lead">Откройте рубрику, затем дело, затем папку «Разговоры» — здесь появится переписка и ответы.</p>
+      </div>
+
+      <div id="pane-project" class="pane" hidden>
+        <div class="view-head">
+          <h2 id="projectTitle">Дело</h2>
+          <p class="status-pill" id="projectStatus"></p>
+          <p class="lead" id="projectGoal"></p>
+          <p class="muted" id="projectOwner"></p>
+        </div>
+        <div class="row wrap" style="margin-bottom:10px">
+          <button type="button" id="btnNewChat" class="btn-primary">Новый разговор</button>
+        </div>
+        <div class="card compose-card" id="composeCard">
+          <h3>Новое сообщение в этом деле</h3>
+          <p class="muted small">Выберите помощника и напишите, что нужно. Сначала сохранится черновик — затем подтвердите и передайте в работу.</p>
+          <div class="filters">
+            <label>Кому
+              <select id="composeWho">
+                <option value="grok">Грок</option>
+                <option value="codex">Кодекс</option>
+                <option value="antigravity">Антигравити</option>
+              </select>
+            </label>
+          </div>
+          <label class="block-label">Сообщение
+            <textarea id="composeText" rows="4" placeholder="Опишите задачу простыми словами…"></textarea>
+          </label>
+          <div class="row" style="margin-top:8px">
+            <button type="button" id="btnComposeDraft" class="btn-primary">Сохранить черновик</button>
+            <span class="muted" id="composeMeta"></span>
+          </div>
+        </div>
+        <p class="muted small" id="projectHint">Раскройте «Разговоры» слева, чтобы открыть переписку.</p>
+      </div>
+
+      <div id="pane-chat" class="pane" hidden>
+        <div class="view-head">
+          <h2 id="chatTitle">Разговор</h2>
+          <p class="muted" id="chatSub"></p>
+          <p class="next-step" id="chatNext"></p>
+          <p class="judge-note muted small" id="chatJudgeNote"></p>
+        </div>
+        <div id="thread" class="thread" aria-live="polite"></div>
+        <div id="chatRelated" class="related hidden"></div>
+        <div class="chat-actions card" id="chatActions">
+          <div class="row wrap" id="chatActionButtons"></div>
+          <details class="key-box" id="keyBox">
+            <summary>Нужен ключ подтверждения</summary>
+            <p class="muted small">Иногда передача помощнику требует одноразового ключа с вашего компьютера. Откройте, только если подсказка выше просит.</p>
+            <pre class="preview" id="revealCmd"></pre>
+            <div class="row wrap">
+              <button type="button" id="btnCopyReveal">Скопировать команду</button>
+              <label class="block-label">Номер запроса
+                <input id="confirmIdInput" autocomplete="off" />
+              </label>
+              <label class="block-label">Ключ
+                <input id="confirmTokenInput" type="password" autocomplete="off" />
+              </label>
+              <button type="button" id="btnHostEnqueue">Передать с ключом</button>
+            </div>
+            <span class="muted" id="keyMeta"></span>
+          </details>
+          <div class="followup">
+            <h3>Добавить комментарий</h3>
+            <textarea id="followupText" rows="3" placeholder="Напишите комментарий или следующее сообщение…"></textarea>
+            <div class="row">
+              <button type="button" id="btnFollowup" class="btn-primary">Сохранить комментарий</button>
+              <span class="muted" id="followupMeta"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="pane-material" class="pane" hidden>
+        <div class="view-head">
+          <h2 id="materialTitle">Материал</h2>
+        </div>
+        <div id="materialSummary" class="material-summary" hidden></div>
+        <pre class="material-body" id="materialBody"></pre>
+      </div>
+
+      <div id="pane-service" class="pane" hidden>
+        <div class="view-head">
+          <button type="button" class="btn-back" id="btnBackFromService">← К дереву</button>
+          <h2>Служебное</h2>
+          <p class="lead">Проверка каналов и квот. Обычная работа — в дереве слева.</p>
+        </div>
+        <div id="serviceReady" class="grid2"></div>
+        <div id="serviceQuotas" class="mono muted" style="margin-top:12px"></div>
+      </div>
+    </section>
+  </main>
+
+  
+  <nav id="h16StickyBar" class="h16-sticky actions-sticky" aria-label="Быстрые действия" hidden>
+    <button type="button" id="h16StickyNewProject" class="btn-primary">Новое дело</button>
+    <button type="button" id="h16StickyNewChat" class="btn-primary" hidden>Новый разговор</button>
+    <button type="button" id="h16StickyComment" class="btn-primary" hidden>Сохранить комментарий</button>
+  </nav>
+
+  <script src="/app.js"></script>
+</body>
+</html>

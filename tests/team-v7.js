@@ -118,6 +118,13 @@ test('Р7: общий транспорт — одновременно, обра�
   await transport.onmessage({ id: 3, method: 'tools/call' }); assert.match(sent.at(-1).result.content[0].text, /alice[\s\S]*bob/);
 });
 test('Р7: team_status через SDK принимает owner/work, включая ошибку схемы', async () => {
+  // Собственный git-корень не даёт git status подняться до репозитория прогона.
+  const git = (...args) => require('child_process').execFileSync('git', args, { cwd: RUN, encoding: 'utf8', windowsHide: true });
+  git('init', '-b', 'main');
+  git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid');
+  write(path.join(RUN, '.gitignore'), '*\n');
+  git('add', '-f', '.gitignore'); git('commit', '-m', 'Isolated status fixture');
+  json(path.join(RUN, 'live/deployed.json'), { commit: git('rev-parse', 'HEAD').trim(), release: ROOT });
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js'), { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/team/index.js')], env: { ...process.env }, stderr: 'pipe' });
   const client = new Client({ name: 'v7', version: '1' }); await client.connect(transport);

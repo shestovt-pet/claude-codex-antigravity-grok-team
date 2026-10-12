@@ -13,6 +13,7 @@ function fixture(opts = {}) {
   const w = { name: 'work-' + (++seq), folder: project, stages: [{ title: 'Итог', weight: 100, accept_criteria: 'Проверено', state: 'план', level: 'обычный', author: { family: 'anthropic', model: 'claude' }, version: 'version-' + seq, ...opts }] };
   gate.normalize(w, null);
   const s = w.stages[0];
+  s.rules_version = 14; // Эти сценарии фиксируют прежние исходы, независимо от версии новых этапов.
   if (s.material?.length) s.version = gate.version(w, s);
   return { w, s };
 }
@@ -152,12 +153,12 @@ test('12е, 12н: последние отказы по частям, дедуп�
   await gate.replacement(g.w, g.s, r, gate.currentRows(g.w, g.s, [], g.s.version), [], gate.parts(g.s)); assert.equal(JSON.stringify(g.s.gate.files), before);
 });
 test('12м: принятие называет модель запуска и границу доверия', async () => {
-  const f = fixture(); job(f); job(f, 'antigravity'); assert.match(await accept(f), /модель запуска gemini-3.1-pro-high; ответ моделью мост не подтверждает/);
+  const f = fixture(); job(f); job(f, 'antigravity'); assert.match(await accept(f), /запрошено: gemini-3.1-pro-high; объявлено провайдером: unknown; доказательство: requested_only/);
 });
-test('12о: перестановка и пропуск служебных полей сохраняют историю, новый этап v14', () => {
+test('12о: перестановка и пропуск служебных полей сохраняют историю, новый этап v15', () => {
   const f = fixture(); f.s.gate.files.push({ hash: 'keep' }); f.s.gate.reasons.push('причина'); f.s.gate.votes = [{ id: 'vote' }];
   const updated = { ...f.w, stages: [{ title: 'Новый' }, { title: f.s.title, id: f.s.id }] }; gate.normalize(updated, f.w);
-  assert.deepEqual(updated.stages[1].gate, f.s.gate); assert.equal(updated.stages[0].rules_version, 14); assert.notEqual(updated.stages[0].id, f.s.id);
+  assert.deepEqual(updated.stages[1].gate, f.s.gate); assert.equal(updated.stages[0].rules_version, 15); assert.notEqual(updated.stages[0].id, f.s.id);
 });
 test('12п: принятие Б не снимает отказ А, включая замену', async () => {
   const f = fixture({ level: 'мелочь', author: [{ part: 'Альфа', family: 'google', model: 'gemini' }, { part: 'Бета', family: 'anthropic', model: 'claude' }] });
@@ -243,6 +244,7 @@ test('team_work close: выданные этапы перечисляются, �
   const team = new Team(root), n = 'close-work';
   await team.work({ action: 'create', owner: 'test', name: n, expected_revision: 0, folder: project, goal: 'цель', done_criteria: 'готово', next_step: 'проверка', stages: [{ title: 'Итог', weight: 100, state: 'план', accept_criteria: 'готово', level: 'обычный', author: { family: 'anthropic', model: 'claude' }, version: 'close-version' }] });
   let w = JSON.parse(fs.readFileSync(team.workFile(n), 'utf8')), s = w.stages[0]; const id = job({ w, s });
+  s.rules_version = 14; json(team.workFile(n), w); // Историческая выдача one_family версии 14.
   await team.work({ action: 'update', owner: 'test', name: n, expected_revision: 1, stages: [{ ...s, state: 'принят', reviews: [id], one_family: true, reason: 'нет другой семьи' }] });
   const out = await team.work({ action: 'close', owner: 'test', name: n, expected_revision: 2 });
   w = JSON.parse(fs.readFileSync(team.workFile(n), 'utf8')); assert(w.closed); assert.equal(require('../common/team').percent(w), 0); assert.match(out, /выдан без принятия/);

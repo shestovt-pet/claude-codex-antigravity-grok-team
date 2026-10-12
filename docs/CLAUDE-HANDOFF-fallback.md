@@ -121,4 +121,6 @@ Webhook secrets и содержимое `state/grok-webhook.json` в этот б
 
 ## Roles per-task (incr1)
 
+GitHub public: `6c5bb9b` (from most `2381486`). Локально most: `2381486`.
+
 Гибкие роли на задачу: `scripts/roles.cmd propose|get|confirm-*`. Артефакт `works/<work>/roles.json`. Confirm только человек (`roles.confirm`). Модуль `common/task-roles.js`. См. HOWTO § Roles и `.work/_grok_flexible_roles/design.md`.

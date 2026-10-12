@@ -315,7 +315,7 @@ test('team-v7: team_rules выдаёт roles отдельно и в all из mai
 test('Квота Claude: старый снимок не заменяет новый; статус не запускает поручений', async () => {
   const q = { percent: 20, source: 'снимок', taken_at: '2026-09-26T20:00:00Z' };
   const result = await team.status(q);
-  assert.match(result, /Claude — использовано 20/);
+  assert.match(result, /Claude Desktop \(отдельно от Claude через Antigravity\) — использовано 20/);
   await team.status({ ...q, percent: 99, taken_at: '2026-09-25T20:00:00Z' });
   assert.equal(read(path.join(team.state, 'claude-quota.json')).percent, 20);
   await rejects(() => team.status({ ...q, taken_at: 'не дата' }), /Некорректный/);
@@ -344,6 +344,15 @@ test(
   },
   true,
 );
+test('Р12.11: два из трёх не заменяют обязательные голоса team_change', async () => {
+  for (const missing of ['codex', 'antigravity']) {
+    const x = await change('v16-missing-' + missing);
+    await vote(x, 'claude');
+    await vote(x, missing === 'codex' ? 'antigravity' : 'codex');
+    await rejects(() => x.team.change({ action: 'merge', name: 'one' }), /Нет действующего/);
+    assert.equal(g.git(x.root, ['rev-parse', 'main']).trim(), x.c.base);
+  }
+}, true);
 test(
   'Ворота: без вердиктов и на другую пару слияния нет',
   async () => {
@@ -715,7 +724,7 @@ test('Статус: сбои квот, работ, репозитория, ре�
   team.works = () => { throw Error('сбой работ'); };
   try {
     const out = await team.status(undefined, undefined, undefined, true);
-    for (const text of ['Claude — данные не предоставлены: ошибка чтения снимка', 'таймаут квоты', 'Работы: ошибка: сбой работ',
+    for (const text of ['Claude Desktop (отдельно от Claude через Antigravity) — данные не предоставлены: ошибка чтения снимка', 'таймаут квоты', 'Работы: ошибка: сбой работ',
       'Репозиторий:', 'Релизы: ошибка:', 'сбой поручений', 'Поручения antigravity:', 'team: версия процесса'])
       assert(out.includes(text), text + '\n' + out);
   } finally { quota.codexQuota = oldQuota; stores.list = oldList; team.works = oldWorks; }

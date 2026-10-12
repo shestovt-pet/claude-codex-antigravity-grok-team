@@ -4,9 +4,12 @@ const { stateDir, isInsideReal } = require('./paths');
 const { atomic, inside } = require('./team-git');
 const locks = require('./locks');
 const states = require('./states');
+const provenance = require('./provenance');
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const active = ['queued', 'running', 'delivery_unclear'];
+// Ключ неотвеченного поручения живёт до проверенного ответа или 7 суток (ПК бывает выключен); 60 мин — только порог «потеряно» и уведомления.
+const KEY_TTL_MS = 7 * 24 * 3600000;
 
 function redact(value, secrets = []) {
   let text = String(value);
@@ -58,12 +61,68 @@ class Grok {
   constructor(state = stateDir, options = {}) {
     this.state = state;
     this.options = options;
-    this.jobs = path.join(state, 'grok-jobs');
+    // Тестовые поручения (options.test) живут в отдельных каталогах grok-test и grok-test-jobs и никогда не считаются голосом Grok.
+    this.test = Boolean(options.test);
+    this.base = this.test ? 'grok-test' : 'grok';
+    this.jobsName = this.test ? 'grok-test-jobs' : 'grok-jobs';
+    this.jobs = path.join(state, this.jobsName);
+  }
+  has(id) {
+    return /^[a-zA-Z0-9_-]{1,80}$/.test(id) && fs.existsSync(path.join(this.jobs, id + '.json'));
+  }
+  // Неверный завершённый файл ответа не занимает путь: переносим в replies_rejected и пишем журнал.
+  quarantine(id, reply, snapshot, why) {
+    const dir = inside(this.state, this.base, 'replies_rejected');
+    fs.mkdirSync(dir, { recursive: true });
+    if (!isInsideReal(dir, this.state) || fs.lstatSync(dir).isSymbolicLink()) throw Error('Путь Grok выходит за разрешённое хранилище.');
+    const at = new Date().toISOString();
+    const target = path.join(dir, id + '.' + at.replace(/[:.]/g, '-') + '.' + crypto.randomUUID() + '.md');
+    // Захват имени атомарен: после него сравниваем и переносим один и тот же файл.
+    const captured = path.join(path.dirname(reply), id + '.pending-' + crypto.randomUUID() + '.md');
+    fs.renameSync(reply, captured);
+    if (sha(fs.readFileSync(captured)) !== sha(snapshot)) {
+      try {
+        // link не заменяет занятый путь, в отличие от rename на некоторых ОС.
+        fs.linkSync(captured, reply);
+        fs.unlinkSync(captured);
+      } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        // Оба файла сохранены. Следующий круг проверит захваченный снимок.
+      }
+      return false;
+    }
+    fs.renameSync(captured, target);
+    fs.appendFileSync(path.join(dir, 'rejected.log'), JSON.stringify({ at, id, file: path.basename(target),
+      reason: why, sha256: sha(snapshot), bytes: snapshot.length }) + '\n');
+    return true;
+  }
+  pendingReplies(id) {
+    const dir = path.dirname(this.file('replies', id));
+    return fs.readdirSync(dir).filter(n => n.startsWith(id + '.pending-') && n.endsWith('.md'))
+      .sort().map(n => path.join(dir, n));
+  }
+  archivePending(id) {
+    for (const file of this.pendingReplies(id)) {
+      if (!isInsideReal(file, this.state) || fs.lstatSync(file).isSymbolicLink())
+        throw Error('Путь Grok выходит за разрешённое хранилище.');
+      this.quarantine(id, file, fs.readFileSync(file), 'Оставшийся снимок после принятия ответа; не является новым голосом.');
+    }
+  }
+  archivePendingSafely(job) {
+    try { this.archivePending(job.id); }
+    catch (e) {
+      const warning = 'Не удалось перенести оставшиеся pending в карантин';
+      // Обслуживание остатков не отменяет уже проверенный ответ и не ломает общий опрос.
+      if (!String(job.reason || '').includes(warning))
+        job.reason = (job.reason ? job.reason + '; ' : '') + warning +
+          ' (' + (/^[A-Z0-9_]+$/.test(e.code || '') ? e.code : 'ошибка пути или файла') + ').';
+      this.save(job);
+    }
   }
   file(kind, id, suffix = '.md') {
     if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw Error('Некорректный номер поручения.');
     fs.mkdirSync(this.state, { recursive: true });
-    const dir = kind === 'jobs' ? inside(this.state, 'grok-jobs') : inside(this.state, 'grok', kind);
+    const dir = kind === 'jobs' ? inside(this.state, this.jobsName) : inside(this.state, this.base, kind);
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, id + suffix);
     if (!isInsideReal(file, this.state) || !isInsideReal(file, dir) ||
@@ -73,8 +132,15 @@ class Grok {
     }
     return file;
   }
-  load(id) { return JSON.parse(fs.readFileSync(this.file('jobs', id, '.json'), 'utf8')); }
-  save(job) { atomic(this.file('jobs', job.id, '.json'), JSON.stringify(job, null, 2) + '\n'); }
+  load(id) {
+    const job = JSON.parse(fs.readFileSync(this.file('jobs', id, '.json'), 'utf8'));
+    job.provenance = provenance.forJob(job, 'grok');
+    return job;
+  }
+  save(job) {
+    job.provenance = provenance.forJob(job, 'grok');
+    atomic(this.file('jobs', job.id, '.json'), JSON.stringify(job, null, 2) + '\n');
+  }
   eraseKey(id) {
     const file = this.file('jobs', id, '.key');
     if (fs.existsSync(file)) fs.writeFileSync(file, '');
@@ -127,11 +193,13 @@ class Grok {
       args.text = (args.text || '') + support.text(support.support(args.folder, args.opora));
       const settings = config(this.state); // До записи карточки и отправки ключа.
       if (!args.task?.trim()) throw Error('Нужно поручение.');
+      if (this.test && (args.work || args.stage)) throw Error('Тестовое поручение не привязывается к работе и этапу.');
+      if (!this.test && /^\s*(test|тест)(?![\p{L}\p{N}_])/iu.test(args.task)) throw Error('Проверку моста отправляйте как тест: grok_send(test=true). Боевой ответ Grok за тест не тратится.');
       if (args.work && !args.stage) throw Error('Для работы укажите этап.');
       if (args.retry_of) this.load(args.retry_of);
-      await require('./stage-gate').prepareJob(args, 'grok');
+      if (!this.test) await require('./stage-gate').prepareJob(args, 'grok');
       const id = crypto.randomUUID(), secret = crypto.randomBytes(32);
-      const job = { id, task: args.task, text: args.text || '', materialHash: sha(args.text || args.task),
+      const job = { id, test: this.test || undefined, task: (this.test ? '[ТЕСТ — не голос Grok] ' : '') + args.task, text: args.text || '', materialHash: sha(args.text || args.task),
         work: args.work, stage: args.stage, stageTitle: args.stageTitle, stageId: args.stageId, gateOrder: args.gateOrder, scopeTask: args.scopeTask, role: args.role, replaces: args.replaces, replacementEvidence: args.replacementEvidence, folder: args.folder, retry_of: args.retry_of, from: require('./access').client(),
         status: 'delivery_unclear', startedAt: new Date().toISOString(),
         reason: 'Отправка начата; подтверждение ещё не сохранено.' };
@@ -180,24 +248,48 @@ class Grok {
   async refresh(id) {
     return this.locked(id, async () => {
       const job = this.load(id);
-      if (job.status === 'done') { this.eraseKey(id); return job; }
-      const reply = this.file('replies', id);
-      if (fs.existsSync(reply) && !job.lateHash) {
+      if (job.status === 'done') { this.save(job); this.eraseKey(id); this.archivePendingSafely(job); return job; }
+      // An old local cancellation never proved that the remote routine stopped.
+      if (job.status === 'cancelled' || job.status === 'cancel_requested') {
+        job.cancel_requested ||= { at: job.finishedAt || new Date().toISOString(), remote_ack: false };
+        job.status = 'stop_unconfirmed';
+        job.reason = 'Отмена запрошена локально; остановить рутину Grok извне нельзя, подтверждения остановки нет.';
+      }
+      if (job.late_result?.verification === 'hmac_verified') this.eraseKey(id);
+      // Срок проверяется до подписи, в том числе после долгого простоя.
+      if (Date.now() - Date.parse(job.startedAt) >= KEY_TTL_MS) {
+        job.keyExpiredAt ||= new Date().toISOString();
+        this.eraseKey(id);
+      }
+      const primaryReply = this.file('replies', id);
+      let skipPending = false;
+      for (let attempt = 0; attempt < 3 && !job.lateHash; attempt++) {
+        const pending = !skipPending && this.pendingReplies(id)[0];
+        const reply = pending || primaryReply;
+        if (!fs.existsSync(reply)) break;
+        if (!isInsideReal(reply, this.state) || fs.lstatSync(reply).isSymbolicLink())
+          throw Error('Путь Grok выходит за разрешённое хранилище.');
+        let snapshot;
         try {
+          snapshot = fs.readFileSync(reply);
           if (sha(fs.readFileSync(this.file('briefs', id))) !== job.briefHash) {
             throw Error('бриф изменён — ответ не учитывается');
           }
-          const snapshot = fs.readFileSync(reply), parsed = parseReply(snapshot);
+          const parsed = parseReply(snapshot);
           if (parsed) {
             if (parsed.text.split(/\r?\n/)[0] !== 'Ответ на ' + id + ', материал ' + job.materialHash) {
               throw Error('устаревший, не учитывается: чужой номер или материал');
             }
             const key = fs.readFileSync(this.file('jobs', id, '.key'));
-            const terminal = ['lost', 'cancelled', 'failed'].includes(job.status);
+            // «Потеряно» при живом ключе не конечно: проверенный ответ Grok после 60 мин засчитывается (ПК мог быть выключен).
+            const terminal = Boolean(job.cancel_requested || job.keyExpiredAt) || ['cancelled', 'failed', 'stop_unconfirmed', 'stop_confirmed'].includes(job.status) ||
+              (job.status === 'lost' && key.length === 0);
             if (terminal && key.length === 0) {
               // После уничтожения ключа поздние данные уже нельзя считать проверенным голосом.
               atomic(this.file('jobs', id, '.late.txt'), snapshot);
               job.lateHash = sha(snapshot);
+              job.late_result = { hash: job.lateHash, receivedAt: new Date().toISOString(),
+                verification: 'unverifiable_key_missing', counts_as_review: false };
               job.reason = 'поздний ответ: только данные, ключ проверки уже уничтожен';
             } else {
               const expected = crypto.createHmac('sha256', key).update(parsed.payload).digest();
@@ -208,47 +300,79 @@ class Grok {
               if (parsed.text.includes(key.toString('hex'))) {
                 throw Error('подложный ответ: содержит секрет поручения');
               }
-              atomic(this.file('jobs', id, '.result.txt'), snapshot);
-              job.resultHash = sha(snapshot);
-              job.verdict = parsed.verdict;
-              job.status = 'done';
-              job.finishedAt = new Date().toISOString();
-              job.reason = 'Ответ проверен и сохранён.';
+              job.delivery_integrity = { verification: 'hmac_verified', payload_sha256: sha(parsed.payload),
+                model_attestation: false };
+              if (terminal) {
+                atomic(this.file('jobs', id, '.late.txt'), snapshot);
+                job.lateHash = sha(snapshot);
+                job.late_result = { hash: job.lateHash, receivedAt: new Date().toISOString(),
+                  verification: 'hmac_verified', counts_as_review: false };
+                job.reason = 'Поздний ответ проверен и сохранён отдельно; не является голосом и не подтверждает остановку.';
+              } else {
+                atomic(this.file('jobs', id, '.result.txt'), snapshot);
+                job.resultHash = sha(snapshot);
+                job.verdict = parsed.verdict;
+                job.status = 'done';
+                job.finishedAt = new Date().toISOString();
+                if (job.lostAt || job.lost_notified) job.answered_after_lost = true;
+                job.reason = job.test ? 'ТЕСТ: ответ проверен и сохранён; голосом Grok не считается.' : 'Ответ проверен и сохранён.';
+              }
               this.save(job); // Сначала карточка: сбой до очистки ключа возобновляем.
               this.eraseKey(id);
             }
-          } else job.reason = 'Ответ ещё пишется: нет строки конца.';
+          } else {
+            job.reason = 'Ответ ещё пишется: нет строки конца.';
+            if (pending) { skipPending = true; continue; }
+          }
         } catch (e) {
           const known = /^(бриф изменён|устаревший|подложный ответ|Ответ не является)/.test(e.message);
           job.reason = known ? e.message : 'Не удалось проверить файл ответа.';
+          if (/^(устаревший|подложный ответ|Ответ не является)/.test(e.message) && job.status !== 'done') {
+            try {
+              if (this.quarantine(id, reply, snapshot, e.message)) {
+                job.rejected = (job.rejected || 0) + 1;
+                job.reason = 'Чужой или неверный файл ответа перенесён в replies_rejected (' + e.message + '); ждём ответ Grok.';
+              }
+              else continue; // Новый снимок проверяется заново.
+            } catch { job.reason += '; перенести файл в карантин не удалось.'; }
+          }
         }
+        break;
       }
-      if (active.includes(job.status) && Date.now() - Date.parse(job.startedAt) >= 3600000) {
+      if (!job.cancel_requested && active.includes(job.status) && Date.now() - Date.parse(job.startedAt) >= 3600000) {
         job.status = 'lost';
         job.finishedAt = new Date().toISOString();
+        job.lostAt = job.finishedAt;
         job.reason = 'Нет проверенного ответа 60 мин. Приложение Grok может быть закрыто ' +
-          'или ожидать разрешения локальных действий.';
+          'или ожидать разрешения локальных действий. Ключ хранится 7 суток: проверенный ответ ещё будет засчитан.';
         this.save(job);
-        this.eraseKey(id);
         await require('./notify').notify('Grok: поручение потеряно', job.reason);
       }
-      if (['lost', 'cancelled', 'failed'].includes(job.status)) this.eraseKey(id);
+      if (['cancelled', 'failed'].includes(job.status) && !job.cancel_requested) this.eraseKey(id);
+      if (Date.now() - Date.parse(job.startedAt) >= KEY_TTL_MS && job.status !== 'done') {
+        if (job.status === 'lost' && !job.keyExpiredAt) job.keyExpiredAt = new Date().toISOString();
+        this.eraseKey(id);
+      }
       this.save(job);
+      if (job.status === 'done') this.archivePendingSafely(job);
       return job;
     });
   }
   async cancel(id) {
     return this.locked(id, async () => {
       const job = this.load(id);
-      job.status = 'cancelled';
-      job.finishedAt = new Date().toISOString();
-      job.reason = 'отменено у нас; остановить рутину Grok извне нельзя';
+      if (job.status === 'done' || job.cancel_requested) return job;
+      job.cancel_requested = { at: new Date().toISOString(), remote_ack: false };
+      job.status = 'cancel_requested';
+      this.save(job); // Durable intent survives a restart before the local status update.
+      job.status = 'stop_unconfirmed';
+      job.reason = 'Отмена запрошена локально; остановить рутину Grok извне нельзя, подтверждения остановки нет.';
       this.save(job);
-      this.eraseKey(id);
       return job;
     });
   }
   resultText(job, from = 0) {
+    job.provenance = provenance.forJob(job, 'grok');
     const suffix = job.resultHash ? '.result.txt' : job.lateHash ? '.late.txt' : null;
     if (!suffix) return job.reason;
     const snapshot = fs.readFileSync(this.file('jobs', job.id, suffix));
@@ -267,8 +391,9 @@ class Grok {
     return 'Grok: ' + configured + '; поручений ' + jobs.length + '; последнее ' +
       (jobs[0]?.startedAt || 'нет') + '\n' + jobs.slice(0, 20).map(job =>
       job.id + ' · ' + (states[job.status] || states.failed) + ' · ' + job.reason +
+      '\n' + provenance.format(job, 'grok') +
       (active.includes(job.status)
         ? '; ответ ждём ' + Math.floor((Date.now() - Date.parse(job.startedAt)) / 60000) + ' мин' : '')).join('\n');
   }
 }
-module.exports = { Grok, config, redact, parseReply, sha };
+module.exports = { Grok, config, redact, parseReply, sha, KEY_TTL_MS };

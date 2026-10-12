@@ -93,6 +93,139 @@ test('Grok: неверный адрес, отсутствующая и повр�
   await assert.rejects(bridge.send({ task: 'Проверка' }), e =>
     /повреждён/.test(e.message) && !e.message.includes(secretKey));
 });
+test('Р14: тестовый канал и метка, Test и Тест запрещены в боевом канале', async () => {
+  const before = calls.length;
+  for (const task of ['Test', 'Тест', 'ТЕСТ моста']) await assert.rejects(grok.send({task}), /test=true/);
+  assert.equal(calls.length, before);
+  const bridge = new Grok(state, {test: true, timeoutMs: 150}), j = await bridge.send({task: 'Тест'});
+  assert.match(j.task, /^\[ТЕСТ/); assert(j.test);
+  assert(captured.get(j.id).reply_path.includes(path.join('grok-test', 'replies')));
+  assert(bridge.has(j.id)); assert(!grok.has(j.id));
+});
+test('Р14: просроченный ответ уже на диске до первого обновления не становится голосом', async () => {
+  for (const status of ['running', 'delivery_unclear', 'lost']) {
+    const j = await send(); j.status = status;
+    j.startedAt = new Date(Date.now() - require('../common/grok').KEY_TTL_MS - 1).toISOString(); grok.save(j);
+    write(captured.get(j.id).reply_path, signed(j));
+    const hmac = crypto.createHmac; let checks = 0;
+    crypto.createHmac = (...args) => { checks++; return hmac(...args); };
+    let result; try { result = await grok.refresh(j.id); } finally { crypto.createHmac = hmac; }
+    assert.equal(checks, 0); assert.notEqual(result.status, 'done'); assert(!result.resultHash);
+    assert(result.keyExpiredAt); assert.equal(result.late_result.counts_as_review, false);
+    assert.throws(() => require('../common/team-store').review('grok', j.id, null, null), /завершённое/);
+  }
+});
+test('Р14: карантин относится к проверенному снимку; исправленный ответ проверяется заново', async () => {
+  const j = await send(), file = captured.get(j.id).reply_path, good = signed(j);
+  write(file, 'Неверный ответ\nКОНЕЦ ОТВЕТА');
+  const readFile = fs.readFileSync; let changed = false;
+  fs.readFileSync = function(p, ...args) {
+    const bytes = readFile.call(this, p, ...args);
+    if (p === file && !changed) { changed = true; write(file, good); }
+    return bytes;
+  };
+  let result; try { result = await grok.refresh(j.id); } finally { fs.readFileSync = readFile; }
+  assert(changed); assert.equal(result.status, 'done'); assert(!result.rejected);
+  assert(fs.readFileSync(file).equals(good));
+});
+test('Б2 круг 2: подмена перед rename, возврат без перезаписи занятого пути', async () => {
+  for (const occupied of [false, true]) {
+    const j = await send(), file = captured.get(j.id).reply_path, good = signed(j), newer = signed(j, 'Другой ответ\nПРИНЯТО');
+    write(file, 'Неверный ответ\nКОНЕЦ ОТВЕТА');
+    const rename = fs.renameSync; let swapped = false, held;
+    fs.renameSync = function(from, to) {
+      if (from === file && !swapped) {
+        swapped = true; write(file, good); held = to;
+        const result = rename.call(this, from, to);
+        if (occupied) write(file, newer);
+        return result;
+      }
+      return rename.call(this, from, to);
+    };
+    let result; try { result = await grok.refresh(j.id); } finally { fs.renameSync = rename; }
+    assert(swapped); assert.equal(result.status, 'done'); assert(!result.rejected);
+    assert.equal(result.resultHash, sha(good));
+    assert(fs.readFileSync(file).equals(occupied ? newer : good));
+    if (occupied) assert(!fs.existsSync(held));
+    const log = path.join(state, 'grok/replies_rejected/rejected.log');
+    const entries = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse).filter(x => x.id === j.id) : [];
+    assert.equal(entries.length, occupied ? 1 : 0);
+    if (occupied) assert(fs.readFileSync(path.join(path.dirname(log), entries[0].file)).equals(good));
+  }
+});
+
+test('Б3: незавершённый захваченный pending не заслоняет основной ответ, повтор refresh', async () => {
+  const j = await send(), file = captured.get(j.id).reply_path, good = signed(j), partial = 'Ответ ещё не дописан';
+  write(file, 'Неверный ответ\nКОНЕЦ ОТВЕТА');
+  const rename = fs.renameSync; let swapped = false;
+  fs.renameSync = function(from, to) {
+    if (from === file && !swapped) {
+      swapped = true; write(file, partial);
+      const result = rename.call(this, from, to); write(file, good); return result;
+    }
+    return rename.call(this, from, to);
+  };
+  let result; try { result = await grok.refresh(j.id); } finally { fs.renameSync = rename; }
+  assert(swapped); assert.equal(result.status, 'done'); assert.equal(result.resultHash, sha(good));
+  assert.equal(grok.pendingReplies(j.id).length, 0);
+  const log = path.join(state, 'grok/replies_rejected/rejected.log');
+  const entries = () => fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse).filter(x => x.id === j.id);
+  assert.equal(entries().length, 1); assert.equal(entries()[0].sha256, sha(partial));
+  assert.equal(fs.readFileSync(path.join(path.dirname(log), entries()[0].file), 'utf8'), partial);
+  const again = await grok.refresh(j.id); assert.equal(again.status, 'done'); assert.equal(again.resultHash, sha(good));
+  assert.equal(entries().length, 1);
+  // Остатки после прежнего done или перезапуска тоже архивируются, без потери файлов.
+  write(path.join(path.dirname(file), j.id + '.pending-one.md'), 'остаток один');
+  write(path.join(path.dirname(file), j.id + '.pending-two.md'), 'остаток два');
+  assert.equal((await grok.refresh(j.id)).resultHash, sha(good));
+  assert.equal(grok.pendingReplies(j.id).length, 0); assert.equal(entries().length, 3);
+  assert.equal(new Set(entries().map(x => x.file)).size, 3);
+  for (const entry of entries()) assert.equal(sha(fs.readFileSync(path.join(path.dirname(log), entry.file))), entry.sha256);
+});
+
+test('Круг 4: отказ архивации done не ломает refresh, status и claim другой работы', async () => {
+  for (const alreadyDone of [false, true]) {
+    const j = await send(), file = captured.get(j.id).reply_path, answer = signed(j);
+    write(file, answer);
+    if (alreadyDone) assert.equal((await grok.refresh(j.id)).status, 'done');
+    const pending = path.join(path.dirname(file), j.id + '.pending-failure.md');
+    write(pending, 'Незавершённый остаток');
+    const root = path.join(RUN, 'archive-failure-' + alreadyDone); fs.mkdirSync(root);
+    const t = new Team(root, path.join(root, 'state/team')), name = 'unrelated';
+    await t.work({action: 'create', name, owner: 'old', expected_revision: 0, goal: 'цель', done_criteria: 'готово', next_step: 'проверить',
+      stages: [{title: 'Проверка', accept_criteria: 'проверено', weight: 100, state: 'план'}]});
+    const w = read(t.workFile(name)); w.heartbeat_at = new Date(Date.now() - 7200000).toISOString(); json(t.workFile(name), w);
+    const rename = fs.renameSync; let failures = 0;
+    fs.renameSync = function(from, to) {
+      if (from === pending) { failures++; const e = Error('Тестовый отказ переноса'); e.code = 'EACCES'; throw e; }
+      return rename.call(this, from, to);
+    };
+    try {
+      const done = await grok.refresh(j.id);
+      assert.equal(done.status, 'done'); assert.equal(done.resultHash, sha(answer));
+      assert.match(done.reason, /Не удалось перенести.*EACCES/);
+      assert.equal(grok.load(j.id).reason, done.reason);
+      assert.equal((await grok.refresh(j.id)).reason, done.reason);
+      assert.match(await grok.status(), /Grok:/);
+      await t.work({action: 'claim', name, owner: 'new', expected_revision: w.revision});
+      assert.equal(read(t.workFile(name)).owner, 'new');
+      assert(failures >= 4); assert.equal(fs.readFileSync(pending, 'utf8'), 'Незавершённый остаток');
+      assert.equal(grok.load(j.id).resultHash, sha(answer));
+    } finally { fs.renameSync = rename; }
+    assert.equal((await grok.refresh(j.id)).status, 'done'); assert(!fs.existsSync(pending));
+  }
+});
+
+test('Р14: неверный ответ переносится в карантин с журналом, ожидание продолжается', async () => {
+  const j = await send(), file = captured.get(j.id).reply_path, bad = 'Неверный ответ\nКОНЕЦ ОТВЕТА';
+  write(file, bad); const result = await grok.refresh(j.id);
+  assert.equal(result.status, 'running'); assert.equal(result.rejected, 1); assert(!fs.existsSync(file));
+  const dir = path.join(state, 'grok', 'replies_rejected');
+  const entry = fs.readFileSync(path.join(dir, 'rejected.log'), 'utf8').trim().split('\n').map(JSON.parse).find(x => x.id === j.id);
+  assert(entry); assert.equal(entry.sha256, sha(bad)); assert.equal(fs.readFileSync(path.join(dir, entry.file), 'utf8'), bad);
+  write(file, signed(j)); assert.equal((await grok.refresh(j.id)).status, 'done');
+});
+
 test('Grok: временный файл не готов; CRLF, подпись и снимок переживают перезапуск', async () => {
   const job = await send(), payload = captured.get(job.id), answer = signed(job, 'КОНТРОЛЬ внутри\r\nПРИНЯТО',
     payload.secret_hex, '\r\n');
@@ -185,16 +318,25 @@ test('Grok: 60 минут, поздние данные, отмена и явны
     const job = await send(), answer = signed(job);
     job.startedAt = new Date(Date.now() - 3600001).toISOString(); grok.save(job);
     const lost = await grok.refresh(job.id); assert.equal(lost.status, 'lost');
-    assert.equal(fs.statSync(grok.file('jobs', job.id, '.key')).size, 0);
+    // 60 мин — только уведомление: ключ живёт 7 суток, ответ Grok после включения ПК засчитывается.
+    assert.equal(fs.statSync(grok.file('jobs', job.id, '.key')).size, 32);
+    const old = await send(), oldAnswer = signed(old);
+    old.startedAt = new Date(Date.now() - require('../common/grok').KEY_TTL_MS - 1).toISOString(); grok.save(old);
+    assert.equal((await grok.refresh(old.id)).status, 'lost');
+    assert.equal(fs.statSync(grok.file('jobs', old.id, '.key')).size, 0);
+    write(captured.get(old.id).reply_path, oldAnswer);
+    assert.match((await grok.refresh(old.id)).reason, /поздний ответ/);
+    assert.throws(() => require('../common/team-store').review('grok', old.id, null, null), /завершённое/);
     write(captured.get(job.id).reply_path, answer);
-    assert.match((await grok.refresh(job.id)).reason, /поздний ответ/);
-    assert.throws(() => require('../common/team-store').review('grok', job.id, null, null), /завершённое/);
+    const late = await grok.refresh(job.id);
+    assert.equal(late.status, 'done'); assert.equal(late.answered_after_lost, true);
+    assert.equal(fs.statSync(grok.file('jobs', job.id, '.key')).size, 0);
   }
   mode = 'ok';
   const job = await send(), answer = signed(job);
   assert.match((await grok.cancel(job.id)).reason, /остановить рутину/);
   write(captured.get(job.id).reply_path, answer);
-  assert.equal((await grok.refresh(job.id)).status, 'cancelled');
+  assert.equal((await grok.refresh(job.id)).status, 'stop_unconfirmed');
   const retry = await grok.send({ task: job.task, retry_of: job.id });
   assert.notEqual(retry.id, job.id);
   assert(fs.readFileSync(captured.get(retry.id).brief_path, 'utf8').includes('повтор ' + job.id));

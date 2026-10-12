@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+const provenance = require('../../common/provenance');
 // Мост: Cowork ↔ Antigravity, версия 0.5.9.
 //
 // Файлы между диском и Antigravity возит мост, а не Claude:
@@ -350,6 +351,8 @@ function metaPath(id) { return path.join(jobDir(id), "meta.json"); }
 function cancelPath(id) { return path.join(jobDir(id), "cancel"); }
 let testFailSaveDone = process.env.MOST_TEST_FAIL_SAVE_DONE === "1"; // только для автотестов: один сбой сохранения «готово»
 function saveJob(job) {
+  job.provenance = provenance.forJob(job, 'antigravity');
+  if (job.status === 'cancelled' || job.stopUnconfirmed) job.cancellation = { parent_stop: job.stopUnconfirmed ? 'stop_unconfirmed' : 'unknown', parent_local_status: job.status, delegated_stop: 'unknown' };
   if (testFailSaveDone && job.status === "done") { testFailSaveDone = false; throw new Error("тестовый сбой сохранения карточки"); }
   replaceFileAtomicSync(cardPath(job.id), JSON.stringify(job, null, 1));
 }
@@ -432,7 +435,7 @@ async function normalizeJob(job) {
         try { resText = fs.readFileSync(resultPath(job.id), "utf8"); } catch (e) {}
         if (meta && resText != null && sha(resText) === meta.hash) {
           Object.assign(cur, { status: "done", resultHash: meta.hash, words: meta.words, warnings: meta.warnings || [], problems: [],
-            finishedAt: meta.finishedAt, durationSec: meta.durationSec, usage: meta.usage || null, draftStatus: "not_attempted",
+            finishedAt: meta.finishedAt, durationSec: meta.durationSec, usage: meta.usage || null, provenance: meta.provenance || provenance.forJob(cur, 'antigravity'), draftStatus: "not_attempted",
             recovered: "результат был зафиксирован, но владелец задания завершился до обновления карточки" });
         } else {
           Object.assign(cur, { status: "lost", finishedAt: nowIso(),
@@ -781,7 +784,7 @@ function runAgy(args, jobId, onSpawn, cwd, stdin) {
       const stderr = stripAnsi(Buffer.concat(errChunks).toString("utf8"));
       const parsed = stdin != null ? agyInput.parseResults(raw) : parseAgyJson(raw);
       const obj = parsed.obj;
-      const base = { stderr, diagnostics: parsed.diagnostics || [], exitCode, error: errTextMsg || inputError || (stdin != null && !obj ? 'Не получено завершающее событие result.' : null), cancelled: entry.reason === "отмена", timedOut, jsonCandidates: parsed.candidates };
+      const base = { stderr, diagnostics: parsed.diagnostics || [], exitCode, error: errTextMsg || inputError || (stdin != null && !obj ? 'Не получено завершающее событие result.' : null), cancelled: entry.reason === "отмена", timedOut, jsonCandidates: parsed.candidates, provenanceObservation: provenance.agyObservation(raw, obj) };
       if (obj) {
         const denied = parsed.denied?.length ? parsed.denied : obj.denied_actions || obj.deniedActions || null;
         resolve(Object.assign(base, {
@@ -789,6 +792,7 @@ function runAgy(args, jobId, onSpawn, cwd, stdin) {
           agyStatus: obj.status != null ? String(obj.status) : "", agyError: obj.error ? (typeof obj.error === "string" ? obj.error : JSON.stringify(obj.error)) : null,
           denied: denied && (Array.isArray(denied) ? denied.length : true) ? denied : null,
           toolCalls: obj.tool_calls || obj.toolCalls || null,
+          provenanceObservation: provenance.agyObservation(raw, obj),
           usage: obj.usage || null, json: true,
         }));
       } else resolve(Object.assign(base, { output: stripAnsi(raw), json: false }));
@@ -855,7 +859,11 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
       job.retry.args = args;
       await updateJob(job.id, c => { Object.assign(c, modelFields(selection), { modelSelectionPending: false }); c.retry.args = args; });
     }
-    const run = () => runAgy(args, job.id, pid => { updateJob(job.id, c => { c.agyPid = pid; }).catch(() => {}); }, job.papka, job.retry?.stdin);
+    const run = async () => {
+      const result = await runAgy(args, job.id, pid => { updateJob(job.id, c => { c.agyPid = pid; }).catch(() => {}); }, job.papka, job.retry?.stdin);
+      await updateJob(job.id, c => { provenance.observe(c, 'antigravity', result.provenanceObservation); });
+      return result;
+    };
     let res = await run();
     const protocolReason = !agyInput.outputLimit(res) && job.retry?.stdin != null && agyInput.protocolError(res);
     if (protocolReason && !job.protocolFallback && !shuttingDown && !fs.existsSync(cancelPath(job.id))) {
@@ -929,6 +937,7 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
       cur.finishedAt = finishedAt;
       cur.durationSec = Math.round((Date.parse(finishedAt) - Date.parse(cur.startedAt)) / 1000);
       cur.usage = res.usage || null;
+      cur.provenance = provenance.observe(cur, 'antigravity', res.provenanceObservation);
       delete cur.stopUnconfirmed;
       if (res.cancelled || fs.existsSync(cancelPath(job.id))) {
         Object.assign(cur, { status: "cancelled", draftStatus: "not_attempted", problems: ["задание отменено"] });
@@ -944,7 +953,7 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
       const text = check.text, hash = sha(text);
       try {
         replaceFileAtomicSync(resultPath(job.id), text);
-        replaceFileAtomicSync(metaPath(job.id), JSON.stringify({ hash, words: words(text), warnings: check.warnings, finishedAt, durationSec: cur.durationSec, usage: cur.usage }));
+        replaceFileAtomicSync(metaPath(job.id), JSON.stringify({ hash, words: words(text), warnings: check.warnings, finishedAt, durationSec: cur.durationSec, usage: cur.usage, provenance: cur.provenance }));
       } catch (e) {
         Object.assign(cur, { status: "failed", draftStatus: "not_attempted" });
         cur.problems.push("не удалось сохранить результат задания: " + errText(e));
@@ -979,7 +988,7 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
         if (meta) {
           // результат уже зафиксирован — не превращаем его в «ошибку»
           Object.assign(c, { status: "done", resultHash: meta.hash, words: meta.words, warnings: meta.warnings || [], problems: [], finishedAt: meta.finishedAt,
-            durationSec: meta.durationSec, usage: meta.usage || null, draftStatus: "not_attempted", recovered: "карточка не сохранилась с первого раза; результат восстановлен" });
+            durationSec: meta.durationSec, usage: meta.usage || null, provenance: meta.provenance || provenance.forJob(c, 'antigravity'), draftStatus: "not_attempted", recovered: "карточка не сохранилась с первого раза; результат восстановлен" });
         } else {
           Object.assign(c, { status: "failed", draftStatus: "not_attempted" });
           c.problems = (c.problems || []).concat(["сбой моста: " + errText(e)]);

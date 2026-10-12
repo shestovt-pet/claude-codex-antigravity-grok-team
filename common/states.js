@@ -9,6 +9,8 @@ module.exports = Object.freeze({
   done: 'ОТВЕТ ПОЛУЧЕН',
   failed: 'НЕ УДАЛОСЬ',
   cancelling: 'ОТМЕНЯЕТСЯ',
+  cancel_requested: 'ОТМЕНА ЗАПРОШЕНА',
+  stop_confirmed: 'ОСТАНОВКА ПОДТВЕРЖДЕНА',
   cancelled: 'ОТМЕНЕНО',
   stop_unconfirmed: 'ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА',
   lost: 'ПОТЕРЯНО',

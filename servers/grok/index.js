@@ -5,7 +5,7 @@ const { z } = require('zod');
 const { Grok } = require('../../common/grok');
 const { format } = require('../../common/format');
 const access = require('../../common/access');
-const grok = new Grok(), server = new McpServer({ name: 'grok', version: '0.5.9' }, require('../../common/server-instructions').options('grok'));
+const grok = new Grok(), testGrok = new Grok(undefined, { test: true }), server = new McpServer({ name: 'grok', version: '0.5.9' }, require('../../common/server-instructions').options('grok'));
 function register(name, title, schema, fn) {
   if (!access.allowed('grok', name)) return;
   server.registerTool(name, { title, description: title,
@@ -24,7 +24,9 @@ register('grok_send', 'Поручить Grok', {
   ...require('../../common/stage-schema').send, folder: z.string().optional(),
   task: z.string().min(1), text: z.string().optional(), work: z.string().optional(),
   stage: z.string().optional(), owner: z.string().optional(), retry_of: z.string().optional(),
-}, async args => { const job = await grok.send(args); return { job, text: job.reason }; });
+  test: z.boolean().optional(),
+}, async args => { const { test, ...rest } = args; const job = await (test ? testGrok : grok).send(rest); return { job, text: job.reason }; });
+const pick = id => (!grok.has(id) && testGrok.has(id) ? testGrok : grok);
 register('grok_status', 'Состояние Grok', {}, async () => ({ text: await grok.status() }));
 register('grok_result', 'Результат Grok', {
   id: z.string(), wait_sec: z.number().int().min(0).max(40).default(0),
@@ -33,23 +35,23 @@ register('grok_result', 'Результат Grok', {
   const end = Date.now() + args.wait_sec * 1000;
   let job;
   do {
-    job = await grok.refresh(args.id);
+    job = await pick(args.id).refresh(args.id);
     if (!['queued', 'running', 'delivery_unclear'].includes(job.status) || Date.now() >= end) break;
     await new Promise(resolve => setTimeout(resolve, 200));
   } while (Date.now() < end);
-  return { job, text: grok.resultText(job, args.from_char) };
+  return { job, text: pick(args.id).resultText(job, args.from_char) };
 });
 register('grok_cancel', 'Отменить поручение Grok', { id: z.string() }, async args => {
-  const job = await grok.cancel(args.id); return { job, text: job.reason };
+  const job = await pick(args.id).cancel(args.id); return { job, text: job.reason };
 });
 async function start() {
   await require('../../common/state-migration').start(require('../../common/paths'));
   await server.connect(require('../../common/public-transport').publicTransport(new StdioServerTransport()));
   access.ready('grok');
   if (!access.guest() && process.env.MOST_PROBE_ONLY !== '1') {
-    setInterval(() => grok.status().catch(() => console.error('Grok: не удалось проверить поручения.')),
+    setInterval(() => Promise.all([grok.status(), testGrok.status()]).catch(() => console.error('Grok: не удалось проверить поручения.')),
       30000).unref();
   }
 }
 if (require.main === module) start().catch(() => { console.error('Grok: запуск не удался.'); process.exitCode = 1; });
-module.exports = { server, grok };
+module.exports = { server, grok, testGrok };

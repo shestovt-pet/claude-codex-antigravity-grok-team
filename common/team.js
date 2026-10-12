@@ -128,7 +128,7 @@ class Team {
       return { error: 'карточка повреждена: ' + path.basename(file) };
     }
   }
-  async refreshWork(file) {
+  async refreshWork(file, { readOnly = false } = {}) {
     const w = this.readWork(file);
     if (w.error) return w;
     const before = JSON.stringify(w);
@@ -138,7 +138,7 @@ class Team {
       catch (e) { stageFailure(s, old, old, e); }
     }
     if (w.closed && w.stages.some(s => !['принят', 'выдан без принятия'].includes(s.state))) w.closed = false;
-    if (JSON.stringify(w) !== before) {
+    if (!readOnly && JSON.stringify(w) !== before) {
       if (JSON.stringify(w.stages.map(s => s.state)) !== JSON.stringify(JSON.parse(before).stages.map(s => s.state))) w.revision++;
       save(file, w);
     }
@@ -660,8 +660,7 @@ class Team {
   }
   async status(claudeQuota, claudeUsage, notifyTest, full = false, scope = {}) {
     require('./access').guard('team', 'team_status', { claude_quota: claudeQuota, claude_usage: claudeUsage, notify_test: notifyTest });
-    // Повтор отложенной уборки после установки — без ожидания, сводка не задерживается.
-    this.afterDeploy().catch(() => {});
+    // Обычная сводка только читает. Уборку запускают установка и старт сервера.
     if (claudeUsage) {
       if (!['calls', 'written', 'reread', 'window_h'].every(k => Number.isFinite(claudeUsage[k]) && claudeUsage[k] >= 0) || !claudeUsage.window_h || !claudeUsage.source?.trim() || !Number.isFinite(Date.parse(claudeUsage.taken_at))) throw Error('Некорректный замер сеанса Claude.');
       claudeQuota = claudeUsage;
@@ -694,16 +693,20 @@ class Team {
         }),
       );
     }
-    await section('Проверка этапов', () => deployer.locked(this.root, async () => {
-      for (const w of this.works().filter(w => !w.error)) await this.refreshWork(this.workFile(w.name));
-    }));
+    let statusWorks = [], statusWorksError;
+    await section('Проверка этапов', async () => {
+      try { statusWorks = await Promise.all(this.works().map(w => w.error ? w : this.refreshWork(this.workFile(w.name), { readOnly: true }))); }
+      catch (e) { statusWorksError = e; throw e; }
+    });
+    const readStatusWorks = () => { if (statusWorksError) throw statusWorksError; return statusWorks; };
     const quota = await require('./quota-line').quotaLine({ state: this.state, binary: process.env.CODEX_PATH || findCodex(), advice: !full, agyModel: scope.agy_model });
     const warning = [require('./server-instructions').read().warning, require('./work-owner').reminder(this.root, undefined, scope)].filter(Boolean).join('\n');
     if (!full) {
-      const text = await require('./summary').compact(this, quota);
+      const text = await require('./summary').compact({ root: this.root, state: this.state, works: readStatusWorks }, quota);
       return (warning ? warning + '\n' : '') + text + (notifyTest ? '\nПробное уведомление: ' + await require('./notify').notify('Связка: пробное уведомление', 'Уведомления команды работают.') : '');
     }
     rows.push(quota);
+    await section('Расхождение версий', () => rows.push(...require('./release-drift').lines(this.root, stateDir)));
     if (warning) rows.unshift(warning);
     await section('Нагрузка', () => rows.push(require('./summary').loadLine(this.state, Object.fromEntries(['codex', 'antigravity', 'grok'].map(who => [who, stores.list(who).jobs])))));
     for (const who of ['codex', 'antigravity']) {
@@ -786,19 +789,22 @@ class Team {
       const failure = path.join(stateDir, 'migration-error.json');
       if (fs.existsSync(failure) && read(failure).error) rows.push('Ошибка сверки хранилища · ' + read(failure).error);
     });
-    await section('Grok', async () => rows.push(await new (require('./grok').Grok)().status()));
-    await section('Работы', async () => rows.push(...this.works().map(workText)));
+    await section('Grok', () => {
+      const result = stores.list('grok', false);
+      rows.push(...result.errors, ...result.jobs.map(j => 'Grok ' + j.id + ': ' + (require('./states')[j.status] || j.status) + (j.reason ? ' · ' + j.reason : '')));
+    });
+    await section('Работы', async () => rows.push(...readStatusWorks().map(workText)));
     await section('Репозиторий', async () => {
       rows.push(
-        'main / версия правил: ' + hash(this.root),
-        'Корень: ' + (clean(this.root) ? 'чисто' : 'есть изменения'),
+        'main / версия правил: ' + hash(this.root, 'main', (r, args) => git(r, args, { skipIndexLock: true })),
+        'Корень: ' + (git(this.root, ['status', '--porcelain', '-uall'], { skipIndexLock: true }).trim() ? 'есть изменения' : 'чисто'),
         this.changesText(),
       );
     });
     await section('Релизы', async () => {
       const marker = inside(this.root, 'live', 'deployed.json');
       rows.push('Последнее развёртывание: ' + (fs.existsSync(marker) ? [read(marker).commit, read(marker).at, read(marker).method || 'способ не записан'].join(' · ') : 'не записано'));
-      const op = require('./deploy-ops').list(this.root).at(-1);
+      const op = require('./deploy-ops').list(this.root, { reconcile: false }).at(-1);
       if (op) rows.push(['Установка ' + op.id + ': ' + op.status, op.reason || op.message, op.restart, require('./deploy-ops').cleanupLine(op.cleanup)].filter(Boolean).join(' · '));
     });
     await section('Настройки', async () => {

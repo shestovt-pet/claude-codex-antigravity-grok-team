@@ -26,7 +26,7 @@ function grokText(c) {
   return ['design', 'verdict'].map(phase => {
     const v = c[phase === 'design' ? 'grokDesign' : 'grokVerdict'];
     if (!v || !require('./grok-gate').bound(v, c, phase)) return 'не запрошен';
-    return v.decision || ({ running: 'ждём ответ', queued: 'ждём ответ', delivery_unclear: 'ждём ответ', failed: 'отказ', lost: 'потеряно', cancelled: 'отменено' }[v.status]) || v.status;
+    return v.decision || ({ running: 'ждём ответ', queued: 'ждём ответ', delivery_unclear: 'ждём ответ', failed: 'отказ', lost: 'потеряно', cancelled: 'отменено локально', stop_unconfirmed: 'остановка не подтверждена', cancel_requested: 'запрошена отмена' }[v.status]) || v.status;
   }).join(' / ');
 }
 function workTitle(name) {
@@ -39,7 +39,7 @@ function loadLine(state, jobs) {
   const fresh = c?.window_h === 5 && Date.now() - Date.parse(c.taken_at) < 18000000;
   const recent = who => (jobs[who] || []).filter(j => !j.archived && Date.parse(j.startedAt) > Date.now() - 18000000);
   const a = recent('antigravity');
-  return 'Нагрузка за 5 ч: Claude — ' + (fresh ? c.calls + ' обращений, перечитано ' + (c.reread / 1e6).toFixed(1) + ' млн' : 'нет замера за 5 ч') +
+  return 'Нагрузка за 5 ч: Claude Desktop — ' + (fresh ? c.calls + ' обращений, перечитано ' + (c.reread / 1e6).toFixed(1) + ' млн' : 'нет замера за 5 ч') +
     '; Codex — ' + recent('codex').length + ' поручений; Antigravity — ' + a.length + ' поручений, ' + (a.reduce((n, j) => n + (Number(j.usage?.total_tokens) || 0), 0) / 1e6).toFixed(2) + ' млн токенов; Grok — ' + recent('grok').length + ' поручений.' +
     (fresh && c.reread > 50000000 ? '\nClaude перегружен: отдавайте чтение и ревью помощникам' : '');
 }
@@ -67,8 +67,8 @@ async function compact(team, quota) {
   const rows = [], jobs = {}, stores = require('./team-store');
   const section = async fn => { try { await fn(); } catch (e) { rows.push('Ошибка: ' + e.message); } };
   rows.push(quota);
+  await section(() => rows.push(...require('./release-drift').lines(team.root, require('./paths').stateDir)));
   for (const who of ['codex', 'antigravity', 'grok']) await section(async () => {
-    if (who === 'grok') for (const j of stores.list(who, false).jobs) await new (require('./grok').Grok)().refresh(j.id);
     const result = stores.list(who); jobs[who] = result.jobs;
     rows.push(...result.errors.map(e => 'Ошибка чтения: ' + e));
     const waiting = result.jobs.filter(j => !j.archived && j.status === 'waiting_quota');
@@ -77,10 +77,10 @@ async function compact(team, quota) {
       const next = times.length ? new Date(Math.min(...times)).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) : 'время неизвестно';
       rows.push(({ codex: 'Codex', antigravity: 'Antigravity', grok: 'Grok' }[who]) + ': Ждут квоту: ' + waiting.length + ' поручений, ближайшее продолжение ' + next + ' · подробности: full=true');
     }
-    for (const j of result.jobs.filter(j => !j.archived && ['running', 'queued', 'needs_decision', 'cancelling', 'stop_unconfirmed', 'delivery_unclear', 'migration_conflict'].includes(j.status))) {
+    for (const j of result.jobs.filter(j => !j.archived && (j.stopUnconfirmed || ['running', 'queued', 'needs_decision', 'cancelling', 'cancel_requested', 'stop_unconfirmed', 'delivery_unclear', 'migration_conflict'].includes(j.status)))) {
       let status = j.status;
       if (who !== 'grok' && ['running', 'cancelling', 'stop_unconfirmed'].includes(status) && await require('./locks').ownerState(j.owner) === 'dead') status = who === 'codex' && j.write ? 'needs_decision' : 'lost';
-      rows.push(who + ' ' + j.id.slice(0, 8) + ': ' + require('./states')[status] + (j.nextAttemptAt ? ' до ' + j.nextAttemptAt : ''));
+      rows.push(who + ' ' + j.id.slice(0, 8) + ': ' + require('./states')[status] + (j.stopUnconfirmed ? ' · ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА' : '') + (j.nextAttemptAt ? ' до ' + j.nextAttemptAt : ''));
     }
   });
   rows.push(loadLine(team.state, jobs));
@@ -118,7 +118,7 @@ async function compact(team, quota) {
     const file = path.join(team.root, 'live/deployed.json');
     if (fs.existsSync(file)) { const m = read(file); rows.push('Последнее развёртывание: ' + m.commit.slice(0, 8) + ' · ' + localTime(m.at) + ' · ' + (m.method || 'способ не записан')); }
     else rows.push('Последнее развёртывание: не записано');
-    const op = require('./deploy-ops').list(team.root).at(-1);
+    const op = require('./deploy-ops').list(team.root, { reconcile: false }).at(-1);
     if (op) rows.push('Установка ' + op.id + ': ' + op.status + (op.reason ? ' · ' + op.reason : '') + (op.restart ? ' · ' + op.restart : '') + (op.cleanup ? ' · ' + require('./deploy-ops').cleanupLine(op.cleanup) : ''));
   });
   await section(() => rows.push(settings()));

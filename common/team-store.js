@@ -107,7 +107,7 @@ function source(who, id) {
   const listed = list(who, false);
   if (listed.errors.length) throw Object.assign(Error(id + ': нельзя прочитать источник: ' + listed.errors.join('; ')), { code: 'STAGE_READ_FAILED' });
   const j = listed.jobs.find(j => j.id === id);
-  if (!j || j.status !== 'done' || j.cancelled || j.lateHash) throw Error(id + ': нет принятого сервером результата текста.');
+  if (!j || !['done', 'applied'].includes(j.status) || j.cancelled || j.lateHash) throw Error(id + ': нет принятого сервером результата текста.');
   const dir = roots()[who];
   const file = who === 'antigravity' ? path.join(path.dirname(j.cardFile), 'result.txt') : who === 'grok' ? path.join(dir, id + '.result.txt') : resultPath(j, dir);
   if (!isInsideReal(file, dir)) throw Error('Результат вне хранилища.');

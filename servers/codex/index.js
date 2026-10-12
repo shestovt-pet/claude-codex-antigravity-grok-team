@@ -1,4 +1,5 @@
 ﻿'use strict';
+const provenance = require('../../common/provenance');
 
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
@@ -187,6 +188,7 @@ async function execute(job, folderLock) {
   function line(s) {
     try {
       const e = JSON.parse(s);
+      provenance.observe(job, 'codex', provenance.codexObservation(e));
       if (e.type === 'thread.started') {
         job.threadId = e.thread_id;
         mutate(job.id, (c) => {
@@ -211,6 +213,7 @@ async function execute(job, folderLock) {
     try {
       await mutate(job.id, (c) => {
         c.threadId = job.threadId;
+        c.provenance = provenance.forJob(job, 'codex');
         c.finishedAt = new Date().toISOString();
         c.exitCode = code;
         if (c.status === 'cancelling') {
@@ -445,6 +448,7 @@ async function send(a) {
       job.textFile = path.join(dir, id + '.input.txt');
       fs.writeFileSync(job.textFile, a.text);
     }
+    job.provenance = provenance.forJob(job, 'codex');
     save(job);
     if (prior?.status === 'waiting_quota')
       await mutate(prior.id, (c) => {
