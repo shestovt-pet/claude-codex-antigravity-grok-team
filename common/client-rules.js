@@ -11,13 +11,12 @@ function target(value) {
   const file = typeof value === 'string' ? value : value.file;
   const role = typeof value === 'object' ? value.role : null;
   if (role) { if (!Object.hasOwn(sectionFiles, role)) throw Error('Неизвестный помощник.'); return { file, role }; }
-  const key = path.resolve(file).toLowerCase();
   const home = process.env.USERPROFILE || os.homedir();
   const known = {
     codex: process.env.MOST_CODEX_RULES || path.join(home, '.codex/AGENTS.md'),
     antigravity: process.env.MOST_AGY_RULES || path.join(home, '.gemini/config/AGENTS.md'),
   };
-  const matches = Object.entries(known).filter(([, p]) => path.resolve(p).toLowerCase() === key);
+  const matches = Object.entries(known).filter(([, p]) => require('./paths').samePath(p, file));
   if (matches.length !== 1) throw Error('Роль файла правил не определена однозначно: ' + file + '. Укажите role.');
   return { file, role: matches[0][0] };
 }

@@ -11,8 +11,8 @@ const tests = []; const test = (name,fn) => tests.push({name,fn}); let passed=0,
 const begin='# most:begin (правит team_change deploy)', end='# most:end';
 function release(id) {
   const dir=path.join(RUN,'live',id.repeat(40));
-  for(const n of ['antigravity','codex','team','grok'])write(path.join(dir,'servers',n,'index.js'),'// подделка релиза');
-  json(path.join(dir,'probe-ok.json'),{commit:id.repeat(40),root:RUN,servers:['antigravity','codex','team','grok'],at:new Date().toISOString()});
+  for(const n of ['team','codex','antigravity'])write(path.join(dir,'servers',n,'index.js'),'// подделка релиза');
+  json(path.join(dir,'probe-ok.json'),{commit:id.repeat(40),root:RUN,servers:['team','codex','antigravity'],at:new Date().toISOString()});
   return dir;
 }
 const oldRelease=release('a'), current=release('b');
@@ -148,7 +148,7 @@ test('L1–L2: configure и clients-only отделяют хранилище о�
   const lockState=path.join(RUN,'only-deploy-locks');
   await d.configure({release:current,configs:[files.claude],stateDir:lockState});
   await d.configureClients({release:current,stateDir:lockState});
-  for(const n of ['team','codex','antigravity','grok'])assert.equal(read(files.claude).mcpServers[n].env.MOST_STATE_DIR,path.join(RUN,'state'));
+  for(const n of ['team','codex','antigravity'])assert.equal(read(files.claude).mcpServers[n].env.MOST_STATE_DIR,path.join(RUN,'state'));
   for(const n of ['team','codex'])assert.equal(read(files.agy).mcpServers[n].env.MOST_STATE_DIR,path.join(RUN,'state'));
   const text=fs.readFileSync(files.codex,'utf8'), servers=cc.block(text).parsed.root.mcp_servers;
   for(const n of ['team','antigravity']){assert.equal(servers[n].env.MOST_STATE_DIR,path.join(RUN,'state'));assert.equal(servers[n].default_tools_approval_mode,'approve');}

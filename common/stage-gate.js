@@ -6,7 +6,7 @@ const { isInsideReal, samePath, repoRoot } = require('./paths');
 const { atomic, name } = require('./team-git');
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');
 const families = ['anthropic', 'google', 'openai', 'xai'];
-const table = { anthropic: ['openai', 'google'], google: ['openai', 'fresh'], openai: ['google', 'fresh'], xai: ['openai', 'google'] };
+const table = { anthropic: ['openai', 'google'], google: ['openai'], openai: ['google'], xai: ['openai', 'google'] };
 const list = x => x == null ? [] : Array.isArray(x) ? x : [x];
 const task = j => j.scopeTask ?? ((j.task || j.poruchenie || '') + '\n' + (j.text || ''));
 const at = j => Date.parse(j.startedAt || j.created_at || j.createdAt || j.at);
@@ -35,9 +35,9 @@ const resolves = (next, j) => !next.count && compare(next, j) > 0 && slot(next) 
   (next.who === j.who || (next.replaces && (!next.replacementEvidence?.observed || next.replacementEvidence.observed.includes(j.id))));
 const nextOrder = s => (s.gate.order = (s.gate.order || 0) + 1);
 function readFailure(message) { return Object.assign(Error(message), { code: 'STAGE_READ_FAILED' }); }
-function allJobs() {
-  return ['codex', 'antigravity', 'grok'].flatMap(who => {
-    const result = stores.list(who, false);
+function allJobs(snapshot) {
+  return require('./members').helpers.flatMap(who => {
+    const result = stores.list(who, false, snapshot);
     if (result.errors.length) throw readFailure('Нельзя прочитать поручения: ' + result.errors.join('; '));
     return result.jobs.map(j => ({ ...j, who }));
   });
@@ -57,14 +57,14 @@ function verdict(text) {
   if (!m) throw Error('Последняя строка не вердикт.');
   return Number(m[1]);
 }
-function reviewed(j, advisory = false) {
+function reviewed(j, advisory = false, snapshot) {
   if (j.status !== 'done' || j.cancelled) throw Error(j.id + ': нужно завершённое, не отменённое поручение.');
   if (j.role && j.role !== 'проверка' && !(advisory && j.role === 'совет')) throw Error(j.id + ': нужна роль «проверка».');
   let result;
-  try { result = stores.review(j.who, j.id, null, null, 'ПРИНЯТО', null, null, true); }
+  try { result = stores.review(j.who, j.id, null, null, 'ПРИНЯТО', null, null, true, snapshot); }
   catch (e) {
     if (!/Последняя строка ревью не соответствует/.test(e.message)) throw e;
-    result = stores.review(j.who, j.id, null, null, 'НЕ ПРИНЯТО', null, null, true);
+    result = stores.review(j.who, j.id, null, null, 'НЕ ПРИНЯТО', null, null, true, snapshot);
   }
   return { ...j, family: reviewerFamily(j), count: j.who === 'grok' ? verdict(require('./grok').parseReply(Buffer.from(result.reviewText)).verdict) : verdict(result.reviewText),
     reviewText: result.reviewText, at: at(j), readyAt: Date.parse(j.finishedAt) || undefined };
@@ -115,7 +115,7 @@ function normalize(w, old, planChange = '') {
         throw Error('Журнал решений неизменяем: допускается только добавление.');
       s.decisions = decisions.map((d, i) => i < previousDecisions.length ? d : { ...d, at: new Date().toISOString() });
     }
-    if (prev && s.gate.locked && ['level', 'author', 'material', 'artifact_manifest'].some(k => JSON.stringify(s[k]) !== JSON.stringify(prev[k])))
+    if (prev && s.gate.locked && ['level', 'author', 'material', 'artifact_manifest'].some(k => !require('./client-configs').equal(s[k] ?? null, prev[k] ?? null)))
       throw Error('После первого поручения на проверку level, author и material не меняются.');
     if (s.level && !['мелочь', 'обычный', 'высокий'].includes(s.level)) throw Error('Неизвестный level.');
     if (s.author) parts(s);
@@ -139,7 +139,7 @@ function normalize(w, old, planChange = '') {
     w.removed_stages.push(structuredClone(s));
   }
 }
-function sources(w, s, jobs, ps) {
+function sources(w, s, jobs, ps, snapshot) {
   const ids = list(s.source_jobs);
   if (new Set(ids).size !== ids.length) throw Error('Повтор source_jobs.');
   const found = jobs.filter(j => belongs(j, w, s) && j.role === 'текст' && ['done', 'applied'].includes(j.status) && !j.cancelled);
@@ -150,7 +150,7 @@ function sources(w, s, jobs, ps) {
   }
   const seen = new Set();
   for (const j of found) {
-    stores.source(j.who, j.id);
+    stores.source(j.who, j.id, snapshot);
     const f = reviewerFamily(j), ns = named(j.task || j.poruchenie || '', ps);
     if (!ns.length && new Set(ps.map(p => p.family)).size > 1) throw Error(j.id + ': назовите часть.');
     for (const p of ns.length ? ns : ps) {
@@ -194,12 +194,12 @@ async function unavailable(who, jobs) {
   }
   throw Error('Замена без подтверждённой нехватки или аварии: ' + who);
 }
-function currentRows(w, s, jobs, v, explicit = []) {
+function currentRows(w, s, jobs, v, explicit = [], snapshot) {
   const rows = [];
   for (const j of jobs.filter(j => belongs(j, w, s) && (['проверка', 'совет'].includes(j.role) || explicit.includes(j.id)))) {
     if (!explicit.includes(j.id) && (j.status !== 'done' || !hasVersion(task(j), v))) continue;
     let r;
-    try { r = reviewed(j, !explicit.includes(j.id)); }
+    try { r = reviewed(j, !explicit.includes(j.id), snapshot); }
     catch (e) {
       if (!explicit.includes(j.id) && /Последняя строка ревью не соответствует/.test(e.message)) continue;
       throw e;
@@ -267,9 +267,24 @@ function checkArtifacts(w, s) {
   if (!report.ready) throw Error('Артефакты не готовы: ' + report.errors.join('; '));
   return { manifest: s.artifact_manifest, sha256: sha(snapshot.bytes), ready: true };
 }
-async function evaluate(w, s, old, jobs = allJobs()) {
+// team-v19 К4 для дирижёра запасного режима — до выбора версии правил, на этапах любой версии (Codex 1c35bf39 пп. 4–5).
+function conductorLimits(s, old) {
+  const fb = require('./fallback'), conductor = fb.caller();
+  if (!conductor) return;
+  const family = fb.FAMILY[conductor.client], wantsAccept = s.state === 'принят' || !!s.criterion_met;
+  const userIssue = s.state === 'выдан без принятия' && s.override?.by === 'user' && s.override.quote?.trim() && !s.override.criterion && !s.one_family;
+  if ((s.override || s.one_family) && !userIssue)
+    throw Error('Запасной режим: override и one_family (решение Claude или пользователя) дирижёр не записывает — решения пользователя в режиме только о необратимом.');
+  if (s.level === 'высокий' && wantsAccept && old?.state !== 'принят') throw Error('Запасной режим: этап «высокий» ждёт Claude — дирижёр его не принимает.');
+  if (s.criterion_met && s.author && parts(s).some(p => (p.families || [p.family]).includes(family)))
+    throw Error('Запасной режим: criterion_met — только если семьи дирижёра (' + family + ') нет среди авторов части.');
+}
+async function evaluate(w, s, old, jobs, snapshot) {
+  jobs ??= allJobs(snapshot);
+  jobs = jobs.filter(j => j.who !== 'grok');
   if (s.rules_version > 15) throw Error('Неизвестная версия правил этапа.');
-  if (s.rules_version >= 15) return require('./stage-gate-v15').evaluate(w, s, old, jobs);
+  conductorLimits(s, old);
+  if (s.rules_version >= 15) return require('./stage-gate-v15').evaluate(w, s, old, jobs, snapshot);
   if (s.artifact_manifest && (s.state === 'принят' || s.criterion_met)) s.artifact_verification = checkArtifacts(w, s);
   if (s.rules_version < 14 && !s.level) return '';
   if (s.state === 'выдан без принятия' && old?.state !== 'выдан без принятия' && !s.override && !s.one_family)
@@ -287,12 +302,13 @@ async function evaluate(w, s, old, jobs = allJobs()) {
   if (s.fresh_review_file) messages.push(registerFile(w, s, s.fresh_review_file, v));
   delete s.fresh_review_file;
   if (!action || changed) return messages.join('\n');
-  sources(w, s, jobs, ps);
-  const ids = list(s.reviews);
+  sources(w, s, jobs, ps, snapshot);
+  const historicIds = new Set((s.gate.votes || []).filter(j => j.who === 'grok').map(j => j.id));
+  const ids = list(s.reviews).filter(id => !historicIds.has(id));
   if (s.state === 'принят' && !ids.length) throw Error('Принятие требует reviews — номера поручений.');
   if (new Set(ids).size !== ids.length) throw Error('Одно поручение дважды в reviews.');
-  for (const id of ids) if (!linked.some(j => j.id === id)) throw Error(id + ': поручение другой работы или этапа.');
-  const rows = currentRows(w, s, jobs, v, ids);
+  for (const id of ids) if (jobs.some(j => j.id === id) && !linked.some(j => j.id === id)) throw Error(id + ': поручение другой работы или этапа.');
+  const rows = currentRows(w, s, jobs, v, ids, snapshot).filter(j => j.replaces?.who !== 'grok');
   for (const j of rows) if (ps.some(p => p.part) && !named(j.who === 'fresh' ? j.reviewText : task(j), ps).length)
     messages.push(j.id + ': части не названы — засчитано на все');
   for (const j of rows.filter(j => j.who !== 'fresh')) {
@@ -311,10 +327,7 @@ async function evaluate(w, s, old, jobs = allJobs()) {
     const req = required(p, s);
     const normal = applicable.filter(j => j.replaces || (j.role !== 'совет' && req.includes(j.who === 'fresh' ? 'fresh' : j.family)));
     let mandatory = normal.filter(j => s.level !== 'мелочь' || j.who !== 'fresh');
-    if (s.level === 'мелочь' && !mandatory.length) {
-      mandatory = applicable.filter(j => j.who === 'grok' && j.role !== 'совет');
-      if (mandatory.length) messages.push('место „мелочи“ занял Grok');
-    }
+
     const latest = new Map();
     for (const j of mandatory) latest.set(j.replaces ? whoSeat(j.replaces.who) : j.who === 'fresh' ? 'fresh' : j.family, j);
     const occupied = [...latest.values()];
@@ -332,14 +345,16 @@ async function evaluate(w, s, old, jobs = allJobs()) {
     const lastRefusals = new Map();
     for (const j of unresolved) lastRefusals.set(j.who + '/' + slot(j), j);
     negatives.push(...[...lastRefusals.values()].map(j => ({ j, p })));
-    if (s.level === 'мелочь') { if (!occupied.length) missing.push((p.part || 'этап') + ': проверяющий другой семьи'); }
-    else for (const seat of req) if (!latest.has(seat)) missing.push((p.part || 'этап') + ': ' + seat);
+    for (const seat of req) if (!latest.has(seat)) missing.push((p.part || 'этап') + ': ' + seat);
     const latestAdvice = new Map();
     for (const j of applicable.filter(j => !mandatory.includes(j))) latestAdvice.set(j.who, j);
     advisories.push(...[...latestAdvice.values()].filter(j => j.count));
   }
   for (const j of new Map(advisories.map(j => [j.id, j])).values()) messages.push('совещательно не принял ' + j.who + ': ' + j.count + ' блокирующих');
   const reasons = [];
+  if (s.level === 'высокий' && negatives.some(n => n.j.who === 'fresh') &&
+      (s.override || s.one_family || s.state === 'выдан без принятия'))
+    throw Error('Высокий риск: отказ дополнительного помощника останавливает выдачу.');
   if (s.override || s.one_family) {
     if (s.one_family) {
       if (!s.reason?.trim()) throw Error('one_family требует reason.');
@@ -347,7 +362,9 @@ async function evaluate(w, s, old, jobs = allJobs()) {
       if (!occupiedAll.some(j => j.who !== 'fresh')) throw Error('one_family требует заполненное обязательное место.');
       reasons.push('проверяла одна семья, причина: ' + s.reason);
     }
-    if (missing.length && !s.one_family) throw Error('Не заполнены обязательные места: ' + missing.join('; '));
+    const userIssue = s.state === 'выдан без принятия' && s.override?.by === 'user' && s.override.quote?.trim() && !s.override.criterion;
+    if (userIssue) reasons.push('выдано без принятия по слову пользователя: ' + s.override.quote);
+    if (missing.length && !s.one_family && !userIssue) throw Error('Не заполнены обязательные места: ' + missing.join('; '));
     if (negatives.length) {
       const o = s.override;
       if (!o || !['claude', 'user'].includes(o.by)) throw Error('Неснятое «НЕ ПРИНЯТО»: нужен override.');
@@ -355,7 +372,7 @@ async function evaluate(w, s, old, jobs = allJobs()) {
       if (o.by === 'claude') {
         if (!o.reason?.trim()) throw Error('override требует reason.');
         const history = jobs.filter(x => belongs(x, w, s) && x.status === 'done' && x.role === 'проверка').flatMap(x => {
-          try { return [reviewed(x)]; } catch { return []; }
+          try { return [reviewed(x, false, snapshot)]; } catch { return []; }
         }).concat(freshRows(s));
         for (const { j, p } of negatives) if (history.filter(x => x.who === j.who && x.count && covers(x, p, ps)).length < 2)
           throw Error(j.who + ': меньше двух «НЕ ПРИНЯТО».');

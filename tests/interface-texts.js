@@ -4,7 +4,7 @@ const fs = require('fs'), path = require('path');
 // Остальные файлы docs (включая новые) проверяются без исключений.
 const history = new Set(['docs/design/design-v1.md', 'docs/design/design-v2.md',
   'docs/design/design-v3.md', 'docs/design/impl-brief.md']);
-const forbidden = /трёх\s+ИИ|Связка\s+трёх|Квоты\s+(?:трёх|четырёх)|проверка\s+трёх\s+голосов|трое\s+проверяющих|(?:^|[^а-яё])трио(?=$|[^а-яё])/i;
+const forbidden = /Квоты\s+(?:трёх|четырёх)|проверка\s+трёх\s+голосов|трое\s+проверяющих|(?:^|[^а-яё])трио(?=$|[^а-яё])/i;
 function ownText(text) {
   // Дословные материалы должны быть явно отделены от собственного описания интерфейса.
   return text.replace(/^```(?:user-request|assistant-response)\r?\n[\s\S]*?^```[ \t]*$/gm, '');

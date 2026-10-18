@@ -91,7 +91,7 @@ test('Р9: team_status краткий и полный не обновляют п
   const team = new (require('../common/team').Team)(f.root, f.state);
   for (const full of [false, true]) {
     const text = await team.status(undefined, undefined, false, full);
-    assert.match(text, /status-p/); assert(!text.includes('карточка повреждена')); assert.deepEqual(roots.map(snapshot), before);
+    assert.doesNotMatch(text, /status-p/); assert.match(text, /status-work/); assert(!text.includes('карточка повреждена')); assert.deepEqual(roots.map(snapshot), before);
   }
 });
 run(tests);

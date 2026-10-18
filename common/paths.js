@@ -33,7 +33,13 @@ function isInsideReal(child, root) {
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+function isSameOrInsideReal(child, root) {
+  const rel = path.relative(canon(root), canonMaybe(child));
+  return rel === '' || (!path.isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + path.sep));
+}
+
 function samePath(a, b) {
+  if (typeof a !== 'string' || !a || typeof b !== 'string' || !b) return false;
   try {
     return canonMaybe(a) === canonMaybe(b);
   } catch (e) {
@@ -50,4 +56,4 @@ function withRoot(text, root = repoRoot) {
   return text.replace(/C:\\most(?![\w-])/gi, () => actual).replace(/C:\/most(?![\w-])/gi, () => actual.replace(/\\/g, '/'));
 }
 module.exports = {
-  withRoot, canon, canonMaybe, isInsideReal, samePath, stateDir, repoRoot };
+  withRoot, canon, canonMaybe, isInsideReal, isSameOrInsideReal, samePath, stateDir, repoRoot };

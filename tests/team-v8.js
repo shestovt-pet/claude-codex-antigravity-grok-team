@@ -109,10 +109,13 @@ test('Р4/Р5: проверки правил из замысла, без изм�
     assert(!/художественн/i.test(text('skill/vtm-hronika/SKILL.md')));
   } else console.log('Личный скилл хроник отсутствует (публичная копия): проверка его формулировок пропущена.');
   assert.match(text('rules/brief.md').split('\n')[0], /roles/);
-  assert.match(text('rules/antigravity.md'), /Кому поручить[^\n]*Grok/);
+  const antigravity = text('rules/antigravity.md');
+  assert.match(antigravity, /У пользователя два помощника:[^\n]*Antigravity[^\n]*Codex/);
+  assert(antigravity.includes('исполнителя выбирает связка сама — по таблице «Кого звать» скилла helpers и rules/roles.md; не спрашивать.'));
+  assert(antigravity.includes('Вопрос — только если неясен смысл нужного результата.'));
   const grokLines = text('rules/claude.md').split('\n').filter(line => /Grok/.test(line) && line.trim());
   assert.equal(new Set(grokLines).size, grokLines.length);
-  assert.equal((text('rules/claude.md').match(/## Совещательное ревью Grok/g) || []).length, 1);
+  assert.equal((text('rules/claude.md').match(/## История выключенного участника/g) || []).length, 1);
   assert(!text('rules/claude.md').includes('Жёсткое ревью замысла и итога, сбор и чтение больших материалов — Grok.'));
 });
 test('Р2/Р3: сервер — --model, карточка, ответ, повтор той же моделью и гостевая очередь', async () => {
@@ -141,6 +144,8 @@ test('Р2/Р3: сервер — --model, карточка, ответ, повт�
     }
     assert.fail(JSON.stringify(card));
   }
+  // team-v19 (Codex 7a3bd85b п. 1): поручения гостя — только при прочитанной записи основного сервера.
+  json(path.join(RUN, 'state/ready/team.json'), { release: ROOT, pid: 2147483000, startedAt: new Date(Date.now() - 3600000).toISOString() });
   const guest = await open(true); let guestId;
   try { guestId = await send(guest.client, 'guest'); } finally { await guest.client.close(); await guest.transport.close(); }
   const main = await open();

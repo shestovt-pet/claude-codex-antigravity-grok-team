@@ -44,6 +44,8 @@ function repo(label) {
   write(path.join(root, 'file.txt'), 'база');
   for (const n of ['common', 'claude', 'antigravity', 'roles'])
     write(path.join(root, 'rules', n + '.md'), 'принятые правила ' + n);
+  // team-v28 Р1: в каждом настоящем релизе есть common/access.js — по нему проба считает ожидаемый список гостя.
+  write(path.join(root, 'common', 'access.js'), fs.readFileSync(path.join(ROOT, 'common', 'access.js')));
   g.git(root, ['add', '-A']);
   g.git(root, ['commit', '-m', 'База']);
   return root;
@@ -123,11 +125,12 @@ function configs(label, rootLabel = label) {
 const mock = {
   archive: async (root, id, temp) => {
     for (const n of ['team', 'codex', 'antigravity', 'grok']) write(path.join(temp, 'servers', n, 'index.js'), '');
+    write(path.join(temp, 'common', 'access.js'), fs.readFileSync(path.join(ROOT, 'common', 'access.js'))); // team-v28 Р1
   },
   install: async () => {},
   probe: async (file, env) => {
     const n = path.basename(path.dirname(file));
-    return { tools: (env.MOST_CLIENT === 'claude' ? [] : n === 'team' ? ['team_status', 'team_rules', 'team_work'] : [n + '_status', n + '_send', n + '_result']).map(name => ({name})) };
+    return { tools: (env.MOST_CLIENT === 'claude' ? [] : require('../common/access').guestTools(n, env.MOST_CLIENT)).map(name => ({name})) };
   },
 };
 const simple = path.join(RUN, 'work-root');
@@ -254,7 +257,7 @@ test('Частичный сбой явно сообщается при чужо�
   );
   assert.equal(read(files[0]).external, true);
 });
-test('MCP: четыре инструмента, формат, русские описания', async () => {
+test('MCP: пять инструментов (team-v18: team_word), формат, русские описания', async () => {
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js'),
     { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
   const tr = new StdioClientTransport({
@@ -267,7 +270,8 @@ test('MCP: четыре инструмента, формат, русские о�
   try {
     await cl.connect(tr);
     const list = await cl.listTools();
-    assert.equal(list.tools.length, 4);
+    assert.equal(list.tools.length, 5);
+    assert(list.tools.some(t => t.name === 'team_word'));
     for (const t of list.tools)
       assert(
         !/most_|poruch|itog|perenesti|papka|rezhim|fayl|stroki|opora|zamechaniya|pravka|tekst|kuda|polno|zhdat|chernovik/.test(
@@ -399,11 +403,11 @@ test(
   true,
 );
 test(
-  'Ворота: решение пользователя заменяет ровно один голос',
+  'Ворота (team-v18): решение пользователя пишется в историю, но место не закрывает',
   async () => {
     const x = await change('user');
     await vote(x);
-    await x.team.change({
+    const out = await x.team.change({
       action: 'verdict',
       name: 'one',
       who: 'user',
@@ -413,8 +417,11 @@ test(
       replaces: 'codex',
       quote: 'Принимаю вместо Codex',
     });
-    await rejects(() => x.team.change({ action: 'merge', name: 'one' }), /antigravity/);
+    assert.match(out, /место им не закрывается/);
     await vote(x, 'antigravity');
+    await rejects(() => x.team.change({ action: 'merge', name: 'one' }), /Нет действующего принятия: codex/);
+    assert(read(x.team.changeFile('one')).verdicts.some(v => v.who === 'user' && v.replaces === 'codex'));
+    await vote(x, 'codex');
     await x.team.change({ action: 'merge', name: 'one' });
     assert.equal(g.hash(x.root), x.c.candidate);
   },

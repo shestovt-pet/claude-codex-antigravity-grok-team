@@ -16,7 +16,7 @@ test('Р1/Р4: правила распределения и проверки т�
     for (const phrase of phrases) assert(text.includes(phrase), file + ': отсутствует положение «' + phrase + '»');
   };
   contains('rules/roles.md', [
-    'Все трое помощников участвуют в обсуждении замысла и в итоговом ревью',
+    'Оба помощника участвуют в обсуждении замысла и итоговом ревью',
     'Codex — критик логики и проверяемости замысла и итога; код и автотесты. Рутины не получает.',
     'Antigravity — автор литературного текста',
     'Колонка таблицы называется «вариант по подсчёту»',
@@ -24,8 +24,8 @@ test('Р1/Р4: правила распределения и проверки т�
     'официальный перевод издателя засчитывается и без второго источника',
     'Русская передача любого имени и термина — только по практике сообщества',
   ]);
-  contains('rules/grok.md', ['проверка терминов (сам выписывает их из готового текста)', 'вариант по подсчёту']);
-  contains('rules/antigravity.md', ['Готовый текст уходит Grok: он сам выписывает термины', 'механически вносит вариант по подсчёту']);
+  contains('rules/grok.md', ['Grok выключен из связки']);
+  contains('rules/antigravity.md', ['Готовый текст получает Claude: он выписывает термины', 'механически вносит вариант по подсчёту']);
   if (fs.existsSync(path.join(ROOT, 'skill/vtm-hronika/SKILL.md'))) contains('skill/vtm-hronika/SKILL.md', [
     'Сервер team_work проверяет приёмку', 'вариант по подсчёту',
   ]);
@@ -58,8 +58,8 @@ test('Р2/Р6: настоящая краткая сводка — подсказ
     json(path.join(stores.roots().codex, id + '.json'), { id, startedAt: new Date(Date.now() - hours * 3600000).toISOString(), stage, status: 'done' });
   const team = new (require('../common/team').Team)(RUN);
   const result = await team.status(undefined, undefined, false, false, { agy_model: 'chosen' });
-  assert.match(result, /новые крупные тексты отложить/); assert.match(result, /Grok: квота не видна/);
-  assert.match(result, /Grok — 0 поручений/); assert.match(result, /Рутина за сутки[^\n]*codex — 1/);
+  assert.match(result, /новые крупные тексты отложить/); assert(!result.includes('Grok: квота не видна'));
+  assert(!result.includes('Grok —')); assert.match(result, /Рутина за сутки[^\n]*codex — 1/);
 });
 test('Краткая сводка: 16 поручений ждут квоту, одна строка на участника, подробности в full', async () => {
   const stores = require('../common/team-store'), locks = require('../common/locks');
@@ -102,8 +102,8 @@ test('Р7: свой владелец, работа, без метки — имя
   assert.match(reminder(RUN, undefined, { owner: 'alice' }), /Работа one/);
   assert(!reminder(RUN, undefined, { owner: 'alice' }).includes('bob'));
   assert.equal(reminder(RUN, undefined, { owner: 'alice', work: 'two' }), '');
-  assert.match(reminder(RUN, undefined, { work: 'two' }), /владелец bob/);
-  assert.match(reminder(RUN), /Работа one[\s\S]*Работа two/);
+  assert.equal(reminder(RUN, undefined, { work: 'two' }), '');
+  assert.equal(reminder(RUN), '');
 });
 test('Р7: общий транспорт — одновременно, обратный порядок, отказ схемы, без метки', async () => {
   assert.deepEqual(require('../common/request-context').scope(null), {});
@@ -115,7 +115,7 @@ test('Р7: общий транспорт — одновременно, обра�
   await Promise.all([transport.onmessage({ id: 1, method: 'tools/call', params: { arguments: { owner: 'alice' } } }), transport.onmessage({ id: 2, method: 'tools/call', params: { arguments: { owner: 'bob' } } })]);
   assert.equal(sent[0].id, 2);
   for (const m of sent) { const text = m.result.content[0].text; assert.equal((text.match(/⚠/g) || []).length, 1); assert(text.includes(m.id === 1 ? 'alice' : 'bob')); assert(!text.includes(m.id === 1 ? 'bob' : 'alice')); }
-  await transport.onmessage({ id: 3, method: 'tools/call' }); assert.match(sent.at(-1).result.content[0].text, /alice[\s\S]*bob/);
+  await transport.onmessage({ id: 3, method: 'tools/call' }); assert(!sent.at(-1).result.content[0].text.includes('⚠'));
 });
 test('Р7: team_status через SDK принимает owner/work, включая ошибку схемы', async () => {
   // Собственный git-корень не даёт git status подняться до репозитория прогона.

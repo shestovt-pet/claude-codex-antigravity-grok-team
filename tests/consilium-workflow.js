@@ -72,7 +72,7 @@ async function main() {
     ['нет плана', f => { f.w.stages[1].kind = 'execution'; }, /порядок/],
     ['цитата не из запроса', f => { f.w.requirements[0].quote = 'Придуманное'; }, /дословным/],
     ['пустой исходный запрос', f => { put(f.dir, 'request.txt', ' '); f.w.request.sha256 = cw.sha(' '); }, /пуст/],
-    ['два голоса', f => { f.w.stages[4].reviews.pop(); }, /три/],
+    ['один голос', f => { f.w.stages[4].reviews.pop(); }, /голоса Codex/],
     ['повтор job_id', f => { f.w.stages[4].reviews[0].job_id = f.w.stages[3].reviews[0].job_id; }, /Повтор/],
     ['неизвестный источник', f => { f.w.stages[4].reviews[0].source = 'claude'; }, /источник/],
     ['изменившееся изображение', f => { put(f.dir, 's3.txt', 'Изменено'); }, /снимка/],
@@ -99,21 +99,21 @@ async function main() {
     await rejected(() => f.check(), /порядок/);
   });
   for (const status of ['running', 'delivery_unclear', 'cancel_requested', 'stop_unconfirmed', 'stop_confirmed', 'cancelled', 'lost', 'failed'])
-    await test('новое нерешённое ревью Grok не скрывается: ' + status, async () => {
+    await test('новое нерешённое ревью Codex не скрывается: ' + status, async () => {
       const f = fixture(); await f.prepare(); const s = f.w.stages[4];
-      f.vote(s, 'grok', true, { status, finishedAt: undefined, startedAt: '2030-01-01T00:00:00.000Z',
+      f.vote(s, 'codex', true, { status, finishedAt: undefined, startedAt: '2030-01-01T00:00:00.000Z',
         ...(status === 'stop_unconfirmed' ? { cancel_requested: { at: '2030-01-01T00:00:01.000Z', remote_ack: false },
           lateHash: 'late-hash', late_result: { receivedAt: '2030-01-01T00:00:02.000Z' } } : {}) });
       f.save(); await rejected(() => f.check(), /действующего/);
     });
   await test('нерешённое ревью с неизвестным порядком не пропускается', async () => {
-    const f = fixture(); await f.prepare(); f.vote(f.w.stages[4], 'grok', true, { status: 'running', finishedAt: undefined });
+    const f = fixture(); await f.prepare(); f.vote(f.w.stages[4], 'codex', true, { status: 'running', finishedAt: undefined });
     f.save(); await rejected(() => f.check(), /порядок/);
   });
   await test('после нерешённого ревью нужен новый действующий завершённый ответ', async () => {
     const f = fixture(); await f.prepare(); const s = f.w.stages[4];
-    f.vote(s, 'grok', true, { status: 'stop_unconfirmed', finishedAt: undefined, startedAt: '2028-01-01T00:00:00Z' });
-    s.reviews[1] = f.vote(s, 'grok', true, { startedAt: '2028-01-02T00:00:00Z', finishedAt: '2028-01-02T00:01:00Z' });
+    f.vote(s, 'codex', true, { status: 'stop_unconfirmed', finishedAt: undefined, startedAt: '2028-01-01T00:00:00Z' });
+    s.reviews[0] = f.vote(s, 'codex', true, { startedAt: '2028-01-02T00:00:00Z', finishedAt: '2028-01-02T00:01:00Z' });
     f.save(); assert.equal((await f.check()).ready, true);
   });
   await test('финальное покрытие всех требований проверяется после голосов', async () => {
@@ -172,7 +172,7 @@ async function main() {
   });
   await test('реальные адаптеры AGY, Codex и Grok: схема карточек 86ed и снятие только служебного Grok footer', async () => {
     const adapter = cw.bridgeAdapter(), snapshot = 'a'.repeat(64), work = 'adapter-test', stage = 'pilot';
-    for (const who of cw.QUORUM) {
+    for (const who of [...cw.QUORUM, 'grok']) {
       const id = 'wf-' + who, task = `workflow_work: ${work}\nworkflow_stage: ${stage}\nsnapshot_sha256: ${snapshot}`;
       const response = `snapshot_sha256: ${snapshot}\nПРИНЯТО`;
       const raw = who === 'grok' ? response + '\nконтроль ' + 'b'.repeat(64) + '\nКОНЕЦ ОТВЕТА\n' : response;

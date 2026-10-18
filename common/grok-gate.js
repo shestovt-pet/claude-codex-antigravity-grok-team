@@ -12,7 +12,12 @@ async function record(c, phase, a) {
   let value;
   if (a.unavailable) {
     try { require('./grok').config(); } catch (e) { value = { status: 'недоступен', reason: e.message }; }
-    if (!value) throw Error('Мост настроен: укажите поручение Grok.');
+    if (!value) {
+      // team-v18 К6: при настроенном мосте недоступность Grok подтверждает действующее слово пользователя «Grok отвалился».
+      const word = require('./user-word').active('grok');
+      if (word) value = { status: 'недоступен', reason: 'слово пользователя «Grok отвалился» (' + word.id + ')', word_id: word.id };
+    }
+    if (!value) throw Error('Мост настроен: укажите поручение Grok или запишите слово пользователя «Grok отвалился» (team_word).');
   } else {
     const j = stores.list('grok', false).jobs.find(j => j.id === a.job_id);
     if (!j) throw Error('Поручение Grok не найдено.');
@@ -46,6 +51,9 @@ async function check(c, lessons) {
   for (const phase of ['design', 'verdict']) {
     const field = phase === 'design' ? 'grokDesign' : 'grokVerdict';
     let v = c[field];
+    // team-v18: Grok на обязательном месте выполнил и совещательный запрос этой редакции тем же поручением.
+    const slot = require('./team-seats').grokSlotVote(c, phase);
+    if (slot && (!v || !bound(v, c, phase) || v.job_id === slot.job_id || v.decision !== 'НЕ ПРИНЯТО')) continue;
     if (!v || !bound(v, c, phase)) throw Error('Grok не запрошен: ' + phase);
     if (v.status !== 'недоступен') {
       await record(c, phase, { job_id: v.job_id }); v = c[field];

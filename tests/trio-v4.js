@@ -207,9 +207,10 @@ test('Круг 4: отказ архивации done не ломает refresh, 
       assert.equal(grok.load(j.id).reason, done.reason);
       assert.equal((await grok.refresh(j.id)).reason, done.reason);
       assert.match(await grok.status(), /Grok:/);
+      const beforeClaim = failures;
       await t.work({action: 'claim', name, owner: 'new', expected_revision: w.revision});
       assert.equal(read(t.workFile(name)).owner, 'new');
-      assert(failures >= 4); assert.equal(fs.readFileSync(pending, 'utf8'), 'Незавершённый остаток');
+      assert.equal(failures, beforeClaim); assert(failures >= 3); assert.equal(fs.readFileSync(pending, 'utf8'), 'Незавершённый остаток');
       assert.equal(grok.load(j.id).resultHash, sha(answer));
     } finally { fs.renameSync = rename; }
     assert.equal((await grok.refresh(j.id)).status, 'done'); assert(!fs.existsSync(pending));
@@ -400,15 +401,20 @@ test('Статус: 15 минут, первая строка всех ответ
   const file = team.workFile('owned'), work = read(file);
   work.created_at = new Date(Date.now() - 16 * 60000).toISOString(); json(file, work);
   for (const who of ['Команда', 'Codex', 'Antigravity', 'Grok']) {
-    assert(require('../common/format').format(who, { status: 'failed' }, 'Проверка')
-      .startsWith('⚠ Статус пользователю не отправлялся 16 мин'));
+    const format = () => require('../common/format').format(who, { status: 'failed' }, 'Проверка');
+    assert(!format().startsWith('⚠ Статус пользователю'));
+    const context = require('../common/request-context').context;
+    assert(context.run({ owner: work.owner }, format).startsWith('⚠ Статус пользователю не отправлялся 16 мин'));
+    assert(!context.run({ owner: 'foreign-owner' }, format).startsWith('⚠ Статус пользователю'));
   }
   await team.work({ action: 'update', name: 'owned', owner: work.owner,
     expected_revision: work.revision, status_sent: true });
   assert.equal(ownership.reminder(), '');
+  assert.equal(ownership.reminder(undefined, Date.now(), { owner: work.owner }), '');
   const current = read(file);
   current.stages[0].state = 'принят'; current.status_sent_at = work.created_at; json(file, current);
   assert.equal(ownership.reminder(), '');
+  assert.equal(ownership.reminder(undefined, Date.now(), { owner: work.owner }), '');
 });
 
 function oldJob(source, id, text = 'ПРИНЯТО', kind = 'jobs') {
@@ -640,18 +646,25 @@ test('MCP: все инструменты — напоминание первой
         assert(!translit.test(JSON.stringify(tool)));
         const result = await client.callTool({ name: tool.name, arguments: {} });
         const text = result.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
-        assert(text.startsWith('⚠ Статус пользователю не отправлялся 16 мин'), tool.name + ': ' + text);
+        assert(!text.startsWith('⚠ Статус пользователю'), tool.name + ': ' + text);
+        if (tool.name === 'team_status') {
+          for (const owner of [work.owner, 'foreign-owner']) {
+            const scoped = await client.callTool({ name: tool.name, arguments: { owner } });
+            const message = scoped.content.map(c => c.text || '').join('\n');
+            assert.equal(message.startsWith('⚠ Статус пользователю не отправлялся 16 мин'), owner === work.owner, message);
+          }
+        }
         assert(!forbidden.test(text) && !translit.test(text), tool.name + ': ' + text);
       }
     } finally { await client.close(); }
   }
   work.stages[0].state = 'принят'; json(file, work);
 });
-test('Подключения: Grok в Claude и гостях, запрет отмены гостям', async () => {
+test('Подключения: Grok отсутствует; исторический сервер запрещает отмену гостям', async () => {
   const deploy = require('../common/deploy'), cc = require('../common/client-configs');
   const config = deploy.configFor({}, RUN, RUN);
-  assert(config.mcpServers.grok);
-  assert(cc.toml('', RUN, RUN, state, process.execPath).includes('[mcp_servers.grok]'));
+  assert(!config.mcpServers.grok);
+  assert(!cc.toml('', RUN, RUN, state, process.execPath).includes('[mcp_servers.grok]'));
   for (const client of ['codex', 'antigravity', 'claude']) {
     const tools = await require('../common/probe').probe(path.join(__dirname, '../servers/grok/index.js'),
       { ...process.env, MOST_CLIENT: client, MOST_PROBE_ONLY: '1' });

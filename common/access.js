@@ -82,23 +82,44 @@ function allowed(server, tool, opts = {}) {
     if (guest(opts)) return false;
   }
   if (!guest(opts)) return true;
-  const c = client();
+  // Установщик прежнего релиза проверяет гостя прежним списком; установщик team-v19 просит полный (MOST_PROBE_GUEST=full).
+  if (process.env.MOST_PROBE_ONLY === '1' && process.env.MOST_PROBE_GUEST !== 'full') return legacyTools(server, client()).includes(tool);
+  return guestTools(server, client()).includes(tool);
+}
+function legacyTools(server, c) {
+  if (!['codex', 'antigravity', 'grok', 'claude'].includes(c)) return [];
+  if (server === 'team') return ['team_status', 'team_rules', 'team_work'];
+  return (c === 'claude' ? 'codex' : c) === server ? [] : [server + '_status', server + '_send', server + '_result'];
+}
+
+// Инструменты гостя при старте (team-v19, К2): у гостей codex и antigravity — team_word и сервер своей семьи; право
+// пользоваться ими проверяет guard при вызове; чат Codex получает свой сервер и вне запасного режима (team-v25).
+function guestTools(server, c) {
   // Live guests: codex / antigravity. Fallback also: grok guest, claude-named-as-guest.
-  if (!['codex', 'antigravity', 'grok', 'claude'].includes(c)) return false;
-  if (server === 'team') return ['team_status', 'team_rules', 'team_work'].includes(tool);
+  if (!['codex', 'antigravity', 'grok', 'claude'].includes(c)) return [];
+  const seat = ['codex', 'antigravity'].includes(c);
+  if (server === 'team') return ['team_status', 'team_rules', 'team_work', ...(seat ? ['team_word'] : [])];
+  const base = [server + '_status', server + '_send', server + '_result'];
+  if (seat && c === server) return [...base, ...(server === 'antigravity' ? ['antigravity_apply', 'antigravity_cancel'] : ['codex_cancel'])];
   const peer = c === 'claude' ? 'codex' : c;
-  return peer !== server && [server + '_status', server + '_result', server + '_send'].includes(tool);
+  if (peer === server) return [];
+  return [...base, ...(seat && server === 'antigravity' ? ['antigravity_apply'] : [])];
 }
 
 function guard(server, tool, a = {}, opts = {}) {
+  if (tool === 'codex_send' && a.full_access && guest(opts))
+    throw Error('Гостю полный доступ Codex запрещён; изменения не выполнены.');
+  // Права дирижёра запасного режима (team-v19, К2) снимают запреты гостю на изменение работ и запись по поручению.
+  const fallback = require('./fallback'), conductor = guest(opts) && fallback.conductorAllows(server, tool, a);
   if (!allowed(server, tool, opts) || (guest(opts) && (
-    (tool === 'team_work' && !['get', 'list'].includes(a.action)) ||
+    (tool === 'team_work' && !['get', 'list'].includes(a.action) && !conductor) ||
     (tool === 'team_status' && (a.claude_quota || a.claude_usage || a.notify_test)) ||
-    (tool === 'codex_send' && a.write) ||
+    (tool === 'codex_send' && a.write && client() !== 'codex' && !conductor) ||
     tool === 'team_change'
   ))) {
     throw Error('Гостю это действие запрещено; изменения не выполнены.');
   }
+  fallback.guard(server, tool, a);
 }
 
 const queued = 'Поручение поставлено в очередь; выполнит основной сервер (Claude Desktop должен быть открыт)';
@@ -126,5 +147,5 @@ function describe(opts = {}) {
 
 module.exports = {
   client, guest, authority, isGateJudge, peerIsAuthority, assertPeerNotJudge,
-  allowed, guard, ready, queued, describe, readSessionAuthority,
+  allowed, guestTools, guard, ready, queued, describe, readSessionAuthority,
 };

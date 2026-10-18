@@ -2,6 +2,7 @@
 const fs = require('fs'), path = require('path'), assert = require('assert');
 module.exports = ({ test, fixture, job, file, fresh, accept, gate, Team, root, project, json, write, sha }) => {
   const read = f => JSON.parse(fs.readFileSync(f, 'utf8'));
+  function highFixture(options) { const material = path.join(project, 'r2-high-' + Date.now()); write(material, 'материал'); return fixture({ ...options, level: 'высокий', material: [material] }); }
   const source = f => fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
   function saveWork(f) {
     const team = new Team(root);
@@ -20,31 +21,18 @@ module.exports = ({ test, fixture, job, file, fresh, accept, gate, Team, root, p
       await accept(f, { one_family: true, reason: 'выдать с одной семьёй' }); assert.equal(f.s.state, 'выдан без принятия');
     }
   });
-  for (const count of [0, 1]) test('КР2 К2: ожидавший ответ завершился после замены, отказов=' + count, async () => {
-    const f = fixture(), t = Date.now() - 5000, iso = n => new Date(t + n).toISOString();
-    job(f, 'codex', 0, { gateOrder: 1, startedAt: iso(0), finishedAt: iso(10) });
-    const no = job(f, 'antigravity', 1, { gateOrder: 2, startedAt: iso(20), finishedAt: iso(30) });
-    const late = job(f, 'antigravity', count, { gateOrder: 3, startedAt: iso(40), status: 'waiting_quota' });
-    job(f, 'antigravity', 0, { gateOrder: 4, startedAt: iso(50), status: 'waiting_quota' });
-    f.s.gate.order = 4; f.s.evidence = 'проверено'; const team = saveWork(f);
-    const a = { work: f.w.name, stage: f.s.id, task: f.s.version, role: 'проверка', owner: 'test', replaces: { who: 'antigravity', reason: 'авария', after_job: [no] } };
-    await gate.prepareJob(a, 'grok', root); Object.assign(f.s, read(team.workFile(f.w.name)).stages[0]);
-    const sent = Date.now();
-    job(f, 'grok', 0, { ...a, startedAt: new Date(sent).toISOString(), finishedAt: new Date(sent + 10).toISOString() });
-    await accept(f); const old = structuredClone(f.s); saveWork(f);
-    updateCard(late, 'antigravity', { status: 'done', finishedAt: new Date(sent + 20).toISOString() });
-    const out = await gate.evaluate(f.w, f.s, old);
-    assert.equal(f.s.state, count ? 'выдан без принятия' : 'принят');
-    if (count) assert.match(out, /после замены не принял antigravity/);
-    const updated = await team.work({ action: 'update', owner: 'test', name: f.w.name, expected_revision: 1, next_step: 'работа продолжается' });
-    assert.equal(read(team.workFile(f.w.name)).stages[0].state, count ? 'выдан без принятия' : 'принят');
-    if (count) assert.match(updated, /Сообщение пользователю[\s\S]*после замены не принял antigravity/);
-    if (count) { await accept(f, { override: { by: 'user', quote: 'выдать с замечаниями' } }); assert.equal(f.s.state, 'выдан без принятия'); }
+  for (const count of [0, 1]) test('КР2 К2: ответ после старой замены Grok, отказов=' + count, async () => {
+    const f = fixture(); job(f, 'codex');
+    job(f, 'grok', 0, { replaces: { who: 'antigravity', reason: 'авария' }, replacementEvidence: { note: 'авария' } });
+    await assert.rejects(accept(f), /google/);
+    job(f, 'antigravity', count);
+    if (count) await assert.rejects(accept(f), /НЕ ПРИНЯТО antigravity/);
+    else { await accept(f); assert.equal(f.s.state, 'принят'); }
   });
   test('КР2 К2: ошибка одного этапа не прерывает update работы', async () => {
     const f = fixture({ state: 'принят', evidence: 'проверено', reviews: ['нет-поручения'] }), team = saveWork(f);
     const out = await team.work({ action: 'update', owner: 'test', name: f.w.name, expected_revision: 1, next_step: 'исправить этап' });
-    assert.match(out, /нет-поручения/); const w = read(team.workFile(f.w.name)); assert.equal(w.next_step, 'исправить этап'); assert.equal(w.stages[0].state, 'идёт');
+    assert.match(out, /Этап не принят/); const w = read(team.workFile(f.w.name)); assert.equal(w.next_step, 'исправить этап'); assert.equal(w.stages[0].state, 'идёт');
   });
   test('КР2 К3: совет Codex с продолжением не блокирует этап', async () => {
     const f = fixture(); job(f); job(f, 'antigravity'); saveWork(f);
@@ -54,7 +42,7 @@ module.exports = ({ test, fixture, job, file, fresh, accept, gate, Team, root, p
     await assert.rejects(gate.prepareJob({ ...a, role: 'проверка' }, 'codex', root), /новым сеансом только для чтения/);
   });
   test('КР2 К4: копия отказа после принятия другой части по прежнему пути', async () => {
-    const f = fixture({ author: ['Альфа', 'Бета'].map(part => ({ part, family: 'google', model: 'gemini' })) });
+    const f = highFixture({ author: ['Альфа', 'Бета'].map(part => ({ part, family: 'google', model: 'gemini' })) });
     const p = await fresh(f, 1, 'Альфа'), rejected = fs.readFileSync(p, 'utf8');
     write(p, f.s.version + '\nБета\nПРИНЯТО'); gate.registerFile(f.w, f.s, p, f.s.version);
     const before = JSON.stringify(f.s.gate.files), team = saveWork(f), copy = path.join(path.dirname(p), 'copy-' + path.basename(p)); write(copy, rejected);
@@ -78,8 +66,8 @@ module.exports = ({ test, fixture, job, file, fresh, accept, gate, Team, root, p
   test('КР2 М2: возврат по порядку при одинаковом времени создания', async () => {
     const f = fixture(), stamp = new Date().toISOString(); job(f, 'antigravity', 0, { gateOrder: 1, startedAt: stamp });
     job(f, 'grok', 0, { gateOrder: 2, startedAt: stamp, replaces: { who: 'codex', reason: 'авария' }, replacementEvidence: { note: 'авария' } });
-    await accept(f); const old = structuredClone(f.s); job(f, 'codex', 1, { gateOrder: 3, startedAt: stamp });
-    assert.match(await gate.evaluate(f.w, f.s, old), /после замены не принял codex/); assert.equal(f.s.state, 'выдан без принятия');
+    await assert.rejects(accept(f), /openai/); job(f, 'codex', 0, { gateOrder: 2, startedAt: stamp }); await accept(f); const old = structuredClone(f.s); job(f, 'codex', 1, { gateOrder: 3, startedAt: stamp });
+    await assert.rejects(gate.evaluate(f.w, f.s, old), /НЕ ПРИНЯТО codex/);
   });
   test('КР2 М3: составные и неоднозначные версии требуют одного указания', async () => {
     for (const [v, text] of [['ред. 1', 'ред. 1.2'], ['v2', 'v2.0'], ['ред. 1', 'сравни ред. 12 с ред. 1'], ['ред. 1', 'version: ред. 1\nversion: ред. 12']]) {

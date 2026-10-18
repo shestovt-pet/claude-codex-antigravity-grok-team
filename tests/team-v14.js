@@ -95,7 +95,7 @@ test('8: замороженные поля; изменение связки ни
 });
 test('9: помощник должен быть подтверждён текстом своей семьи; совет/сбой не автор; anthropic помечен', async () => {
   for (const opts of [null, { role: 'совет' }, { role: 'текст', status: 'failed' }]) {
-    const f = fixture({ author: { family: 'google', model: 'gemini' } }); if (opts) job(f, 'antigravity', 0, opts);
+    const f = highFixture({ author: { family: 'google', model: 'gemini' } }); if (opts) job(f, 'antigravity', 0, opts);
     await assert.rejects(accept(f), /без поручения/);
   }
   const f = fixture(); job(f); job(f, 'antigravity'); assert.match(await accept(f), /автор заявлен Claude/);
@@ -134,12 +134,16 @@ test('12в, 12ж, 12з, 12к: критерий и отказы снимаютс�
   await assert.rejects(accept(g, { criterion_met: { reason: 'проверено' } })); delete g.s.criterion_met;
   job(g); await accept(g); assert.equal(g.s.state, 'выдан без принятия'); await accept(g, { criterion_met: { reason: 'проверено' } }); assert.equal(g.s.state, 'принят');
 });
-test('12и: совещательный Grok не блокирует; неудобный обязательный на мелочи блокирует', async () => {
+test('12и: исторический Grok не блокирует; неудобный обязательный на мелочи блокирует', async () => {
   const f = fixture({ level: 'мелочь' }); job(f); job(f, 'antigravity'); job(f, 'grok', 1);
-  assert.match(await accept(f), /совещательно не принял grok/);
+  assert.doesNotMatch(await accept(f), /grok/);
   job(f, 'codex', 1); await assert.rejects(accept(f), /НЕ ПРИНЯТО codex/);
   const g = fixture({ level: 'мелочь' }); job(g, 'grok', 1); await assert.rejects(accept(g));
 });
+function highFixture(options) {
+  const material = path.join(project, 'legacy-high-' + (++seq)); write(material, 'материал');
+  return fixture({ ...options, level: 'высокий', material: [material] });
+}
 test('12е, 12н: последние отказы по частям, дедупликация, ссылка after_file не перерегистрирует', async () => {
   const f = fixture({ author: [{ part: 'Альфа', family: 'anthropic', model: 'claude' }, { part: 'Бета', family: 'anthropic', model: 'claude' }] });
   const a = job(f, 'codex', 1), b = job(f, 'codex', 1, { task: f.s.version + ' Бета' });
@@ -148,7 +152,7 @@ test('12е, 12н: последние отказы по частям, дедуп�
   const proof = await gate.replacement(f.w, f.s, j, rows, jobs, gate.parts(f.s), false); assert(proof.text.includes(a) && proof.text.includes(b));
   j.replaces.after_job = [b]; await assert.rejects(gate.replacement(f.w, f.s, j, rows, jobs, gate.parts(f.s), false), /последние/);
   j.task += ' Гамма'; j.replaces.after_job = [a, a, b]; await assert.rejects(gate.replacement(f.w, f.s, j, rows, jobs, gate.parts(f.s), false));
-  const g = fixture({ author: { family: 'google', model: 'gemini' } }); const p = await fresh(g, 1); const before = JSON.stringify(g.s.gate.files);
+  const g = highFixture({ author: { family: 'google', model: 'gemini' } }); const p = await fresh(g, 1); const before = JSON.stringify(g.s.gate.files);
   const r = { id: 'new', who: 'grok', family: 'xai', task: g.s.version, at: Date.now() + 100, replaces: { who: 'fresh', reason: 'нет инструмента Agent', after_file: [p] } };
   await gate.replacement(g.w, g.s, r, gate.currentRows(g.w, g.s, [], g.s.version), [], gate.parts(g.s)); assert.equal(JSON.stringify(g.s.gate.files), before);
 });
@@ -187,11 +191,11 @@ test('6: семья замены совпадает с автором или в�
   job(f, 'antigravity'); const rows = gate.currentRows(f.w, f.s, gate.allJobs(), f.s.version);
   await assert.rejects(gate.replacement(f.w, f.s, { ...base, family: 'google' }, rows, [], gate.parts(f.s), false), /вторым/);
 });
-test('12в: отказ вернувшегося заменённого снимает принятие; новое принятие восстанавливает', async () => {
+test('12в: старая замена Grok не закрывает место; отказ Codex блокирует до нового принятия', async () => {
   const f = fixture(); job(f, 'antigravity');
   job(f, 'grok', 0, { replaces: { who: 'codex', reason: 'авария' }, replacementEvidence: { note: 'авария: f1, f2' } });
-  await accept(f); const old = structuredClone(f.s); job(f, 'codex', 1);
-  assert.match(await gate.evaluate(f.w, f.s, old), /после замены не принял codex/); assert.equal(f.s.state, 'выдан без принятия');
+  await assert.rejects(accept(f), /openai/); job(f); await accept(f); const old = structuredClone(f.s); job(f, 'codex', 1);
+  await assert.rejects(gate.evaluate(f.w, f.s, old), /НЕ ПРИНЯТО codex/);
   await assert.rejects(accept(f), /НЕ ПРИНЯТО/); job(f); await accept(f); assert.equal(f.s.state, 'принят');
 });
 test('12з: criterion_met после правки material ждёт новые вердикты всех семей', async () => {
@@ -201,16 +205,16 @@ test('12з: criterion_met после правки material ждёт новые �
   f.s.version = gate.version(f.w, f.s); job(f); await assert.rejects(accept(f, { criterion_met: { reason: 'готово' } }));
   job(f, 'antigravity'); await accept(f, { criterion_met: { reason: 'готово' } }); assert.equal(f.s.state, 'принят');
 });
-test('12и: свежий обязательный отказ блокирует, два разных файла разрешают override', async () => {
+test('12и: свежий обязательный отказ высокого риска блокирует и выдачу по override', async () => {
   const material = path.join(project, 'fresh-high-' + (++seq)); write(material, 'high'); const f = fixture({ level: 'высокий', material: [material] });
   job(f); job(f, 'antigravity'); await fresh(f, 1); await assert.rejects(accept(f), /fresh/);
-  await assert.rejects(accept(f, { override: { by: 'claude', reason: 'решение' } }), /меньше двух/);
-  await fresh(f, 1); await accept(f, { override: { by: 'claude', reason: 'решение' } }); assert.equal(f.s.state, 'выдан без принятия');
+  await assert.rejects(accept(f, { override: { by: 'claude', reason: 'решение' } }), /отказ дополнительного помощника останавливает выдачу/);
+  await fresh(f, 1); await assert.rejects(accept(f, { override: { by: 'user', quote: 'Выдать' } }), /отказ дополнительного помощника останавливает выдачу/);
 });
-test('12и: замена семьи anthropic при авторе xai обязательна', async () => {
+test('12и: историческая карточка Grok не подтверждает автора xai', async () => {
   const f = fixture({ author: { family: 'xai', model: 'grok' } }); job(f, 'grok', 0, { role: 'текст' }); job(f, 'antigravity');
   job(f, 'antigravity', 1, { model: 'claude-opus-4.6', replaces: { who: 'codex', reason: 'авария' }, replacementEvidence: { note: 'авария' } });
-  await assert.rejects(accept(f), /НЕ ПРИНЯТО antigravity/);
+  await assert.rejects(accept(f), /Автор-помощник без поручения «текст»: xai/);
 });
 test('12п: замена по Б не снимает отказ исходного проверяющего по А', async () => {
   const f = fixture({ level: 'мелочь', author: [{ part: 'Альфа', family: 'anthropic', model: 'claude' }, { part: 'Бета', family: 'anthropic', model: 'claude' }] });
@@ -270,15 +274,15 @@ test('12д до v14: source_jobs без role — текст, reviews без role
   await accept(f, { reviews: [review] }); assert.equal(f.s.state, 'принят');
   const pathResult = path.join(root, 'state/codex-jobs', review + '.result.txt'); write(pathResult, 'просто совет'); await assert.rejects(accept(f, { reviews: [review] }), /вердикт/);
 });
-test('КР1 Б1: вернувшийся Codex освобождает семью Grok по своей части', async () => {
+test('КР1 Б1: старые замены Grok не закрывают места Codex и Antigravity', async () => {
   const f = fixture();
   job(f, 'grok', 0, { replaces: { who: 'codex', reason: 'авария' }, replacementEvidence: { note: 'авария' } });
   job(f, 'codex');
   job(f, 'grok', 0, { replaces: { who: 'antigravity', reason: 'авария' }, replacementEvidence: { note: 'авария' } });
-  await accept(f); assert.equal(f.s.state, 'принят');
+  await assert.rejects(accept(f), /google/); job(f, 'antigravity'); await accept(f); assert.equal(f.s.state, 'принят');
 });
 test('КР1 Б2: регистрация after_file и отправка в одну миллисекунду', async () => {
-  const f = fixture({ author: { family: 'google', model: 'gemini' } });
+  const f = highFixture({ author: { family: 'google', model: 'gemini' } });
   json(path.join(root, 'works', f.w.name + '.json'), f.w);
   const p = file(f, 1), now = Date.now, fixed = now(); Date.now = () => fixed;
   try {
@@ -289,7 +293,7 @@ test('КР1 Б2: регистрация after_file и отправка в одн
   } finally { Date.now = now; }
 });
 for (const registered of [true, false]) test('КР1 Б3: повторный путь after_file, заранее зарегистрирован=' + registered, async () => {
-  const f = fixture({ author: { family: 'google', model: 'gemini' } });
+  const f = highFixture({ author: { family: 'google', model: 'gemini' } });
   const p = await fresh(f, 1), original = structuredClone(f.s.gate.files[0]);
   write(p, f.s.version + '\nНОВЫЙ-ОТКАЗ\nНЕ ПРИНЯТО: 2 блокирующих');
   if (registered) gate.registerFile(f.w, f.s, p, f.s.version);
@@ -305,14 +309,14 @@ for (const registered of [true, false]) test('КР1 Б3: повторный пу
   const rows = gate.currentRows(restored, restored.stages[0], [], f.s.version);
   await gate.replacement(restored, restored.stages[0], { ...a, id: 'sent', who: 'grok', family: 'xai', at: Date.now() }, rows, [], gate.parts(f.s), false);
 });
-test('КР1 Б4: следующая замена снимает отказ замены по месту', async () => {
+test('КР1 Б4: исторический отказ Grok не является действующим after_job', async () => {
   const f = fixture({ level: 'мелочь' });
   const no = job(f, 'grok', 1, { replaces: { who: 'codex', reason: 'авария' }, replacementEvidence: { note: 'авария' } });
   job(f, 'antigravity', 0, { replaces: { who: 'codex', reason: 'авария', after_job: [no] }, replacementEvidence: { note: 'авария' } });
-  await accept(f); assert.equal(f.s.state, 'принят');
+  await assert.rejects(accept(f), /последние неснятые отказы/);
 });
 test('КР1 Б3: один путь с двумя отказами по разным частям передаёт оба хеша', async () => {
-  const f = fixture({ author: [{ part: 'Альфа', family: 'google', model: 'gemini' }, { part: 'Бета', family: 'google', model: 'gemini' }] });
+  const f = highFixture({ author: [{ part: 'Альфа', family: 'google', model: 'gemini' }, { part: 'Бета', family: 'google', model: 'gemini' }] });
   const p = await fresh(f, 1, 'Альфа');
   write(p, f.s.version + '\nБета\nНЕ ПРИНЯТО: 2 блокирующих'); gate.registerFile(f.w, f.s, p, f.s.version);
   json(path.join(root, 'works', f.w.name + '.json'), f.w);
@@ -337,8 +341,8 @@ for (const legacy of [false, true]) test('КР1 Б5: без folder, внешни
 });
 test('КР1 Н1: названия без регистра и ё/е, предупреждение без названий', async () => {
   const f = fixture({ level: 'мелочь', author: [{ part: 'Зачёт', family: 'anthropic', model: 'claude' }, { part: 'Бета', family: 'anthropic', model: 'claude' }] });
-  job(f, 'codex', 0, { task: f.s.version + ' зачет' }); await assert.rejects(accept(f), /Бета: проверяющий/);
-  job(f, 'antigravity'); assert.match(await accept(f), /части не названы — засчитано на все/);
+  job(f, 'codex', 0, { task: f.s.version + ' зачет' }); await assert.rejects(accept(f), /Бета: openai/);
+  job(f, 'codex', 0, { task: f.s.version + ' Бета' }); job(f, 'antigravity'); assert.match(await accept(f), /части не названы — засчитано на все/);
   job(f, 'codex', 1); await assert.rejects(accept(f), /части не названы — засчитано на все/);
 });
 test('КР1 Н2: ошибка чтения карточки сохраняет принятие и предупреждает с номером', async () => {
@@ -376,7 +380,7 @@ test('КР1 Н2: ошибка чтения карточки сохраняет �
         assert.equal(listed.errors.some(e => e.includes(id)), failure !== 'ENOENT');
         const w = await team.refreshWork(team.workFile(f.w.name));
         assert.equal(w.stages[0].state, 'принят'); assert.equal(w.revision, 4); assert.equal(w.closed, true);
-        if (failure === 'ENOENT') assert(!w.stages[0].gate.warning, 'ENOENT не даёт предупреждения Н2');
+        if (failure === 'ENOENT' || who === 'grok') assert(!w.stages[0].gate.warning, 'ENOENT не даёт предупреждения Н2');
         else assert(w.stages[0].gate.warning.includes(id), 'настоящий сбой должен давать предупреждение Н2');
         assert(reads > 0, 'карточка дошла до чтения после перечисления');
       } finally { fs.readFileSync = readFile; }
@@ -397,7 +401,7 @@ test('КР1 Н3: неизвестное окно квоты и дата сбро
 test('КР1 Н4: чужой заголовок в text не определяет авторство', async () => {
   const f = fixture({ level: 'мелочь', author: [{ part: 'Альфа', family: 'google', model: 'gemini' }, { part: 'Бета', family: 'anthropic', model: 'claude' }] });
   job(f, 'antigravity', 0, { role: 'текст', task: 'Альфа', text: 'Бета' }); job(f);
-  await accept(f); assert.equal(f.s.state, 'принят');
+  job(f, 'antigravity', 0, { task: f.s.version + ' Бета' }); await accept(f); assert.equal(f.s.state, 'принят');
 });
 test('КР1 Н5: пересоздание замороженного этапа требует id и сохраняет историю', () => {
   const f = fixture(); f.s.gate.locked = true; f.s.gate.votes = [{ count: 2 }];
@@ -445,11 +449,11 @@ test('КР1 Н10: сообщение о принятии только в при�
   const accepted = await team.work({ ...base, action: 'update', expected_revision: 1, stages: [{ ...s, state: 'принят', evidence: 'проверено', reviews }] }); assert.match(accepted, /Сообщение пользователю/);
   const updated = await team.work({ ...base, action: 'update', expected_revision: 2, status_sent: true }); assert(!updated.includes('Сообщение пользователю'));
 });
-test('КР1 Н11: общий абзац правил единственный, Grok по семьям', () => {
+test('КР1 Н11: общий абзац правил единственный, Grok выключен', () => {
   const read = f => fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
-  const common = read('rules/common.md'); assert(!common.includes('Приёмка по семье автора — rules/common.md'));
-  for (const who of ['claude', 'antigravity', 'grok', 'brief']) { const text = read('rules/' + who + '.md'); assert(!text.includes('В каждом поручении с работой укажи role')); assert(text.includes('common.md#правила-team-v14')); }
-  assert(read('rules/grok.md').includes('на месте замены голос Grok обязателен'));
+  const common = read('rules/common.md'); assert(!common.includes('Приёмка по семье автора — rules/common.md')); assert(common.includes('## Правила team-v14 для работ')); const brief = read('rules/brief.md'); assert(!brief.includes('В каждом поручении с работой укажи role')); assert(!brief.includes('Правила team-v14 для работ')); assert(!brief.includes('common.md#правила-team-v14'));
+  for (const who of ['claude', 'antigravity']) { const text = read('rules/' + who + '.md'); assert(!text.includes('В каждом поручении с работой укажи role')); assert(text.includes('common.md#правила-team-v14')); }
+  assert.equal(read('rules/grok.md').trim(), 'Grok выключен из связки 13.10.2026 словом пользователя');
 });
 test('КР1 Н12: скилл описывает последствия возврата заменённого', () => {
   const skillPath = path.join(__dirname, '../skill/vtm-hronika/SKILL.md');

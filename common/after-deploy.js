@@ -40,7 +40,7 @@ async function afterDeploy(id, opts = {}) {
         ops.update(file, { cleanup: { state: 'идёт', started: new Date(now()).toISOString() } });
         try {
           const r = (opts.cleanup || require('./cleanup').cleanup)({ root, apply: true, owner: 'после установки ' + id }, opts.cleanupDeps || {});
-          const c = { state: 'готово', removed: r.removed.length, failed: r.failed.length, kept: r.plan.keep.length, blocked: r.plan.blocked, finished: new Date(now()).toISOString() };
+          const c = { state: 'готово', removed: r.removed.length, failed: r.failed.length, kept: r.plan.keep.length, blocked: r.plan.blocked, uncheckedHiddenProcesses: r.plan.uncheckedHiddenProcesses || 0, finished: new Date(now()).toISOString() };
           try { ops.update(file, { cleanup: c }); } catch (e) { return 'уборка выполнена, но итог не записан: ' + e.message; }
           return ops.cleanupLine(c);
         } catch (e) {

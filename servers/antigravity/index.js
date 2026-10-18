@@ -189,7 +189,7 @@ function hardKillOwn(proc) {
 }
 
 // ---------- межпроцессные замки на именованных каналах ----------
-const { pipeName, probe, listenPipe, tryLock, waitLock, ownerState } = require("../../common/locks");
+const { startOwner, probe, tryLock, waitLock, ownerState } = require("../../common/locks");
 // Карточку задания меняем только под замком задания: прочитать свежую → изменить → сохранить.
 async function updateJob(id, mutator, waitMs) {
   const l = await waitLock("job", id, { jobId: id }, waitMs == null ? 8000 : waitMs);
@@ -801,7 +801,7 @@ function runAgy(args, jobId, onSpawn, cwd, stdin) {
     // запрос отмены из любого экземпляра моста — файлом-флагом
     const poll = setInterval(() => { if (!entry.stopping && fs.existsSync(cancelPath(jobId))) requestStop(jobId, "отмена"); }, CANCEL_POLL_MS);
     try {
-      proc = spawn(AGY.bin, AGY.pre.concat(args), { cwd, stdio: [stdin != null ? "pipe" : "ignore", "pipe", "pipe"], windowsHide: true, detached: !isWindows });
+      proc = spawn(AGY.bin, AGY.pre.concat(args), { cwd, env: require('../../common/fallback').jobEnv(jobId), stdio: [stdin != null ? "pipe" : "ignore", "pipe", "pipe"], windowsHide: true, detached: !isWindows });
       entry.proc = proc;
       RUNNING.set(jobId, entry);
       if (onSpawn) onSpawn(proc.pid);
@@ -1063,7 +1063,10 @@ function publicText(s) {
   for (const [a, b] of Object.entries({ ...publicNames, ...argNames, ...modeNames })) s = s.replaceAll(a, b);
   return s;
 }
+// team-v19 К2: обработчики доступны очереди основного сервера (перенос дирижёра запасного режима).
+const HANDLERS = {};
 function register(oldName, description, schema, fn) {
+  HANDLERS[oldName] = fn;
   if (!access.allowed('antigravity', publicNames[oldName])) return;
   const inputSchema = {};
   for (const [key, val] of Object.entries(schema))
@@ -1079,6 +1082,10 @@ function register(oldName, description, schema, fn) {
       owner: z.string().optional().describe('Метка сеанса владельца работы.'),
       work: z.string().optional().describe('Название работы.'),
     });
+  if (oldName === 'most_perenesti' || oldName === 'most_otmenit')
+    inputSchema.owner = z.string().optional().describe('Запасной режим: метка сеанса дирижёра.');
+  if (oldName === 'most_perenesti')
+    inputSchema.quote = z.string().optional().describe('Запасной режим: перезапись (overwrite) — только с дословным ответом пользователя.');
   const titles = {
     most_zdorovie: 'Состояние Antigravity',
     most_poruchit: 'Поручить Antigravity',
@@ -1425,6 +1432,8 @@ register(
     if (job.warnings && job.warnings.length) head.push("Предупреждения: " + job.warnings.join("; "));
     if (job.status === "applied") head.push("УЖЕ ПЕРЕНЕСЕНО: " + (job.appliedTo || "?") + " (" + (job.appliedAt || "?") + ")." + (job.applyNote ? " " + job.applyNote : ""));
     if (job.applyNote && job.status === "done") head.push(job.applyNote);
+    if (job.applyRequest) head.push("Перенос запасного режима: " + (job.applyRequest.done ? (job.applyRequest.ok ? "выполнен" : "отказ") + " — " + job.applyRequest.result
+      : "в очереди основного сервера" + (job.applyRequest.hold ? "; ждёт: " + job.applyRequest.hold : "")) + ".");
 
     let body = "";
     const hintBase = (s_pravki ? ", from_change=" + s_pravki : "") + (polno ? ", full=true" : "");
@@ -1474,11 +1483,20 @@ register(
     kuda: z.string().optional().describe("Для нового текста и замечаний: полный путь файла внутри папки проекта."),
     perezapisat: z.boolean().optional().describe("Только для нового текста (text): разрешить заменить существующий файл to."),
   },
-  async ({ nomer, kuda, perezapisat }) => {
+  async ({ nomer, kuda, perezapisat, quote }, opts = {}) => {
     if (shuttingDown) return fail("мост останавливается");
     let job = await loadNorm(nomer);
     if (!job) return fail("задания " + nomer + " нет." + legacyNote(nomer));
-    if (job.from && job.from !== 'claude') return fail('Перенос гостевого поручения запрещён: результат хранится только в хранилище поручений.');
+    // team-v19 К2: перенос дирижёра запасного режима (guard уже проверил сеанс) исполняет основной сервер из очереди.
+    if (access.guest()) {
+      if (job.status !== "done") return fail("перенос ставится в очередь только для готового задания (сейчас " + job.status + ")");
+      // Перезапись необратима: только с дословным ответом пользователя, он хранится в карточке (помощник с чистой памятью, У3).
+      if (perezapisat && !(typeof quote === "string" && quote.trim())) return fail("перезапись (overwrite) в запасном режиме — только с дословным ответом пользователя: quote=<его ответ>");
+      const m = require('../../common/user-word').mode();
+      await updateJob(nomer, (c) => { c.applyRequest = { kuda: kuda || null, perezapisat: !!perezapisat, ...(perezapisat ? { quote: quote.trim() } : {}), word: m.entry.id, by: access.client(), at: nowIso() }; });
+      return reply("Перенос задания " + nomer + " поставлен в очередь основного сервера (запасной режим, " + m.entry.id + "); итог — antigravity_result " + nomer + ".");
+    }
+    if (job.from && job.from !== 'claude' && !opts.fallback) return fail('Перенос гостевого поручения запрещён: результат хранится только в хранилище поручений.');
     if (job.textInput && (job.rezhim === 'pravka' || !kuda))
       return fail('Перенос в исходник для переданного текстом материала запрещён; сохраните результат отдельно.');
     if (job.corrupt) return fail("карточка задания повреждена: " + job.error);
@@ -1593,12 +1611,8 @@ register(
     if (!job) return fail("задания " + nomer + " нет." + legacyNote(nomer));
     if (job.corrupt) return fail("карточка задания повреждена: " + job.error);
     if (job.status === 'waiting_quota' || job.status === 'queued') {
-      await updateJob(nomer, (c) => {
-        if (['waiting_quota', 'queued'].includes(c.status)) {
-          c.status = 'cancelled';
-          c.finishedAt = nowIso();
-        }
-      });
+      // Общий переход с сервером team (grok_slot): common/job-cancel.js.
+      await updateJob(nomer, (c) => { require('../../common/job-cancel').cancelWaiting(c); });
       return reply('Ожидание отменено.');
     }
     if (job.status !== "running") {
@@ -1702,6 +1716,15 @@ async function resumeQueue() {
   scanning = true;
   try {
     await require('../../common/progress').longRunning('Antigravity', listJobs(), updateJob);
+    // team-v19 К2: перенос дирижёра запасного режима — основной сервер, под замком задания и файла; без режима ждёт с причиной.
+    for (const j of listJobs().filter((j) => j.applyRequest && !j.applyRequest.done)) {
+      const r = j.applyRequest, m = require('../../common/user-word').mode();
+      const hold = !m.active ? 'запасной режим снят — перенос ждёт Claude' : m.entry.id !== r.word ? 'дирижёр сменился — перенос ждёт нового запроса' : '';
+      if (hold) { if (r.hold !== hold) await updateJob(j.id, (c) => { if (c.applyRequest) c.applyRequest.hold = hold; }).catch(() => {}); continue; }
+      const out = await context.run({ args: { id: j.id } }, () => HANDLERS.most_perenesti({ nomer: j.id, kuda: r.kuda || undefined, perezapisat: r.perezapisat }, { fallback: true }));
+      const text = (out.content || []).map((c) => c.text).join('\n').slice(0, 2000);
+      await updateJob(j.id, (c) => { if (c.applyRequest) { Object.assign(c.applyRequest, { done: nowIso(), ok: !out.isError, result: text }); delete c.applyRequest.hold; } }).catch(() => {});
+    }
     for (const j of listJobs()) {
       if (!['waiting_quota', 'queued'].includes(j.status) || Date.parse(j.nextAttemptAt) > Date.now() || !j.retry)
         continue;
@@ -1741,7 +1764,7 @@ async function resumeQueue() {
   rotateJournal();
   if (!access.guest() && !process.env.MOST_TEST_KEEP) pruneOld();
   // канал экземпляра: по нему другие экземпляры моста узнают, жив ли этот
-  const ip = await listenPipe(pipeName("instance", INSTANCE), () => ({ instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT, version: VERSION, file: __filename, running: [...RUNNING.keys()] }));
+  const ip = await startOwner(() => ({ version: VERSION, file: __filename, running: [...RUNNING.keys()] }));
   if (ip.ok) { instanceServer = ip.srv; instancePipeOk = true; }
   else log("не удалось открыть канал экземпляра: " + ip.error);
   log("мост " + VERSION + " запущен; agy: " + (AGY ? AGY.shown : "не найден") + "; хранилище: " + STATE_DIR);

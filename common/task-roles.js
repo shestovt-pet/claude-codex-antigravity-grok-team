@@ -123,14 +123,14 @@ function defaultHeuristic(kind, detect) {
 
   if (k === 'code') {
     return Object.assign(base, {
-      orchestrator: claudeOnline ? 'claude' : 'grok',
+      orchestrator: claudeOnline ? 'claude' : 'antigravity',
       coder: 'codex',
       reviewer: ['antigravity'],
     });
   }
   if (k === 'review') {
     return Object.assign(base, {
-      orchestrator: claudeOnline ? 'claude' : 'grok',
+      orchestrator: claudeOnline ? 'claude' : 'antigravity',
       reviewer: ['codex', 'antigravity'],
     });
   }
@@ -148,7 +148,7 @@ function defaultHeuristic(kind, detect) {
   }
   // fallback
   return Object.assign(base, {
-    orchestrator: 'grok',
+    orchestrator: 'antigravity',
     coder: 'codex',
     reviewer: ['antigravity'],
   });

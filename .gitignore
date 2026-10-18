@@ -10,3 +10,8 @@ tests/.tmp-*
 works/*.json
 works/status.md
 _antigravity_result.txt
+
+# Живая проверка team-v21 — исходник, а не каталог установленного релиза.
+!tests/live/
+tests/live/*
+!tests/live/team-v21-live.js

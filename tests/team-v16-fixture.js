@@ -38,7 +38,7 @@ function job(f, who = 'codex', count = 0, opts = {}) {
 }
 function fresh(f, fields = '', count = 0) {
   const p = path.join(project, '.most', 'reviews', 'fresh-' + (++seq) + '.txt');
-  write(p, 'version: ' + f.s.version + '\nсемья: anthropic\nмодель: claude-opus-4.6\n' + fields + '\nответ ' + seq + '\n' +
+  write(p, 'version: ' + f.s.version + '\nсемья: anthropic\nмодель: claude-sonnet-4.6\n' + fields + '\nответ ' + seq + '\n' +
     (count ? 'НЕ ПРИНЯТО: ' + count + ' блокирующих' : 'ПРИНЯТО'));
   gate.registerFile(f.w, f.s, p, f.s.version); return p;
 }

@@ -81,7 +81,7 @@ test('Старый релиз: три сервера и старое храни�
   write(path.join(root, 'README.md'), 'Проверка');
   git.git(root, ['add', 'README.md']); git.git(root, ['commit', '-m', 'Проверка']);
   const commit = git.hash(root), release = path.join(root, 'live', commit), oldState = path.join(root, 'live/.deploy-state');
-  const names = ['antigravity', 'codex', 'team', 'grok'];
+  const names = ['team', 'codex', 'antigravity'];
   // Релиз содержит настоящий код кандидата; старый deploy проверял только три сервера.
   for (const dir of ['servers', 'common']) fs.cpSync(path.join(__dirname, '..', dir), path.join(release, dir), { recursive: true });
   fs.copyFileSync(path.join(__dirname, '../package.json'), path.join(release, 'package.json'));
@@ -107,15 +107,15 @@ test('Старый релиз: три сервера и старое храни�
     probe: async (file, env) => { probes.push([path.basename(path.dirname(file)), env.MOST_CLIENT]); return probe(file, env); },
     restart: { launch: async (file, { runId, log }) => {
       const script = fs.readFileSync(file, 'utf8');
-      assert(script.includes(path.join(root, 'state')) && script.includes("'grok'"));
+      assert(script.includes(path.join(root, 'state')) && !script.includes("'grok'"));
       restarted = true; write(log, 'запущен ' + runId);
     } },
   });
-  assert.equal(probes.length, 10);
+  assert.equal(probes.length, 0); // team-v19 К2: гости codex и antigravity получают и сервер своей семьи
   assert.deepEqual(read(path.join(release, 'probe-ok.json')).servers, names);
   for (const n of names) assert.equal(read(config).mcpServers[n].env.MOST_STATE_DIR, path.join(root, 'state'));
-  assert(fs.readFileSync(process.env.MOST_CODEX_CONFIG, 'utf8').includes('[mcp_servers.grok]'));
-  assert(read(process.env.MOST_AGY_MCP_CONFIG).mcpServers.grok);
+  assert(!fs.readFileSync(process.env.MOST_CODEX_CONFIG, 'utf8').includes('[mcp_servers.grok]'));
+  assert(!read(process.env.MOST_AGY_MCP_CONFIG).mcpServers.grok);
   assert(!fs.existsSync(path.join(root, 'state/codex-jobs/old/card.json')));
   assert(!fs.existsSync(migration.marker(path.join(root, 'state'))));
   assert(restarted);

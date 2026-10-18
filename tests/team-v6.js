@@ -13,14 +13,14 @@ function checklist() {
   files.forEach((f, i) => {
     const s = fs.readFileSync(f, 'utf8');
     // Правила доставляются с корнем установки (team-v11 Р1): здесь корень — папка прогона.
-    for (const text of ['Claude — дирижёр', 'Codex — критик логики и код', 'Antigravity — автор литературного текста', 'Grok — поиск, источники и термины', 'Все трое помощников участвуют в обсуждении замысла и итоговом ревью', 'Рутину делают сервер и скрипты', 'голос совещательный', 'Обязательные проверяющие — Codex и Antigravity', 'решение принимает Claude', ...['C:\\most\\AGENTS.md', 'C:\\most\\rules\\common.md', 'C:\\most\\lessons.md'].map(t => require('../common/paths').withRoot(t, process.env.MOST_REPO_ROOT)), '[блокирующее]/[улучшение]', '[разовое]/[системное]', 'последняя строка — «ПРИНЯТО» или «НЕ ПРИНЯТО: N блокирующих»', 'только с доказательством', 'не разрешение самостоятельно отправлять задания или менять настройки']) assert(s.includes(text), text);
+    for (const text of ['Claude — дирижёр', 'Codex — критик логики и код', 'Antigravity — автор литературного текста', 'Claude — веб-поиск, источники и термины', 'Оба помощника участвуют в обсуждении замысла и итоговом ревью', 'Рутину делают сервер и скрипты', 'Обязательные проверяющие — Codex и Antigravity', 'решение принимает Claude', ...['C:\\most\\AGENTS.md', 'C:\\most\\rules\\common.md', 'C:\\most\\lessons.md'].map(t => require('../common/paths').withRoot(t, process.env.MOST_REPO_ROOT)), '[блокирующее]/[улучшение]', '[разовое]/[системное]', 'последняя строка — «ПРИНЯТО» или «НЕ ПРИНЯТО: N блокирующих»', 'только с доказательством', i ? 'не разрешение самостоятельно отправлять задания или менять настройки' : 'Чат Codex может сам ставить поручения через мост']) assert(s.includes(text), text);
     for (const text of i ? ['на диск не пишет', 'команд, меняющих файлы, не запускает', 'Результат переносит сервер по решению Claude'] : ['отдельного пользователя Windows без сети', '`.git` только для чтения', 'Удаления запрещены', 'перечисляй в отчёте']) assert(s.includes(text), text);
   });
 }
 function release() {
   const dir = path.join(RUN, 'live', 'a'.repeat(40));
-  for (const n of ['team', 'codex', 'antigravity', 'grok']) write(path.join(dir, 'servers', n, 'index.js'), '');
-  json(path.join(dir, 'probe-ok.json'), { root: RUN, commit: 'a'.repeat(40), at: new Date().toISOString(), servers: ['antigravity', 'codex', 'team', 'grok'] });
+  for (const n of ['team', 'codex', 'antigravity']) write(path.join(dir, 'servers', n, 'index.js'), '');
+  json(path.join(dir, 'probe-ok.json'), { root: RUN, commit: 'a'.repeat(40), at: new Date().toISOString(), servers: ['team', 'codex', 'antigravity'] });
   return dir;
 }
 test('Р1: точные прежние структуры, обязательный смысл, внешние байты и повтор', async () => {
@@ -155,25 +155,25 @@ test('Р5: execute → restart → итог сценария; отказ гот�
         assert.equal(read(file).status, 'перезапуск идёт');
         write(info.log, 'итог ' + info.runId + ' ' + (success ? 'True' : 'False') + '\n');
         json(info.result, { runId: info.runId, release: 'candidate-release', startedAt: '2026-09-27T10:00:00Z', finishedAt: '2026-09-27T10:01:00Z', success, reason: 'Пробный итог' });
-        for (const name of ['team', 'codex', 'antigravity', 'grok']) json(path.join(root, 'state/ready', name + '.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'candidate-release' });
+        for (const name of ['team', 'codex', 'antigravity']) json(path.join(root, 'state/ready', name + '.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'candidate-release' });
       } }),
     });
-    if (success) { await execute(); assert.equal(read(file).status, 'завершено'); assert.equal(read(file).restartEvidence.ready.length, 4); }
+    if (success) { await execute(); assert.equal(read(file).status, 'завершено'); assert.equal(read(file).restartEvidence.ready.length, 3); }
     else { await assert.rejects(execute(), /готовность нового Claude не подтверждена/); assert.equal(read(file).status, 'перезапуск не подтверждён'); assert.equal(read(file).restartEvidence, undefined); }
   }
 });
-test('Р5: завершено только после журнала и свежих живых четырёх серверов своего релиза; отказ/таймаут', async () => {
+test('Р5: завершено только после журнала и свежих живых трёх серверов своего релиза; отказ/таймаут', async () => {
   const state = path.join(RUN, 'restart-state'), info = { runId: 'run', release: 'release', state, result: path.join(state, 'result.json'), log: path.join(state, 'restart.log') };
   let now = 0; await assert.rejects(restart.waitForCompletion(info, { now: () => now, sleep: async ms => { now += ms; }, completionMs: 500 }), /Истекло время/);
   json(info.result, { runId: 'run', release: 'release', success: false, reason: 'отказ' }); await assert.rejects(restart.waitForCompletion(info), /отказ/);
   const startedAt = '2026-09-27T10:00:00Z'; json(info.result, { runId: 'run', release: 'release', success: true, startedAt, finishedAt: '2026-09-27T10:01:00Z' });
-  for (const name of ['team', 'codex', 'antigravity', 'grok']) json(path.join(state, 'ready', name + '.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'release' });
+  for (const name of ['team', 'codex', 'antigravity']) json(path.join(state, 'ready', name + '.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'release' });
   await assert.rejects(restart.waitForCompletion(info), /ENOENT/);
   write(info.log, 'итог run True\n');
-  assert.equal((await restart.waitForCompletion(info)).ready.length, 4);
+  assert.equal((await restart.waitForCompletion(info)).ready.length, 3);
   await assert.rejects(restart.waitForCompletion(info, { alive: () => false }), /Готовность/);
-  json(path.join(state, 'ready/grok.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'old' }); await assert.rejects(restart.waitForCompletion(info), /Готовность/);
-  json(path.join(state, 'ready/grok.json'), { pid: process.pid, startedAt, release: 'release' }); await assert.rejects(restart.waitForCompletion(info), /Готовность/);
+  json(path.join(state, 'ready/codex.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'old' }); await assert.rejects(restart.waitForCompletion(info), /Готовность/);
+  json(path.join(state, 'ready/codex.json'), { pid: process.pid, startedAt, release: 'release' }); await assert.rejects(restart.waitForCompletion(info), /Готовность/);
   const file = path.join(RUN, 'restart-operation.json'); json(file, { root: RUN }); let complete;
   const pending = ops.execute({ result: file, release: 'release', restartClaude: true }, async () => 'обновлено', { restart: async () => { assert.equal(read(file).status, 'перезапуск идёт'); return await new Promise(r => { complete = r; }); } });
   while (!complete) await new Promise(r => setImmediate(r)); assert.notEqual(read(file).status, 'завершено'); complete({ success: true, message: 'готово', ready: [] }); await pending; assert.equal(read(file).status, 'завершено');

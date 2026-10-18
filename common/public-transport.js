@@ -24,10 +24,13 @@ function publicTransport(transport) {
     const content = message?.result?.content;
     if (Array.isArray(content)) {
       const warning = require('./work-owner').reminder(undefined, undefined, current);
+      // team-v19 К6: баннер запасного режима — первой строкой ответа основного сервера и гостя.
+      let banner = '';
+      try { banner = require('./fallback').banner(current); } catch {}
       const first = content.find(item => item.type === 'text');
       if (first) {
         const body = first.text.replace(/^(?:⚠ Статус пользователю[^\n]*\n)+/, '');
-        const text = (warning ? warning + '\n' : '') + body;
+        const text = (banner ? banner + '\n' : '') + (warning ? warning + '\n' : '') + body;
         message = { ...message, result: { ...message.result,
           content: content.map(item => item === first ? { ...item, text } : item) } };
       }

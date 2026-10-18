@@ -10,6 +10,8 @@ Object.assign(process.env, { MOST_REPO_ROOT: root, MOST_STATE_DIR: state, MOST_T
 const write = (f, text) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text); };
 const json = (f, x) => write(f, JSON.stringify(x));
 const read = f => JSON.parse(fs.readFileSync(f, 'utf8'));
+// team-v19 (Codex 7a3bd85b п. 1): поручения гостя — только при прочитанной записи основного сервера (MOST_PROBE_ONLY её не пишет).
+json(path.join(state, 'ready', 'team.json'), { release: ROOT, pid: 2147483000, startedAt: new Date(Date.now() - 3600000).toISOString() });
 const support = require('../common/brief-support');
 const gate = require('../common/stage-gate');
 const tests = [], test = (name, fn) => tests.push({ name, fn });
@@ -79,18 +81,18 @@ for (const who of ['codex', 'antigravity', 'grok']) test('12е: оба after_job
     const bad = await call(b, who + '_send', { ...args, replaces: { ...args.replaces, after_job: ['negative-a'] } }); assert(bad.error); assert.match(bad.text, /последние/);
   } finally { await b.close(); }
 });
-test('12н: after_file доставлен, регистрация не меняется при повторном запуске', async () => {
+test('12н: замена необязательного помощника отклонена, регистрация не меняется', async () => {
   const w = work('fresh-replace'), s = w.stages[0]; s.author = { family: 'google', model: 'gemini' };
   const p = path.join(project, '.most/reviews/rejected.txt'); write(p, s.version + '\nСВЕЖИЙ-ОТКАЗ\nНЕ ПРИНЯТО: 1 блокирующих'); gate.registerFile(w, s, p, s.version); json(path.join(root, 'works', w.name + '.json'), w);
   const before = JSON.stringify(s.gate.files);
   for (let i = 0; i < 2; i++) {
     const b = await server('grok', true);
     try {
-      const r = await call(b, 'grok_send', { task: s.version, work: w.name, stage: s.id, owner: 'test', role: 'проверка', replaces: { who: 'fresh', reason: 'нет инструмента Agent', after_file: [p] } }); assert(!r.error, r.text);
+      const r = await call(b, 'grok_send', { task: s.version, work: w.name, stage: s.id, owner: 'test', role: 'проверка', replaces: { who: 'fresh', reason: 'нет инструмента Agent', after_file: [p] } }); assert(r.error, r.text); assert.match(r.text, /Замена необязательного проверяющего/);
     } finally { await b.close(); }
     assert.equal(JSON.stringify(read(path.join(root, 'works', w.name + '.json')).stages[0].gate.files), before);
   }
-  const j = require('../common/team-store').list('grok', false).jobs.find(j => j.work === w.name); assert(j.task.includes('СВЕЖИЙ-ОТКАЗ'));
+  assert(!require('../common/team-store').list('grok', false).jobs.some(j => j.work === w.name));
 });
 test('13: origin, realpath, 100/200 КБ, битый JSON, пустой список и отключение', () => {
   const file = path.join(project, '.most/opora.json');

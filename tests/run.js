@@ -30,6 +30,9 @@ function finishLog() {
 (async () => {
   const files = ['consilium-workflow.js', 'attribution.js', 'antigravity.js', 'part1.js', 'part2.js', 'trio-v2.js', 'trio-review.js', 'trio-v4.js', 'trio-v4-fix1.js', 'trio-v4-fix2.js', 'trio-v5.js', 'team-v6.js', 'team-v7.js', 'team-v8.js', 'team-v9.js', 'team-v10.js', 'team-v11.js', 'team-v12.js', 'team-v13.js', 'team-v14.js', 'team-v14-bridges.js'];
   files.push('team-v16-sources.js', 'team-v16-gate.js', 'team-v16-workflow.js', 'team-v16-status.js', 'team-v16-roles.js');
+  files.push('team-v17-rules.js', 'team-v23.js', 'team-v24.js', 'team-v25.js', 'team-v27.js', 'team-v28.js');
+  files.push('team-v18-word.js', 'team-v18-change.js');
+  files.push('team-v19-claude-word.js', 'team-v21-paths.js', 'team-v22-full-access.js');
   const selected = process.argv.slice(2);
   if (selected.some(f => !files.includes(f))) throw Error('Неизвестный набор тестов.');
   for (const file of selected.length ? selected : files) {

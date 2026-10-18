@@ -166,6 +166,7 @@ test('Р5: контекст операции — чужой корень, нет
 });
 test('Р5: отключение уборки доходит до карточки операции; испорченная карточка — без уборки', async () => {
   const root = path.join(RUN, 'p5off'); fs.mkdirSync(path.join(root, 'state'), { recursive: true });
+  write(path.join(root, 'live/rel/common/path-compat.js'), '// team-v21 fixture');
   let t = 0; const out = await ops.start({ root, release: path.join(root, 'live', 'rel'), configs: [], restartClaude: false, cleanup: false },
     { launch: async () => 4242, alive: () => true, now: () => (t += 400000), sleep: async () => {} });
   assert.match(out, /не подтверждён/);
@@ -224,7 +225,7 @@ test('Уборка: живые поручения всех помощников 
       const card = who === 'codex' ? path.join(state, 'codex-jobs', id + '.json') : who === 'antigravity' ? path.join(state, 'jobs', id, 'card.json') : path.join(state, 'grok-jobs', id + '.json');
       json(card, { id, status, work: 'busy' });
       const wl = require('../common/work-owner').hasLiveJobs('busy');
-      assert.equal(wl, true, who + ' ' + status);
+      assert.equal(wl, who !== 'grok', who + ' ' + status);
       fs.rmSync(card);
     }
   }
@@ -239,6 +240,7 @@ test('Уборка: поручение по папке клона без work, �
   const f = cleanFixture('c39');
   const byFolder = f.clone('by-folder'), branches = f.clone('branches'), stash = f.clone('stash'), ok = f.clone('ok');
   const state = process.env.MOST_STATE_DIR;
+  fs.mkdirSync(path.join(byFolder, 'sub'), { recursive: true }); fs.mkdirSync(path.join(ok, '..', 'ok-sibling'), { recursive: true });
   json(path.join(state, 'codex-jobs', 'fold.json'), { id: 'fold', status: 'running', folder: path.join(byFolder, 'sub') });
   json(path.join(state, 'jobs', 'agyfold', 'card.json'), { id: 'agyfold', status: 'queued', papka: path.join(ok, '..', 'ok-sibling') });
   git(branches, ['checkout', '-q', '-b', 'эксперимент']); write(path.join(branches, 'e.txt'), 'e'); commit(branches, 'эксперимент'); git(branches, ['checkout', '-q', 'main']);
@@ -263,7 +265,7 @@ test('Уборка: граница суток и время из будущег�
 test('Уборка: сервер не удаляет релиз, из которого работает, и настройки из deployed.json', () => {
   const f = cleanFixture('c32');
   const self = path.join(f.live, 'a'.repeat(40)), inCfg = path.join(f.live, 'b'.repeat(40)), inPrev = path.join(f.live, 'd'.repeat(40)), free = path.join(f.live, 'e'.repeat(40));
-  for (const p of [self, inCfg, inPrev, free]) fs.mkdirSync(path.join(p, 'servers'), { recursive: true });
+  for (const p of [self, inCfg, inPrev, free]) write(path.join(p, 'servers/x.js'), '');
   const cfg = path.join(path.dirname(f.root), 'custom.json');
   write(cfg, JSON.stringify({ a: path.join(inCfg, 'servers', 'x.js') })); write(cfg + '.prev', JSON.stringify({ a: path.join(inPrev, 'servers', 'x.js') }));
   json(path.join(f.live, 'deployed.json'), { commit: 'c'.repeat(40), configs: [cfg] });
@@ -286,9 +288,9 @@ test('Р1/Р4: правила живой проверки, опасных слу
   const text = f => fs.readFileSync(path.join(ROOT, f), 'utf8').replace(/\s+/g, ' ');
   assert.match(text('rules/claude.md'), /## Меньше кругов ревью \(team-v10\)/);
   assert.match(text('rules/claude.md'), /раздел «## Опасные случаи»/); assert.match(text('rules/claude.md'), /раздел «## Живая проверка»/);
-  assert.match(text('rules/grok.md'), /## Живая проверка до ревью \(team-v10\)/);
-  assert.match(text('rules/grok.md'), /Журнал пишет только `tests\/run\.js`/); assert.match(text('rules/grok.md'), /не переключать ветки и коммиты/);
-  assert.match(text('rules/common.md'), /ничего не переключают/); assert.match(text('rules/roles.md'), /живая проверка новой логики/);
+  assert.match(text('rules/grok.md'), /Grok выключен из связки/);
+  assert.match(text('rules/grok.md'), /Grok выключен из связки/);
+  assert.match(text('rules/common.md'), /ничего не переключают/); assert.match(text('rules/roles.md'), /полный прогон тестов Windows делает Codex/);
   assert.match(text('tests/run.js'), /MOST_AFTER_DEPLOY = 'off'/); assert.match(text('tests/run.js'), /'team-v10\.js'/);
 });
 (async () => {

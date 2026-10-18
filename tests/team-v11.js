@@ -83,9 +83,9 @@ test('Р1 случай 25: Codex и Antigravity — блок или записи
   assert(cc.toml(first, 'C:\\A\\live\\' + H('b'), 'c:/a', 'C:\\A\\state', 'node').includes(H('b')), 'обновление своей установки');
   assert.throws(() => cc.toml(first, 'C:\\B\\live\\' + H('a'), 'C:\\B', 'C:\\B\\state', 'node', 'config.toml'), /Чужие записи подключений в config\.toml: «team»/);
   const agy = { mcpServers: { grok: { command: 'python', args: ['grok_server.py'] }, mine: { command: 'keep' } } };
-  assert.throws(() => cc.jsonConfig(agy, 'agy', 'C:\\A\\live\\' + H('a'), 'C:\\A', 's', 'node', 'mcp_config.json'), /«grok» → python grok_server\.py/);
+  assert.deepEqual(cc.jsonConfig(agy, 'agy', 'C:\\A\\live\\' + H('a'), 'C:\\A', 's', 'node', 'mcp_config.json').mcpServers.grok, agy.mcpServers.grok);
   const ok = cc.jsonConfig({ mcpServers: { mine: { command: 'keep' } } }, 'agy', 'C:\\A\\live\\' + H('a'), 'C:\\A', 's', 'node');
-  assert.deepEqual(ok.mcpServers.mine, { command: 'keep' }); assert(ok.mcpServers.team && ok.mcpServers.codex && ok.mcpServers.grok);
+  assert.deepEqual(ok.mcpServers.mine, { command: 'keep' }); assert(ok.mcpServers.team && ok.mcpServers.codex && ok.mcpServers.antigravity);
 });
 
 // ---- Р1: первая доставка правил (случай 30)
@@ -294,9 +294,7 @@ test('Р3 случаи 55, 60–63: частные значения не в ре
 });
 test('Р5: README для новичка — установка git и ZIP, Grok по шагам, чужие записи, безопасность', () => {
   const t = read(path.join(ROOT, 'README.md'));
-  for (const re of [/Download ZIP/, /setup\.cmd --dry-run/, /brief_path/, /reply_path/, /secret_hex/, /КОНЕЦ ОТВЕТА/, /state\\grok-webhook\.json/, /api2\.cursor\.sh\/automations\/webhook/, /из панели этой рутины/,
-    /state\\grok`, `works` и `.work`/, /Grok: мост настроен/, /Смена ключа/, /считается чужой/, /телеметрии нет/, /English summary/,
-    /github\.com\/shestovt-pet\/claude-codex-antigravity-grok-team/]) assert.match(t, re);
+  for (const re of [/Download ZIP/, /setup\.cmd --dry-run/, /Grok выключен/, /считается чужой/, /телеметрии нет/, /English summary/]) assert.match(t, re);
   assert.match(read(path.join(ROOT, 'docs/architecture.md')), /## Что изменилось в версии 0\.5\.0/);
   assert.match(read(path.join(ROOT, 'package.json')), /"version": "0\.5\.\d+"/);
 });

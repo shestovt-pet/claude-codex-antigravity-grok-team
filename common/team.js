@@ -8,9 +8,9 @@ const stores = require('./team-store'),
 const { format, duration } = require('./format');
 const participants = ['claude', 'codex', 'antigravity'];
 const sha = value => require('crypto').createHash('sha256').update(value).digest('hex');
-const requestText = c => c.request ? 'Запрос пользователя ' + c.requestMark + ':\n' + c.request + '\nЗамысел: ' + c.designFile + ', sha256 ' + c.designHash + '\n' : 'запрос не сохранён (изменение начато до ворот запроса)\n';
+const requestText = c => c.request ? 'Запрос пользователя ' + c.requestMark + ':\n' + c.request + (c.fast ? '\nМалая правка, карточка sha256 ' + c.cardHash + ':\n' + c.note + '\nМалая ли правка — обязательный вопрос ревью.\n' : '\nЗамысел: ' + c.designFile + ', sha256 ' + c.designHash + '\n') : 'запрос не сохранён (изменение начато до ворот запроса)\n';
 function refreshDesign(c) {
-  if (!c.request) return;
+  if (!c.request || c.fast) return;
   const current = sha(fs.readFileSync(c.designFile));
   if (current !== c.designHash) {
     c.designHash = current;
@@ -128,13 +128,13 @@ class Team {
       return { error: 'карточка повреждена: ' + path.basename(file) };
     }
   }
-  async refreshWork(file, { readOnly = false } = {}) {
+  async refreshWork(file, { readOnly = false, snapshot } = {}) {
     const w = this.readWork(file);
     if (w.error) return w;
     const before = JSON.stringify(w);
     for (const s of w.stages.filter(s => s.level && ['принят', 'выдан без принятия'].includes(s.state))) {
       const old = structuredClone(s);
-      try { s.gate.message = await require('./stage-gate').evaluate(w, s, old); delete s.gate.warning; }
+      try { s.gate.message = await require('./stage-gate').evaluate(w, s, old, undefined, snapshot); delete s.gate.warning; }
       catch (e) { stageFailure(s, old, old, e); }
     }
     if (w.closed && w.stages.some(s => !['принят', 'выдан без принятия'].includes(s.state))) w.closed = false;
@@ -148,7 +148,8 @@ class Team {
     require('./access').guard('team', 'team_work', a);
     if (a.action === 'create' && !a.owner?.trim()) throw Error('Для новой работы нужна метка владельца owner.');
     if (a.action === 'list') return deployer.locked(this.root, async () => {
-      const works = await Promise.all(this.works().map(w => w.error ? w : this.refreshWork(this.workFile(w.name))));
+      const snapshot = require('./job-snapshot').create();
+      const works = await Promise.all(this.works().map(w => w.error ? w : this.refreshWork(this.workFile(w.name), { snapshot })));
       for (const w of works.filter(w => !w.error && w.previous_owners?.includes(a.owner))) {
         require('./work-owner').check(w, a.owner);
       }
@@ -159,7 +160,8 @@ class Team {
     });
     const file = this.workFile(a.name);
     if (a.action === 'get') return deployer.locked(this.root, async () => {
-      const current = await this.refreshWork(file);
+      const snapshot = require('./job-snapshot').create();
+      const current = await this.refreshWork(file, { snapshot });
       if (current.error) return workText(current);
       return workText(require('./work-owner').touch(a.name, a.owner, this.root));
     });
@@ -170,12 +172,17 @@ class Team {
         if (!old) throw Error('Работа не найдена.');
         if (!a.owner?.trim()) throw Error('Нужна метка нового владельца.');
         if (a.expected_revision !== old.revision) throw Error('Работу уже изменил другой чат.');
-        for (const job of new (require('./grok').Grok)().list()) {
-          await new (require('./grok').Grok)().refresh(job.id);
-        }
+
         await require('./work-owner').reconcileJobs(a.name);
         const heartbeat = Date.parse(old.heartbeat_at || old.updated_at);
-        if (!Number.isFinite(heartbeat) || Date.now() - heartbeat <= 3600000 ||
+        const mode = require('./user-word').mode(), conductor = require('./fallback').session(a);
+        if (conductor?.active) {
+          // team-v19 К3: дирижёр запасного режима забирает работу без 60 минут тишины и при живых поручениях.
+        } else if (!require('./access').guest() && mode.returned && old.owner && old.owner === mode.owner) {
+          // После возврата Claude забирает работу, когда дирижёр остановился (handover) или 15 минут не вызывал ничего по ней.
+          if (!mode.handover && Number.isFinite(heartbeat) && Date.now() - heartbeat < 900000)
+            throw Error('Дирижёр ещё работает (последний вызов ' + new Date(heartbeat).toTimeString().slice(0, 5) + '): claim — после его team_word handover или 15 минут тишины.');
+        } else if (!Number.isFinite(heartbeat) || Date.now() - heartbeat <= 3600000 ||
             require('./work-owner').hasLiveJobs(a.name)) {
           throw Error('Работа жива: передача владения запрещена.');
         }
@@ -202,6 +209,34 @@ class Team {
       if (a.status_sent === true) w.status_sent_at = w.heartbeat_at;
       for (const k of ['title', 'folder', 'goal', 'done_criteria', 'stages', 'next_step', 'reminders'])
         if (a[k] !== undefined) w[k] = structuredClone(a[k]);
+      // team-v19 К4 (г), К4а: поле continuation ставит только сервер; дирижёр не добавляет anthropic в author.
+      const fallback = require('./fallback'), conductor = require('./access').guest() ? fallback.session(a) : null;
+      if (a.stages !== undefined) for (const s of w.stages) delete s.continuation;
+      // Порядок ключей не важен: схема zod переставляет их в ответе через MCP (помощник с чистой памятью, Б2).
+      const same = require('./client-configs').equal;
+      if (conductor?.active && a.stages) for (const s of a.stages) {
+        const prev = s.id ? old?.stages.find(p => p.id === s.id) : old?.stages.find(p => p.title === s.title);
+        if (fallback.hasAnthropic(s.author ?? prev?.author) && (!prev || !same(prev.author ?? null, s.author ?? prev.author ?? null)))
+          throw Error('Запасной режим: дирижёр не добавляет anthropic в author; этап, начатый Claude, — continue_stage.');
+        // Этап Claude (anthropic в author, не продолжение) дирижёр не дописывает и принимает только с material, равным снимку
+        // (Grok cfb0705b Б1, помощник Б1); иначе — continue_stage.
+        if (!prev || !fallback.hasAnthropic(prev.author) || prev.continuation) continue;
+        for (const k of ['material', 'version', 'source_jobs', 'partial_sources', 'accept_criteria', 'artifact_manifest'])
+          if (s[k] !== undefined && !same(s[k], prev[k] ?? null))
+            throw Error('Запасной режим: этап Claude «' + prev.title + '» дирижёр не дописывает — ' + k + ' не меняется; продолжение — continue_stage.');
+        if ((s.state === 'принят' || s.criterion_met) && prev.state !== 'принят') {
+          const snap = fallback.readSnapshot(conductor.word.id), from = snap?.works?.find(x => x.name === old.name)?.stages?.find(x => x.id === prev.id);
+          const root = old.folder || require('./paths').repoRoot, hash = f => { try { return sha(fs.readFileSync(path.resolve(root, f))); } catch { return null; } };
+          const equalToSnapshot = from && same((prev.material || []).slice().sort(), from.material.map(m => m.path).sort()) && from.material.every(m => m.sha256 && hash(m.path) === m.sha256);
+          if (!equalToSnapshot) throw Error('Запасной режим: этап Claude «' + prev.title + '» принимается только с material, равным снимку ' + conductor.word.id + '; иначе — continue_stage.');
+        }
+      }
+      if (a.continue_stage !== undefined) {
+        if (!old) throw Error('continue_stage — только для существующей работы.');
+        const plan = fallback.continuation(w, old, a);
+        w.stages = plan.stages;
+        a.plan_change = a.plan_change ? a.plan_change + '; ' + plan.plan_change : plan.plan_change;
+      }
       if (
         !w.goal?.trim() ||
         !w.done_criteria?.trim() ||
@@ -221,7 +256,9 @@ class Team {
       for (const s of w.stages) {
         const previous = old?.stages.find(p => p.id === s.id), before = structuredClone(s);
         let msg;
-        try { msg = await gate.evaluate(w, s, previous); delete s.gate.warning; }
+        // team-v19 К4: замок этапа знает, что вызов — от дирижёра запасного режима.
+        const ctx = require('./request-context').context;
+        try { msg = await ctx.run({ ...(ctx.getStore() || {}), fallbackConductor: conductor?.active ? conductor : null }, () => gate.evaluate(w, s, previous)); delete s.gate.warning; }
         catch (e) { msg = stageFailure(s, before, previous, e); stageErrors.push(msg); }
         if (msg) {
           if (!s.gate.warning) s.gate.message = msg;
@@ -302,7 +339,7 @@ class Team {
       (part === 'all' ? ['common', 'claude', 'antigravity', 'grok', 'roles', 'fallback'] : [part])
         .map((p) => {
           const file = 'rules/' + p + '.md';
-          if (!git(this.root, ['ls-tree', '--name-only', commit, '--', file]).trim()) return p === 'brief' ? 'Памятка не найдена. Части: brief — памятка; common — общие правила; claude — дирижёр; antigravity — работа с текстом; roles — распределение ролей; fallback — режим без Claude Desktop; all — полные правила.' : 'в main нет ' + file;
+          if (!git(this.root, ['ls-tree', '--name-only', commit, '--', file]).trim()) return p === 'brief' ? 'Памятка не найдена. Части: brief — памятка; common — общие правила; claude — дирижёр; antigravity — работа с текстом; roles — распределение ролей; fallback — запасной режим, когда Claude отвалился; all — полные правила.' : 'в main нет ' + file;
           return '\nПравила ' + p + ':\n' + require('./paths').withRoot(git(this.root, ['show', commit + ':' + file]), this.root);
         })
         .join('\n')
@@ -355,6 +392,7 @@ class Team {
       throw Error('Вердикт относится к другой паре коммитов; сначала зафиксируйте кандидата.');
   }
   async change(a) {
+    if (a.who === 'grok' || a.action === 'grok_slot') throw Error(require('./members').grokDisabled);
     this.notices = [];
     let result;
     try { result = await this.changeInner(a); }
@@ -374,10 +412,12 @@ class Team {
     if (a.action === 'deploy') {
       const pending = require('./deploy-ops').list(this.root).find(op => !require('./deploy-ops').terminal.includes(op.status));
       if (pending) throw Error('Идёт установка ' + pending.id);
-      const out = await deployer.locked(this.root, async () => {
+      let deployedCommit = null;
+      const deployed = await deployer.locked(this.root, async () => {
         // Разрешение владельца раньше обслуживания замка Git и любых действий выпуска.
         const readOnlyGit = (root, args) => git(root, args, { recoverIndex: false });
         const commit = hash(this.root, a.commit || 'main', readOnlyGit);
+        deployedCommit = commit;
         const dir = path.join(this.state, 'changes');
         const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter(n => n.endsWith('.json')) : [];
         const linked = [];
@@ -394,6 +434,10 @@ class Team {
         git(this.root, ['merge-base', '--is-ancestor', commit, 'main']);
         return deployer.deploy({ root: this.root, commit, external: true, restartClaude: a.restart_claude, cleanup: a.cleanup !== false }, { repoLocked: true });
       });
+      // team-v19 К12: гости старых релизов в открытых Codex и Antigravity — одной строкой отчёта.
+      let stale = '';
+      try { stale = require('./client-configs').staleGuests({ root: this.root, release: deployedCommit }, this.staleDeps || {}); } catch {}
+      const out = deployed + (stale ? '\n' + stale : '');
       // team-v10 Р5: без перезапуска уборку выполняет этот же вызов, уже отпустив замок установки;
       // с перезапуском — новый сервер после готовности.
       if (!a.restart_claude && /: завершено\./.test(out)) return out + '\n' + await this.afterDeploy();
@@ -404,7 +448,8 @@ class Team {
     if (a.action === 'cleanup') {
       if (!a.owner?.trim()) throw Error('Для уборки нужна метка владельца owner.');
       const c = require('./cleanup');
-      return deployer.locked(this.root, async () => c.cleanupText(c.cleanup({ root: this.root, apply: a.apply === true, owner: a.owner }, this.cleanupDeps || {})));
+      const run = () => c.cleanupText(c.cleanup({ root: this.root, apply: a.apply === true, owner: a.owner }, this.cleanupDeps || {}));
+      return a.apply === true ? deployer.locked(this.root, run) : run();
     }
     name(a.name);
     if (a.action === 'diff') {
@@ -456,10 +501,22 @@ class Team {
         if (a.work) require('./work-owner').touch(a.work, a.owner, this.root);
         const request = a.request?.trim();
         if (!request || request.length < 20) throw Error('Нужен запрос пользователя: не менее 20 символов.');
-        if (!path.isAbsolute(a.design_file || '') || !fs.statSync(a.design_file).isFile()) throw Error('Нужен абсолютный путь существующего файла замысла.');
-        const design = { request, requestMark: '#' + sha(request).slice(0, 8), designFile: a.design_file, designHash: sha(fs.readFileSync(a.design_file)), designVotes: [] };
+        if (!a.fast && (!path.isAbsolute(a.design_file || '') || !fs.statSync(a.design_file).isFile())) throw Error('Нужен абсолютный путь существующего файла замысла.');
+        const design = { request, requestMark: '#' + sha(request).slice(0, 8), ...(a.fast ? { fast: true, note: require('./precheck').fastNote(a.note), cardHash: sha(a.note.trim()) } : { designFile: a.design_file, designHash: sha(fs.readFileSync(a.design_file)), designVotes: [] }) };
         const folder = inside(this.root, '.work', a.name),
           file = this.changeFile(a.name);
+        if (fs.existsSync(file) && a.fast) {
+          const prior = read(file);
+          if (!prior.fast || ['слито', 'закрыто без слияния'].includes(prior.status)) throw Error('Нельзя менять режим или закрытое изменение.');
+          if (prior.work) require('./work-owner').touch(prior.work, a.owner, this.root);
+          else if (prior.owner && prior.owner !== a.owner) throw Error('Изменение принадлежит другому владельцу.');
+          if (prior.note !== design.note || prior.request !== request) {
+            Object.assign(prior, design, { verdicts: [], status: 'карточка изменена' });
+            delete prior.candidateCardHash;
+            save(file, prior);
+          }
+          return 'Карточка малой правки сохранена; при изменении прежние принятия аннулированы.\n' + requestText(prior);
+        }
         if (fs.existsSync(folder) || fs.existsSync(file)) throw Error('Изменение с таким именем уже существует.');
         const base = hash(this.root);
         fs.mkdirSync(path.dirname(folder), { recursive: true });
@@ -472,8 +529,21 @@ class Team {
       const p = this.pair(a.name, ['commit', 'verdict', 'merge'].includes(a.action)),
         { c, folder } = p;
       if (c.status === 'закрыто без слияния') throw Error('Изменение закрыто без слияния.');
+      if (c.fast) {
+        require('./precheck').fastNote(c.note);
+        const currentCard = sha(c.note.trim());
+        if (c.cardHash !== currentCard) { c.cardHash = currentCard; c.verdicts = []; delete c.candidateCardHash; save(this.changeFile(a.name), c); }
+        if (a.action === 'design') throw Error('У малой правки нет ворот замысла; карточка меняется повторным start fast=true.');
+        if (['verdict', 'merge'].includes(a.action) && c.candidateCardHash !== c.cardHash) {
+          c.verdicts = []; save(this.changeFile(a.name), c);
+          throw Error('Карточка изменена: нужны новый commit и новые вердикты.');
+        }
+      }
       if (a.title !== undefined && ['design', 'verdict', 'commit'].includes(a.action)) c.title = a.title;
-      if (['design', 'commit', 'merge'].includes(a.action) && c.request) { refreshDesign(c); save(this.changeFile(a.name), c); }
+      if ((['design', 'commit', 'merge'].includes(a.action) || (a.action === 'grok_slot' && a.phase === 'design')) && c.request) { refreshDesign(c); save(this.changeFile(a.name), c); }
+      if (a.action === 'grok_slot') return this.grokSlot(a, p);
+      // team-v18 К4: голос Grok на месте выпавшего — только по поручению grok_slot.
+      if (['design', 'verdict'].includes(a.action) && a.who === 'grok' && a.replaces) return this.grokSlotVote(a, p);
       if (['design', 'verdict'].includes(a.action) && a.who === 'grok') {
         if (a.action === 'verdict') {
           this.checkPair(a, p);
@@ -491,7 +561,7 @@ class Team {
               (c.designVotes || []).filter(v => v.who === a.replaces && v.decision === 'НЕ ПРИНЯТО').length < 2)
             throw Error('Замена голоса требует двух отрицательных ревью этого помощника и пояснения по фактам.');
         } else {
-          if (!['codex', 'antigravity', 'grok'].includes(a.who)) throw Error('Неверный участник.');
+          if (!require('./members').helpers.includes(a.who)) throw Error('Неверный участник.');
           if ((c.designVotes || []).some(v => v.who === a.who && v.job_id === a.job_id)) throw Error('Это ревью замысла уже записано.');
           const j = stores.review(a.who, a.job_id, null, null, a.decision, c.requestMark, c.designHash);
           systemic(c, a.who, a.job_id, j.reviewText);
@@ -502,12 +572,12 @@ class Team {
         return 'Голос по замыслу ' + c.designHash + ' записан: ' + a.decision;
       }
       if (a.action === 'commit') {
-        if (c.request && ['codex', 'antigravity'].some(who => {
-          const v = (c.designVotes || []).filter(v => (v.replaces || v.who) === who).at(-1);
-          return v?.decision !== 'ПРИНЯТО' || v.designHash !== c.designHash;
-        })) throw Error('Сначала ворота замысла: нужно ПРИНЯТО от Codex и Antigravity по замыслу ' + c.designHash +
+        // team-v18 К3: места Codex и Antigravity — одной функцией с verdict, merge и precheck.
+        const seats = require('./team-seats');
+        if (!c.fast && c.request && seats.SEATS.some(who => !seats.seat(c, who, 'design').closed)) throw Error('Сначала ворота замысла: нужно ПРИНЯТО от Codex и Antigravity по замыслу ' + c.designHash +
           '\n' + require('./precheck').designVoteWarnings(c).map((w) => '- ' + w).join('\n'));
         if (!a.message?.trim()) throw Error('Нужно сообщение коммита.');
+        const fastTree = c.fast ? require('./precheck').checkFast(folder, c.base, undefined, true).tree : null;
         const self = this.precheck(p);
         // Отпечаток прогона Grok (team-v9 Р1): кандидат должен совпасть с проверенным содержимым.
         if (a.fingerprint) {
@@ -515,9 +585,11 @@ class Team {
           if (now !== a.fingerprint.trim()) throw Error('Содержимое изменилось после прогона тестов: отпечаток ' + now + ', прогон был на ' + a.fingerprint.trim() + '. Повторите прогон.');
         }
         git(folder, ['add', '-A']);
-        git(folder, ['-c', 'commit.gpgsign=false', 'commit', '-m', a.message]);
+        if (fastTree && git(folder, ['write-tree']).trim() !== fastTree) throw Error('Содержимое изменилось во время проверки малой правки; повторите commit.');
+        git(folder, ['-c', 'commit.gpgsign=false', 'commit', ...(c.fast && c.candidateCardHash !== c.cardHash ? ['--allow-empty'] : []), '-m', a.message]);
         c.candidate = git(folder, ['rev-parse', 'HEAD']).trim();
-        c.candidateDesignHash = c.designHash;
+        if (c.fast) c.candidateCardHash = c.cardHash;
+        else c.candidateDesignHash = c.designHash;
         c.verdicts = [];
         c.status = 'ожидает ревью';
         save(this.changeFile(a.name), c);
@@ -536,11 +608,12 @@ class Team {
             throw Error('Неверный участник или вид решения.');
           if (a.who !== 'claude') {
             const j = stores.review(a.who, a.job_id, a.base, a.candidate, a.decision, c.requestMark);
+            if (c.fast && !(j.task || j.poruchenie || '').includes(c.cardHash)) throw Error('В поручении ревью нужен sha256 карточки малой правки.');
             systemic(c, a.who, a.job_id, j.reviewText);
           }
         }
         const target = a.who === 'user' ? a.replaces : a.who;
-        c.verdicts = c.verdicts.filter((v) => (v.replaces || v.who) !== target);
+        // team-v18 К3: история записей места хранится целиком; новая запись прежнюю не удаляет.
         c.verdicts.push({
           who: a.who,
           base: a.base,
@@ -553,23 +626,24 @@ class Team {
           at: new Date().toISOString(),
         });
         save(this.changeFile(a.name), c);
+        if (a.who === 'user') return 'Решение пользователя записано в историю для ' + target + ': место им не закрывается — нужно ПРИНЯТО участника.';
         return 'Вердикт записан для ' + target + ': ' + a.decision;
       }
       if (a.action === 'merge') {
-        if (c.request && (c.candidateDesignHash !== c.designHash ||
-          ['codex', 'antigravity'].some(who => {
-            const vote = (c.designVotes || []).filter(v => (v.replaces || v.who) === who).at(-1);
-            return vote?.decision !== 'ПРИНЯТО' || vote.designHash !== c.designHash;
-          }))) throw Error('Замысел изменён или не принят: нужны новый commit и новые вердикты.');
+        const seats = require('./team-seats');
+        if (c.fast) {
+          require('./precheck').checkFast(folder, c.base, p.candidate);
+          for (const v of c.verdicts.filter(v => ['codex', 'antigravity'].includes(v.who) && v.base === c.base && v.candidate === p.candidate)) {
+            const j = stores.review(v.who, v.job_id, c.base, p.candidate, v.decision, c.requestMark);
+            if (/\[блокирующее\][^\r\n]*не малая/i.test(j.reviewText)) throw Error('не малая правка — нужен замысел; team_change start без fast.');
+          }
+        }
+        if (!c.fast && c.request && (c.candidateDesignHash !== c.designHash || seats.SEATS.some(who => !seats.seat(c, who, 'design').closed)))
+          throw Error('Замысел изменён или не принят: нужны новый commit и новые вердикты.' +
+            seats.SEATS.map(who => seats.seatError(c, who, 'design')).filter(Boolean).map(e => '\n' + e).join(''));
         let lessonText = '';
         try { lessonText = git(folder, ['show', p.candidate + ':lessons.md']); } catch {}
-        // Обновляем системные замечания завершившегося Grok до их проверки.
-        for (const phase of ['design', 'verdict']) {
-          const v = c[phase === 'design' ? 'grokDesign' : 'grokVerdict'];
-          if (v?.job_id && require('./grok-gate').bound(v, c, phase))
-            await require('./grok-gate').record(c, phase, { job_id: v.job_id });
-        }
-        save(this.changeFile(a.name), c);
+
         if (c.systemic?.length) {
           const diff = git(folder, ['diff', '--no-ext-diff', '--no-textconv', c.base, p.candidate, '--', 'lessons.md']);
           const added = diff.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).join('\n');
@@ -579,7 +653,7 @@ class Team {
             const n = v.note?.match(/системное — открыто в уроке (\d+)/)?.[1];
             if (n) { try { open ||= new RegExp('^## ' + n + '\\.', 'm').test(git(folder, ['show', p.candidate + ':lessons.md'])); } catch {} }
           }
-          const unresolved = c.systemic.filter(v => !(v.who === 'grok' && require('./grok-gate').paragraph(lessonText, v.job_id.slice(0, 8), ['Отклонено:'])));
+          const unresolved = c.systemic.filter(v => v.who !== 'grok');
           const missing = unresolved.filter(v => v.who === 'grok'
             ? !require('./grok-gate').paragraph(lessonText, v.job_id.slice(0, 8), ['closed'])
             : !added.includes(v.job_id.slice(0, 8)));
@@ -591,18 +665,24 @@ class Team {
         if (!clean(folder) || !clean(this.root, true)) throw Error('Рабочая копия или корень репозитория грязные.');
         if (git(this.root, ['branch', '--show-current']).trim() !== 'main')
           throw Error('В корне должна быть выбрана main.');
-        for (const who of participants) {
-          const v = c.verdicts.find(
-            (v) =>
-              v.base === c.base &&
-              v.candidate === p.candidate &&
-              ((v.who === who && v.decision === 'ПРИНЯТО') ||
-                (v.who === 'user' && v.replaces === who && v.decision === 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ' && v.quote?.trim())),
-          );
-          if (!v) throw Error('Нет действующего принятия: ' + who);
-          if (v.who !== 'user' && who !== 'claude') stores.review(who, v.job_id, c.base, p.candidate, 'ПРИНЯТО', c.requestMark);
+        // team-v18 К3: решение Claude и по каждому обязательному месту — ПРИНЯТО участника или Grok на месте выпавшего;
+        // «РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ» место не закрывает.
+        const decision = c.verdicts.filter(v => v.who === 'claude' && v.base === c.base && v.candidate === p.candidate).at(-1);
+        if (decision?.decision !== 'ПРИНЯТО') throw Error('Нет действующего принятия: claude');
+        for (const [phase, candidate] of [['verdict', p.candidate], ['design', c.candidate]]) {
+          if (phase === 'design' && (!c.request || c.fast)) continue;
+          for (const who of seats.SEATS) {
+            const error = seats.seatError(c, who, phase, candidate);
+            if (error) throw Error(error);
+            const st = seats.seat(c, who, phase, candidate);
+            if (st.by === 'grok') {
+              seats.verifySlot(c, phase, who, st.record.job_id, 'ПРИНЯТО', { state: this.state, candidate });
+              const late = seats.storeRefusal(c, who, phase, candidate);
+              if (late) throw Error('Позднее «НЕ ПРИНЯТО» ' + who + ' (' + late.id + ') по этой редакции: слияние остановлено до разбора.');
+            } else if (phase === 'verdict') stores.review(who, st.record.job_id, c.base, p.candidate, 'ПРИНЯТО', c.requestMark);
+          }
         }
-        await require('./grok-gate').check(c, lessonText);
+
         save(this.changeFile(a.name), c);
         git(this.root, ['fetch', '--no-tags', '--', folder, 'change/' + a.name]);
         if (
@@ -619,6 +699,148 @@ class Team {
       }
       throw Error('Неизвестное действие.');
     });
+  }
+  // team-v18 К2: слово пользователя «X отвалился» — запись дословно и список. Писать может только клиент claude.
+  async word(a) {
+    require('./access').guard('team', 'team_word', a);
+    const words = require('./user-word'), fallback = require('./fallback');
+    if (a.action === 'list') return words.listText();
+    // team-v19: слово о Claude, возврат, остановка дирижёра и перепривязка — запасной режим (К1, К2).
+    if (a.action !== 'record' || a.who_down === 'claude') return fallback.word(a, this.fallbackDeps || {});
+    const guestWord = await fallback.helperWord(a);
+    if (guestWord) return guestWord;
+    const { text } = await words.record(a);
+    const down = require('./team-seats').down();
+    return text + (down.length >= 2 ? '\nНедоступны двое: ' + down.map(w => words.NAMES[w]).join(', ') +
+      ' — изменение связки ждёт возврата одного из них; обычные работы идут, если доступны два проверяющих других семей.' : '');
+  }
+  // team-v18 К4: Grok на место выпавшего Codex или Antigravity. Поручение создаёт сервер по собранному им материалу.
+  async grokSlot(a, p) {
+    const seats = require('./team-seats'), words = require('./user-word'), gate = require('./grok-gate');
+    const { c, folder } = p, phase = a.phase, who = a.slot, name = seats.NAMES[who], file = this.changeFile(a.name);
+    if (!c.request) throw Error('В старом изменении запрос и замысел не сохранены.');
+    if (!['design', 'verdict'].includes(phase)) throw Error('Укажите phase: design или verdict.');
+    if (!seats.SEATS.includes(who)) throw Error('Место (slot): codex или antigravity.');
+    if (phase === 'verdict') {
+      if (c.candidate !== p.candidate || c.candidate === c.base) throw Error('Сначала зафиксируйте кандидата (commit).');
+      if (!clean(folder)) throw Error('Рабочая копия грязная; сначала зафиксируйте изменения.');
+    }
+    const b = seats.binding(c, phase), st = seats.seat(c, who, phase);
+    if (st.closed) throw Error('Место ' + name + ' по этой редакции уже закрыто.');
+    // (б) Отказ выпавшего по этой редакции в силе — записанный или найденный в хранилище.
+    const refusal = st.blocked && st.by === 'own' ? (st.record.job_id || 'записан') : seats.storeRefusal(c, who, phase)?.id;
+    if (refusal) throw Error(name + ' уже сказал «НЕ ПРИНЯТО» по этой редакции (' + refusal + '): отказ в силе — новая редакция или design who=claude replaces после двух отказов.');
+    if (st.blocked) throw Error(st.reason);
+    // Совещательный отказ Grok по этой редакции: повторной попытки «пока не согласится» нет.
+    const field = phase === 'design' ? 'grokDesign' : 'grokVerdict';
+    if (c[field]?.job_id && gate.bound(c[field], c, phase) && ['running', 'queued', 'delivery_unclear'].includes(c[field].status)) {
+      await gate.record(c, phase, { job_id: c[field].job_id });
+      save(file, c);
+    }
+    if (c[field] && gate.bound(c[field], c, phase) && c[field].decision === 'НЕ ПРИНЯТО')
+      throw Error('Grok уже сказал «НЕ ПРИНЯТО» по этой редакции обычным запросом (' + c[field].job_id + '): повторной попытки нет.');
+    // Один Grok — одно место; выпали двое — изменение ждёт.
+    if (words.active('grok')) throw Error('Изменение ждёт: недоступны ' + name + ', Grok; проверить вместо двоих некому.');
+    const existing = seats.slots(c, phase, b), other = existing.find(s => s.seat !== who);
+    if (other) throw Error('Grok уже назначен на место ' + seats.NAMES[other.seat] + ' этой редакции (поручение ' + other.job_id +
+      '): второе место он не займёт, нужна новая редакция или возврат ' + name + '. Изменение ждёт: недоступны Codex, Antigravity; проверить вместо двоих некому.');
+    for (const s of existing) {
+      const j = stores.list('grok', false).jobs.find(j => j.id === s.job_id);
+      if (!j || !['failed', 'lost', 'cancelled', 'stop_unconfirmed'].includes(j.status))
+        throw Error('Grok уже на месте ' + name + ': поручение ' + s.job_id + ' (' + (require('./states')[j?.status] || j?.status || 'нет карточки') + ').');
+    }
+    // (а) Основание на момент проверки сохраняется до отмены поручений выпавшего.
+    const basis = seats.basis(c, phase, who, Date.now());
+    const slot = { id: 'slot-' + require('crypto').randomUUID().slice(0, 8), phase, seat: who, ...b, basis, word_id: basis.word_id,
+      state: 'основание сохранено', at: new Date().toISOString() };
+    (c.grokSlots ||= []).push(slot);
+    save(file, c);
+    const fail = message => { slot.state = 'не создано: ' + message; save(file, c); return Error(message); };
+    const cancelled = [], waited = [];
+    for (const j of seats.reviewJobs(c, who).filter(j => seats.PENDING.includes(j.status))) {
+      if (j.status === 'running') throw fail(name + ' сейчас отвечает: поручение ' + j.id + ' идёт. Дождитесь ответа; зависшее отмените по прежним правилам и вызовите grok_slot снова.');
+      if (['cancelling', 'stop_unconfirmed'].includes(j.status)) {
+        let since = Date.parse(j.cancellingAt);
+        if (!Number.isFinite(since)) try { since = fs.statSync(j.cardFile).mtimeMs; } catch { since = Date.now(); }
+        if (Date.now() - since < seats.TEN_MIN) throw fail('Отмена идёт: поручение ' + j.id + ' (' + name + '); повторите grok_slot позже.');
+        // Поручение-ревью только читает: отмена дольше 10 минут считается отменой; его поздний ответ — данные.
+        waited.push(j.id);
+        continue;
+      }
+      let after;
+      try { after = await require('./job-cancel').cancel(who, j.id); }
+      catch (e) { throw fail('Отмена поручения ' + j.id + ' не подтверждена: ' + e.message); }
+      if (after.status !== 'cancelled') throw fail(after.status === 'running' ? name + ' сейчас отвечает: поручение ' + j.id + ' идёт.'
+        : 'Отмена поручения ' + j.id + ' не подтверждена: ' + (require('./states')[after.status] || after.status) + '.');
+      cancelled.push(j.id);
+    }
+    // (а) От слова до создания поручения Grok, включая ожидание отмены, у выпавшего нет успешного ответа ни по одной работе.
+    const back = words.success(who, Date.parse(basis.word_at), Date.now());
+    if (back) throw fail(name + ' ответил после слова (поручение ' + back.id + '): место не заменяется.');
+    let content, elements;
+    try {
+      if (phase === 'design') {
+        const bytes = fs.readFileSync(c.designFile);
+        if (sha(bytes) !== c.designHash) throw Error('файл замысла изменён после записи хеша — повторите grok_slot');
+        content = bytes.toString('utf8');
+        elements = seats.headings(content);
+      } else {
+        // Полный дифф закреплённой пары, а не экранный diff с обрезкой.
+        content = git(folder, ['diff', '--binary', '--no-ext-diff', '--no-textconv', c.base, c.candidate]);
+        elements = git(folder, ['diff', '--name-only', '--no-ext-diff', '--no-textconv', c.base, c.candidate]).split(/\r?\n/).filter(Boolean);
+      }
+    } catch (e) { throw fail('Материал не собран: ' + e.message.split('\n')[0]); }
+    if (!elements.length) throw fail('Нет элементов покрытия: ' + (phase === 'design' ? 'в замысле нет разделов «##»' : 'дифф пуст') + '.');
+    const text = seats.materialText({ c, phase, who, slotId: slot.id, elements, content, b }), materialSha = sha(text);
+    const materialFile = path.join(this.state, 'changes', a.name, 'grok-slot-' + phase + '-' + who + '-' + slot.id + '.txt');
+    atomic(materialFile, text);
+    atomic(materialFile.replace(/\.txt$/, '.json'), JSON.stringify({ change: a.name, phase, seat: who, ...b, basis, word_id: basis.word_id,
+      sha256: materialSha, coverage: elements, cancelled, waited }, null, 2) + '\n');
+    Object.assign(slot, { materialFile, materialSha256: materialSha, coverage: elements, cancelled, waited });
+    save(file, c);
+    let job;
+    const grok = new (require('./grok').Grok)();
+    try { job = await grok.send({ task: seats.slotTask({ c, phase, who, slotId: slot.id, elements, b, materialSha }), text, role: 'проверка', opora: false }); }
+    catch (e) { throw fail('Поручение Grok не создано: ' + e.message); }
+    // Основание — на момент фактического создания поручения Grok: успешный ответ выпавшего в окне от проверки до создания
+    // отменяет поручение Grok, место не заменяется.
+    const stale = seats.basisAtCreation({ seat: who, basis, created_at: job.startedAt });
+    if (stale) {
+      try { await grok.cancel(job.id); } catch {}
+      Object.assign(slot, { cancelled_job: job.id, created_at: job.startedAt });
+      throw fail(stale + ': поручение Grok ' + job.id + ' отменено, место не заменяется.');
+    }
+    Object.assign(slot, { job_id: job.id, created_at: job.startedAt, state: 'создано' });
+    save(file, c);
+    return 'Grok на месте ' + name + ' (' + (phase === 'design' ? 'замысел ' + c.designHash.slice(0, 8) : 'пара ' + c.base.slice(0, 8) + '→' + c.candidate.slice(0, 8)) +
+      '): поручение ' + job.id + ' — ' + (require('./states')[job.status] || job.status) + (job.reason ? ' (' + job.reason + ')' : '') + '.\n' +
+      'Основание: ' + (basis.kind === 'слово' ? 'слово пользователя ' + basis.word_id : 'истёкшее слово ' + basis.word_id + ' и поручение ' + basis.job_id + ' (' + basis.job_status + ')') +
+      ', проверено ' + basis.checked_at + '.\nМатериал: ' + materialFile + ', sha256 ' + materialSha + '; элементов покрытия: ' + elements.length + '.' +
+      (cancelled.length ? '\nОтменены поручения ' + name + ': ' + cancelled.join(', ') + '.' : '') +
+      (waited.length ? '\nОтмена дольше 10 минут считается отменой: ' + waited.join(', ') + '.' : '') +
+      '\nПосле ответа: team_change ' + phase + ' who=grok replaces=' + who + ' job_id=' + job.id + ' decision=<вердикт>' + (phase === 'verdict' ? ' base candidate' : '') + '.';
+  }
+  // Голос Grok на месте выпавшего: привязка к grok_slot, сохранённый материал и раздел «## Покрытие».
+  async grokSlotVote(a, p) {
+    const seats = require('./team-seats'), { c, folder } = p, phase = a.action, who = a.replaces;
+    if (!c.request) throw Error('В старом изменении запрос и замысел не сохранены.');
+    if (!seats.SEATS.includes(who)) throw Error('Grok занимает только место codex или antigravity.');
+    if (!['ПРИНЯТО', 'НЕ ПРИНЯТО'].includes(a.decision)) throw Error('Неизвестный вердикт.');
+    if (phase === 'verdict') {
+      this.checkPair(a, p);
+      if (!clean(folder)) throw Error('Рабочая копия грязная; сначала зафиксируйте изменения.');
+    }
+    const list = phase === 'design' ? (c.designVotes ||= []) : (c.verdicts ||= []);
+    if (list.some(v => v.who === 'grok' && v.job_id === a.job_id)) throw Error('Этот ответ Grok уже записан.');
+    const grok = new (require('./grok').Grok)();
+    if (!grok.has(a.job_id || '')) throw Error('Поручение Grok не найдено.');
+    const current = await grok.refresh(a.job_id);
+    if (current.status !== 'done') throw Error('Grok ещё не ответил (' + (require('./states')[current.status] || current.status) + '): голос записывается после ответа.');
+    const { slot, text } = seats.verifySlot(c, phase, who, a.job_id, a.decision, { state: this.state, candidate: p.candidate });
+    systemic(c, 'grok', a.job_id, text);
+    list.push({ who: 'grok', replaces: who, job_id: a.job_id, decision: a.decision, slot: slot.id, ...seats.binding(c, phase, p.candidate), note: a.note, at: new Date().toISOString() });
+    save(this.changeFile(a.name), c);
+    return 'Голос Grok на месте ' + seats.NAMES[who] + ' записан: ' + a.decision + (a.decision === 'НЕ ПРИНЯТО' ? ' — слияние остановлено до новой редакции.' : '.');
   }
   changesText() {
     const dir = inside(this.root, '.work');
@@ -641,9 +863,10 @@ class Team {
               (clean(folder) ? 'чисто' : 'есть изменения') +
               '; ' +
               (c?.status || 'нет карточки team') +
-              '\n' + (c ? requestText(c) : '') + 'Grok: ' + (c ? require('./summary').grokText(c) : 'не запрошен') + '\nВердикты: ' +
+              '\n' + (c ? requestText(c) : '') + '\nВердикты: ' +
               (c?.verdicts
-                .map((v) => (v.replaces || v.who) + ': ' + v.decision + (v.candidate === candidate ? '' : ' (устарел)'))
+                .map((v) => (v.who === 'grok' && v.replaces ? 'grok на месте ' + v.replaces : v.who === 'user' ? 'пользователь за ' + v.replaces : (v.replaces || v.who)) +
+                  ': ' + v.decision + (v.candidate === candidate ? '' : ' (устарел)'))
                 .join('; ') || 'нет')
             );
           } catch (e) {
@@ -660,6 +883,7 @@ class Team {
   }
   async status(claudeQuota, claudeUsage, notifyTest, full = false, scope = {}) {
     require('./access').guard('team', 'team_status', { claude_quota: claudeQuota, claude_usage: claudeUsage, notify_test: notifyTest });
+    const snapshot = require('./job-snapshot').create();
     // Обычная сводка только читает. Уборку запускают установка и старт сервера.
     if (claudeUsage) {
       if (!['calls', 'written', 'reread', 'window_h'].every(k => Number.isFinite(claudeUsage[k]) && claudeUsage[k] >= 0) || !claudeUsage.window_h || !claudeUsage.source?.trim() || !Number.isFinite(Date.parse(claudeUsage.taken_at))) throw Error('Некорректный замер сеанса Claude.');
@@ -667,6 +891,8 @@ class Team {
     }
     const rows = ['Хранилище состояния: ' + stateDir],
       seenOwners = new Set();
+    // team-v19 К12: гость показывает коммит своего релиза (расхождение с live\deployed.json — в баннере).
+    if (require('./access').guest()) rows.push('Гость ' + require('./access').client() + ': релиз ' + path.basename(path.resolve(__dirname, '..')).slice(0, 8));
     const section = async (title, fn) => {
       rows.push(title + ':');
       try {
@@ -695,23 +921,23 @@ class Team {
     }
     let statusWorks = [], statusWorksError;
     await section('Проверка этапов', async () => {
-      try { statusWorks = await Promise.all(this.works().map(w => w.error ? w : this.refreshWork(this.workFile(w.name), { readOnly: true }))); }
+      try { statusWorks = await Promise.all(this.works().map(w => w.error ? w : this.refreshWork(this.workFile(w.name), { readOnly: true, snapshot }))); }
       catch (e) { statusWorksError = e; throw e; }
     });
     const readStatusWorks = () => { if (statusWorksError) throw statusWorksError; return statusWorks; };
     const quota = await require('./quota-line').quotaLine({ state: this.state, binary: process.env.CODEX_PATH || findCodex(), advice: !full, agyModel: scope.agy_model });
     const warning = [require('./server-instructions').read().warning, require('./work-owner').reminder(this.root, undefined, scope)].filter(Boolean).join('\n');
     if (!full) {
-      const text = await require('./summary').compact({ root: this.root, state: this.state, works: readStatusWorks }, quota);
+      const text = await require('./summary').compact({ root: this.root, state: this.state, works: readStatusWorks }, quota, snapshot);
       return (warning ? warning + '\n' : '') + text + (notifyTest ? '\nПробное уведомление: ' + await require('./notify').notify('Связка: пробное уведомление', 'Уведомления команды работают.') : '');
     }
     rows.push(quota);
     await section('Расхождение версий', () => rows.push(...require('./release-drift').lines(this.root, stateDir)));
     if (warning) rows.unshift(warning);
-    await section('Нагрузка', () => rows.push(require('./summary').loadLine(this.state, Object.fromEntries(['codex', 'antigravity', 'grok'].map(who => [who, stores.list(who).jobs])))));
+    await section('Нагрузка', () => rows.push(require('./summary').loadLine(this.state, Object.fromEntries(require('./members').helpers.map(who => [who, stores.list(who, true, snapshot).jobs])))));
     for (const who of ['codex', 'antigravity']) {
       await section('Поручения ' + who, async () => {
-        const { jobs, errors } = stores.list(who),
+        const { jobs, errors } = stores.list(who, true, snapshot),
           recent = jobs.filter((j) => !j.archived && Date.parse(j.startedAt) > Date.now() - 18000000);
         if (who === 'antigravity')
           rows.push(
@@ -728,11 +954,10 @@ class Team {
           );
         rows.push(who + ': карточек ' + jobs.length + ', архивных ' + jobs.filter((j) => j.archived).length + '.');
         for (const j of jobs) {
-          const locks = require('./locks'),
-            owner = await locks.ownerState(j.owner);
+          const locks = require('./locks');
           if (j.owner?.instance && !seenOwners.has(j.owner.instance)) {
             seenOwners.add(j.owner.instance);
-            const live = await locks.probe(locks.pipeName('instance', j.owner.instance));
+            const live = await locks.probeOwner(j.owner);
             if (live.state === 'alive' && live.info?.version) {
               let disk = 'не установлена';
               try {
@@ -752,6 +977,7 @@ class Team {
             !['running', 'queued', 'waiting_quota', 'needs_decision', 'cancelling', 'stop_unconfirmed'].includes(j.status)
           )
             continue;
+          const owner = await snapshot.ownerState(j.owner);
           rows.push(
             format(
               who === 'codex' ? 'Codex' : 'Antigravity',
@@ -789,10 +1015,7 @@ class Team {
       const failure = path.join(stateDir, 'migration-error.json');
       if (fs.existsSync(failure) && read(failure).error) rows.push('Ошибка сверки хранилища · ' + read(failure).error);
     });
-    await section('Grok', () => {
-      const result = stores.list('grok', false);
-      rows.push(...result.errors, ...result.jobs.map(j => 'Grok ' + j.id + ': ' + (require('./states')[j.status] || j.status) + (j.reason ? ' · ' + j.reason : '')));
-    });
+
     await section('Работы', async () => rows.push(...readStatusWorks().map(workText)));
     await section('Репозиторий', async () => {
       rows.push(
@@ -805,7 +1028,7 @@ class Team {
       const marker = inside(this.root, 'live', 'deployed.json');
       rows.push('Последнее развёртывание: ' + (fs.existsSync(marker) ? [read(marker).commit, read(marker).at, read(marker).method || 'способ не записан'].join(' · ') : 'не записано'));
       const op = require('./deploy-ops').list(this.root, { reconcile: false }).at(-1);
-      if (op) rows.push(['Установка ' + op.id + ': ' + op.status, op.reason || op.message, op.restart, require('./deploy-ops').cleanupLine(op.cleanup)].filter(Boolean).join(' · '));
+      if (op) rows.push(['Установка ' + op.id + ': ' + op.status, op.reason || op.message, op.restart, op.oldCode && !(op.reason || op.message || '').includes(require('./deploy-ops').oldCodeLine) ? require('./deploy-ops').oldCodeLine : require('./deploy-ops').cleanupLine(op.cleanup)].filter(Boolean).join(' · '));
     });
     await section('Настройки', async () => {
       rows.push(require('./client-configs').status());
@@ -820,7 +1043,7 @@ class Team {
             'Файл настроек ' +
               config +
               ': ' +
-              ['antigravity', 'codex', 'team', 'grok']
+              require('./members').servers
                 .map((n) => n + ' → ' + (s.config.mcpServers?.[n]?.args?.join(' ') || 'не подключён'))
                 .join('; '),
           );

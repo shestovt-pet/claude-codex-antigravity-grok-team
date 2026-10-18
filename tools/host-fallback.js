@@ -826,6 +826,7 @@ function argValue(argv, flag) {
   return i >= 0 ? argv[i + 1] : null;
 }
 
+const RETIRED = 'Запасной режим теперь по слову пользователя „Claude отвалился“ в чате Codex или Antigravity — rules/fallback.md';
 async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0] || 'status';
@@ -836,6 +837,12 @@ async function main() {
 
   if (cmd === '_supervise') {
     supervise(process.argv[3], process.argv[4], process.argv[5], process.argv[6], process.argv[7]);
+    return;
+  }
+  // team-v19 Р-а: запасной режим с токеном хоста выведен из работы; роли по задаче — scripts/roles.cmd.
+  if (/^(enter|leave|confirm-|jobs|actions-|roles-)/.test(cmd)) {
+    console.error(RETIRED);
+    process.exitCode = 1;
     return;
   }
   try {
@@ -928,5 +935,5 @@ if (require.main === module) main();
 module.exports = {
   status, list, enter, leave, detect, readyAges, hostReady, SERVERS, INCREMENT,
   confirmRequest, confirmStatus, listJobs, stopJob, enqueueJob,
-  actionsIngest, actionsList, actionsApply, accessDraft,
+  actionsIngest, actionsList, actionsApply, accessDraft, RETIRED,
 };

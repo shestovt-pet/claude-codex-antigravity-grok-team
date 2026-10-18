@@ -5,7 +5,8 @@ const fs = require('fs'),
   { execFileSync } = require('child_process');
 const { randomUUID } = require('crypto');
 const { inside, repository, deployGit, hash, atomic } = require('./team-git');
-const names = ['antigravity', 'codex', 'team', 'grok'];
+const { samePath } = require('./paths');
+const names = require('./members').servers;
 function configPaths() {
   if (process.env.MOST_CLAUDE_CONFIGS) return JSON.parse(process.env.MOST_CLAUDE_CONFIGS);
   const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData/Local');
@@ -31,6 +32,7 @@ function configFor(config, release, root, state = require('./paths').stateDir, f
   out.mcpServers = { ...out.mcpServers };
   const { assertOwn, pointsInto } = require('./ownership');
   assertOwn(out.mcpServers, names, root, file);
+  if (out.mcpServers.grok && require('./ownership').own(out.mcpServers.grok, 'grok', root)) delete out.mcpServers.grok;
   // Старые записи прежних версий удаляются, только если указывают на этот корень; чужое не трогаем.
   if (out.mcpServers.most && pointsInto(out.mcpServers.most, root)) delete out.mcpServers.most;
   for (const [key, value] of Object.entries(out.mcpServers))
@@ -239,6 +241,33 @@ async function deploy({ root, commit = 'main', configs, dryRun = false, releaseO
   }, deployState);
 }
 
+// team-v28 Р1: строгое сравнение — тот же состав и без повторов (['a', 'a'] не равно ['a', 'b']).
+const sameTools = (actual, expected) => actual.length === expected.length && new Set(actual).size === actual.length && expected.every(t => actual.includes(t));
+function releaseGuestTools(releasePath, pairs) {
+  const file = path.join(releasePath, 'common', 'access.js');
+  if (!fs.existsSync(file)) throw Error('В релизе нет списка инструментов гостя (common/access.js).');
+  const script = 'const [file, pairs] = process.argv.slice(1); const g = require(file).guestTools;' +
+    "if (typeof g !== 'function') { process.stderr.write('нет функции guestTools'); process.exit(3); }" +
+    "const out = {}; for (const [c, n] of JSON.parse(pairs)) out[c + ':' + n] = g(n, c); process.stdout.write(JSON.stringify(out));";
+  const timeout = Number(process.env.MOST_GUEST_LIST_TIMEOUT_MS) || 20000;
+  let out;
+  try {
+    out = execFileSync(process.execPath, ['-e', script, file, JSON.stringify(pairs)],
+      { cwd: releasePath, encoding: 'utf8', windowsHide: true, timeout, maxBuffer: 1 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    const why = e.code === 'ETIMEDOUT' || e.signal ? 'не ответил за ' + Math.round(timeout / 1000) + ' с' : String(e.stderr || e.message).trim().split(/\r?\n/)[0];
+    throw Error('В релизе нет списка инструментов гостя (guestTools): ' + why);
+  }
+  let list;
+  try { list = JSON.parse(out); } catch { throw Error('В релизе нет списка инструментов гостя (guestTools): неверный ответ.'); }
+  for (const [c, n] of pairs) {
+    const v = list?.[c + ':' + n];
+    if (!Array.isArray(v) || v.some(t => typeof t !== 'string' || !t) || new Set(v).size !== v.length)
+      throw Error('В релизе неверный список инструментов гостя: ' + c + ' → ' + n + '.');
+  }
+  return list;
+}
+
 async function probeRelease(releasePath, root, id, deployState, deps, hook) {
   await hook('probe');
   const isolated = path.join(deployState, '.probe-' + randomUUID());
@@ -258,12 +287,15 @@ async function probeRelease(releasePath, root, id, deployState, deps, hook) {
       MOST_PROBE_ONLY: '1',
       MOST_CLIENT: 'claude',
     });
-  for (const client of ['codex', 'antigravity']) for (const n of ['team', client === 'codex' ? 'antigravity' : 'codex', 'grok']) {
-    const result = await (deps.probe || require('./probe').probe)(path.join(releasePath, 'servers', n, 'index.js'), { ...process.env, MOST_CLIENT: client, MOST_PROBE_ONLY: '1', MOST_REPO_ROOT: root, MOST_STATE_DIR: isolated, MOST_CODEX_JOBS_DIR: path.join(isolated, 'codex-jobs'), MOST_INPUT_DIR: path.join(isolated, 'input'), MOST_JOURNAL: path.join(isolated, 'antigravity.log') });
+  // team-v28 Р1: ожидаемый список гостя считает отдельный процесс из common/access.js самого релиза — не работающий код
+  // и не проверяемый сервер; сбой, зависание или неверный ответ модуля — отказ установки без возврата к своему списку.
+  const pairs = ['codex', 'antigravity'].flatMap(client => require('./client-configs')[client === 'codex' ? 'CODEX' : 'AGY'].map(n => [client, n]));
+  const expectedAll = releaseGuestTools(releasePath, pairs);
+  for (const [client, n] of pairs) {
+    const result = await (deps.probe || require('./probe').probe)(path.join(releasePath, 'servers', n, 'index.js'), { ...process.env, MOST_CLIENT: client, MOST_PROBE_ONLY: '1', MOST_PROBE_GUEST: 'full', MOST_REPO_ROOT: root, MOST_STATE_DIR: isolated, MOST_CODEX_JOBS_DIR: path.join(isolated, 'codex-jobs'), MOST_INPUT_DIR: path.join(isolated, 'input'), MOST_JOURNAL: path.join(isolated, 'antigravity.log') });
     if (!deps.probe || result?.tools) {
-      const expected = n === 'team' ? ['team_status', 'team_rules', 'team_work'] : [n + '_status', n + '_send', n + '_result'];
       const actual = result?.tools?.map(t => t.name) || [];
-      if (actual.length !== expected.length || actual.some(t => !expected.includes(t))) throw Error('Гостевой сервер предоставил неверный список инструментов.');
+      if (!sameTools(actual, expectedAll[client + ':' + n])) throw Error('Гостевой сервер предоставил неверный список инструментов.');
     }
   }
   atomic(path.join(releasePath, 'probe-ok.json'), JSON.stringify({ commit: id, root, servers: names, at: new Date().toISOString() }));
@@ -281,17 +313,17 @@ function verifiedRelease(release, allowLegacy = false) {
     throw Error('Некорректная метка пробного запуска: ' + release);
   for (const n of names)
     if (!fs.existsSync(inside(release, 'servers', n, 'index.js')) || !fs.statSync(inside(release, 'servers', n, 'index.js')).isFile()) throw Error('Релиз неполон, соберите заново через team_change deploy.');
-  return { release, root: marker.root, legacy: JSON.stringify(marker.servers) !== JSON.stringify(names) };
+  return { release, root: require('./path-compat').realOrGiven(marker.root), legacy: JSON.stringify(marker.servers) !== JSON.stringify(names) };
 }
 
 function configPlans(snaps, release, root, state) {
   return snaps.flatMap((s) => {
     const next = configFor(s.config, release, root, state, s.file);
     const { equal, entries } = require('./client-configs');
-    const managed = [...new Set([...names, 'most', ...Object.keys(s.config.mcpServers || {}).filter(n => s.config.mcpServers[n]?.args?.some(a => String(a).includes('mcp-server-google-antigravity')))])];
+    const managed = [...new Set([...names, 'grok', 'most', ...Object.keys(s.config.mcpServers || {}).filter(n => s.config.mcpServers[n]?.args?.some(a => String(a).includes('mcp-server-google-antigravity')))])];
     return equal(entries(next, managed), entries(s.config, managed)) ? [] : [{
       ...s, next: JSON.stringify(next, null, 2) + '\n',
-      backup: !names.every((n) => s.config.mcpServers?.[n]?.args?.[0] === path.join(release, 'servers', n, 'index.js')),
+      backup: !names.every((n) => s.config.mcpServers?.[n]?.args?.[0] && samePath(s.config.mcpServers[n].args[0], path.join(release, 'servers', n, 'index.js'))),
     }];
   });
 }
@@ -399,7 +431,7 @@ async function rollback({ root, configs, configOnly = false, stateDir }, deps = 
         if (!fs.existsSync(file + '.prev')) throw Error('нет резервного конфига ' + file + '.prev');
         const s = snapshot(file),
           prev = snapshot(file + '.prev');
-        const clientKind = require('./client-configs').paths().find(p => path.resolve(p.file) === path.resolve(file))?.kind;
+        const clientKind = require('./client-configs').paths().find(p => samePath(p.file, file))?.kind;
         if (clientKind) {
           const next = require('./client-configs').restore(s, prev, clientKind);
           await switchConfigs([{ ...s, next, backup: false }], deps.hook);
@@ -409,7 +441,7 @@ async function rollback({ root, configs, configOnly = false, stateDir }, deps = 
         // Восстанавливаются записи серверов, посторонние поля текущего конфига сохраняются.
         const next = { ...s.config, mcpServers: { ...s.config.mcpServers } };
         const keys = new Set([
-          ...names,
+          ...names, 'grok',
           'most',
           ...Object.entries(prev.config.mcpServers || {})
             .filter(([, v]) => v.args?.some((a) => String(a).includes('mcp-server-google-antigravity')))

@@ -3,7 +3,7 @@
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const LIMITS = Object.freeze({ json: 8 * 1024 ** 2, text: 16 * 1024 ** 2,
   count: 4096, file: 512 * 1024 ** 2, total: 32 * 1024 ** 3, chunk: 1024 ** 2 });
-const QUORUM = ['codex', 'grok', 'antigravity'];
+const QUORUM = require('./members').helpers;
 const HEX = /^[a-f0-9]{64}$/;
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const canonical = x => JSON.stringify(sort(x));
@@ -12,7 +12,7 @@ function sort(x) { return Array.isArray(x) ? x.map(sort) : x && typeof x === 'ob
 function fail(message, code = 2) { throw Object.assign(Error(message), { workflowCode: code }); }
 function need(condition, message, code) { if (!condition) fail(message, code); }
 function unique(xs) { return new Set(xs).size === xs.length; }
-function exactQuorum(xs) { return Array.isArray(xs) && xs.length === 3 && unique(xs) && QUORUM.every(x => xs.includes(x)); }
+function exactQuorum(xs) { return Array.isArray(xs) && unique(xs) && xs.filter(x => x !== 'grok').length === QUORUM.length && QUORUM.every(x => xs.includes(x)); }
 function marker(text, key) {
   const rows = String(text).split(/\r?\n/).filter(x => x.startsWith(key + ':'));
   return rows.length === 1 ? rows[0].slice(key.length + 1).trim() : null;
@@ -128,11 +128,11 @@ async function importPolicy(ctx, policyRef) {
   need(p.schema_version === 1 && p.mode === 'recorded_response_not_independently_authenticated' &&
     p.scope === 'native_codex_only' && p.enabled === true, 'Политика импорта не включена или неизвестна.');
   need(typeof p.trust_boundary === 'string' && p.trust_boundary.length >= 40, 'Не описана граница доверия импорта.');
-  need(exactQuorum(p.agreement?.map(x => x.participant)), 'Политика не содержит соглашения всех троих.');
+  need(exactQuorum(p.agreement?.map(x => x.participant)), 'Политика не содержит соглашения Codex и Antigravity.');
   need(typeof p.policy_id === 'string' && p.policy_id, 'Нет policy_id.');
   const policyHash = sha(canonical({ schema_version: p.schema_version, policy_id: p.policy_id, mode: p.mode,
     scope: p.scope, enabled: p.enabled, trust_boundary: p.trust_boundary }));
-  for (const a of p.agreement) {
+  for (const a of p.agreement.filter(a => a.participant !== 'grok')) {
     need(a.job_id && a.source_record && HEX.test(a.response?.sha256 || ''), 'Не зафиксирован источник согласования политики.');
     const r = await readFile(ctx, a.response, LIMITS.text, true);
     let text = r.text;
@@ -213,9 +213,10 @@ async function run(file, options = {}) {
       if (w.schema_version === 2) {
         receipts.push(await require('./consilium-workflow-v2').check({ ctx, w, s, snapshot, adapter, usedJobs, files }));
       } else {
-      need(exactQuorum(s.reviews.map(r => r.participant)), 'Нужно ровно три разных голоса: ' + s.id);
+      const activeReviews = s.reviews.filter(r => r.participant !== 'grok');
+      need(exactQuorum(activeReviews.map(r => r.participant)), 'Нужны голоса Codex и Antigravity: ' + s.id);
       const votes = [];
-      for (const ref of s.reviews) {
+      for (const ref of activeReviews) {
         need(ref.job_id && !usedJobs.has(ref.job_id), 'Повтор/отсутствие job_id.'); usedJobs.add(ref.job_id);
         let vote;
         if (ref.source === 'bridge') vote = await bridgeVote(adapter, ref.participant, ref, w.work_id, s.id, snapshot);

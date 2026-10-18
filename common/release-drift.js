@@ -1,6 +1,8 @@
 'use strict';
 // Только чтение: этот раздел сводки не обновляет карточки, готовность или установку.
 const fs = require('fs'), path = require('path'), { spawnSync } = require('child_process');
+const { samePath, withRoot } = require('./paths');
+const { realOrGiven } = require('./path-compat');
 function git(root, args) {
   const r = spawnSync('git', ['--no-optional-locks', '-c', 'safe.directory=' + root, ...args],
     { cwd: root, encoding: 'utf8', windowsHide: true });
@@ -8,6 +10,7 @@ function git(root, args) {
   return r.stdout.trim();
 }
 function lines(root, state) {
+  root = realOrGiven(root);
   const rows = [], deployedPath = path.join(root, 'live', 'deployed.json');
   let deployed;
   if (fs.existsSync(deployedPath)) {
@@ -27,12 +30,16 @@ function lines(root, state) {
   } else rows.push('Последнее развёртывание: не записано (нет deployed.json)');
   const ready = path.join(state, 'ready');
   if (fs.existsSync(ready)) {
-    const releases = fs.readdirSync(ready).filter(n => n.endsWith('.json')).map(n => {
+    // team-v28 Р3: отметки готовности только текущих участников; чужие (Grok выключен) — справкой, без «⚠».
+    const servers = require('./members').servers, files = fs.readdirSync(ready).filter(n => n.endsWith('.json'));
+    const stale = files.filter(n => !servers.includes(n.slice(0, -5)));
+    if (stale.length) rows.push('Устаревшая отметка готовности: ' + stale.join(', '));
+    const releases = files.filter(n => !stale.includes(n)).map(n => {
       const rec = JSON.parse(fs.readFileSync(path.join(ready, n), 'utf8'));
       return rec.release && path.resolve(rec.release);
     });
     const expected = deployed?.release ? path.resolve(deployed.release) : deployed?.commit && path.resolve(root, 'live', deployed.commit);
-    if (releases.length && (!expected || releases.some(r => !r || r.toLowerCase() !== expected.toLowerCase())))
+    if (releases.length && (!expected || releases.some(r => !r || !samePath(r, expected))))
       rows.push('⚠ Серверы запущены не из записанной установки');
   }
   // -z сохраняет имена с переводами строк и нелатинскими символами; rename содержит второй путь.
@@ -51,6 +58,6 @@ function lines(root, state) {
     if (paths.some(p => p && !ignored(p))) count++;
   }
   if (count) rows.push('⚠ В C:\\most несохранённые изменения кода: ' + count + ' файлов');
-  return rows;
+  return rows.map(row => withRoot(row, root));
 }
 module.exports = { lines };

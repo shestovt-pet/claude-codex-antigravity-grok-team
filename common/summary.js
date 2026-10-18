@@ -25,6 +25,9 @@ function mergedLine(root, merged) {
 function grokText(c) {
   return ['design', 'verdict'].map(phase => {
     const v = c[phase === 'design' ? 'grokDesign' : 'grokVerdict'];
+    // team-v18: Grok на месте выпавшего обязательного выполняет и совещательный запрос этой редакции.
+    const slot = c.request ? require('./team-seats').grokSlotVote(c, phase) : null;
+    if (slot && (!v || !require('./grok-gate').bound(v, c, phase))) return 'на месте ' + slot.replaces + ': ' + slot.decision;
     if (!v || !require('./grok-gate').bound(v, c, phase)) return 'не запрошен';
     return v.decision || ({ running: 'ждём ответ', queued: 'ждём ответ', delivery_unclear: 'ждём ответ', failed: 'отказ', lost: 'потеряно', cancelled: 'отменено локально', stop_unconfirmed: 'остановка не подтверждена', cancel_requested: 'запрошена отмена' }[v.status]) || v.status;
   }).join(' / ');
@@ -40,7 +43,7 @@ function loadLine(state, jobs) {
   const recent = who => (jobs[who] || []).filter(j => !j.archived && Date.parse(j.startedAt) > Date.now() - 18000000);
   const a = recent('antigravity');
   return 'Нагрузка за 5 ч: Claude Desktop — ' + (fresh ? c.calls + ' обращений, перечитано ' + (c.reread / 1e6).toFixed(1) + ' млн' : 'нет замера за 5 ч') +
-    '; Codex — ' + recent('codex').length + ' поручений; Antigravity — ' + a.length + ' поручений, ' + (a.reduce((n, j) => n + (Number(j.usage?.total_tokens) || 0), 0) / 1e6).toFixed(2) + ' млн токенов; Grok — ' + recent('grok').length + ' поручений.' +
+    '; Codex — ' + recent('codex').length + ' поручений; Antigravity — ' + a.length + ' поручений, ' + (a.reduce((n, j) => n + (Number(j.usage?.total_tokens) || 0), 0) / 1e6).toFixed(2) + ' млн токенов.' +
     (fresh && c.reread > 50000000 ? '\nClaude перегружен: отдавайте чтение и ревью помощникам' : '');
 }
 function settings() {
@@ -48,13 +51,13 @@ function settings() {
   for (const file of d.configPaths()) {
     try {
       const c = d.snapshot(file).config;
-      for (const n of ['team', 'codex', 'antigravity', 'grok']) entries.push({ name: 'Claude ' + file + ' / ' + n, arg: c.mcpServers?.[n]?.args?.[0] });
+      for (const n of require('./members').servers) entries.push({ name: 'Claude ' + file + ' / ' + n, arg: c.mcpServers?.[n]?.args?.[0] });
     } catch (e) { entries.push({ name: 'Claude ' + file, error: e.code === 'ENOENT' ? 'отсутствует' : 'ошибка чтения' }); }
   }
   for (const { file, kind } of cc.paths().filter(p => p.kind !== 'permissions')) {
     try {
       const s = d.snapshot(file), servers = kind === 'codex' ? cc.block(s.text).parsed.root.mcp_servers : s.config.mcpServers;
-      for (const n of ['team', kind === 'codex' ? 'antigravity' : 'codex', 'grok']) entries.push({ name: kind + '/' + n, arg: servers?.[n]?.args?.[0] });
+      for (const n of require('./members').servers) entries.push({ name: kind + '/' + n, arg: servers?.[n]?.args?.[0] });
     } catch { entries.push({ name: kind, error: 'не подключён или ошибка чтения' }); }
   }
   const release = e => e.arg && /[\\/]live[\\/]([a-f0-9]{40})[\\/]servers[\\/]/.exec(e.arg)?.[1];
@@ -63,13 +66,13 @@ function settings() {
   if (main && entries.every(e => release(e) === main)) return 'Все подключения → ' + main.slice(0, 8);
   return 'Расхождения подключений: ' + entries.filter(e => !main || release(e) !== main).map(e => e.name + ' → ' + (release(e)?.slice(0, 8) || e.error || 'не подключён')).join('; ');
 }
-async function compact(team, quota) {
+async function compact(team, quota, snapshot = require('./job-snapshot').create()) {
   const rows = [], jobs = {}, stores = require('./team-store');
   const section = async fn => { try { await fn(); } catch (e) { rows.push('Ошибка: ' + e.message); } };
   rows.push(quota);
   await section(() => rows.push(...require('./release-drift').lines(team.root, require('./paths').stateDir)));
-  for (const who of ['codex', 'antigravity', 'grok']) await section(async () => {
-    const result = stores.list(who); jobs[who] = result.jobs;
+  for (const who of require('./members').helpers) await section(async () => {
+    const result = stores.list(who, true, snapshot); jobs[who] = result.jobs;
     rows.push(...result.errors.map(e => 'Ошибка чтения: ' + e));
     const waiting = result.jobs.filter(j => !j.archived && j.status === 'waiting_quota');
     if (waiting.length) {
@@ -79,12 +82,12 @@ async function compact(team, quota) {
     }
     for (const j of result.jobs.filter(j => !j.archived && (j.stopUnconfirmed || ['running', 'queued', 'needs_decision', 'cancelling', 'cancel_requested', 'stop_unconfirmed', 'delivery_unclear', 'migration_conflict'].includes(j.status)))) {
       let status = j.status;
-      if (who !== 'grok' && ['running', 'cancelling', 'stop_unconfirmed'].includes(status) && await require('./locks').ownerState(j.owner) === 'dead') status = who === 'codex' && j.write ? 'needs_decision' : 'lost';
+      if (who !== 'grok' && ['running', 'cancelling', 'stop_unconfirmed'].includes(status) && await snapshot.ownerState(j.owner) === 'dead') status = who === 'codex' && j.write ? 'needs_decision' : 'lost';
       rows.push(who + ' ' + j.id.slice(0, 8) + ': ' + require('./states')[status] + (j.stopUnconfirmed ? ' · ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА' : '') + (j.nextAttemptAt ? ' до ' + j.nextAttemptAt : ''));
     }
   });
   rows.push(loadLine(team.state, jobs));
-  rows.push('Рутина за сутки (этап «рутина»): ' + ['codex', 'antigravity', 'grok'].map(who => who + ' — ' +
+  rows.push('Рутина за сутки (этап «рутина»): ' + require('./members').helpers.map(who => who + ' — ' +
     (jobs[who] || []).filter(j => Date.parse(j.startedAt) > Date.now() - 86400000 && /^рутина(?:$|\s*[:—-])/i.test(j.stage || '')).length).join('; '));
   await section(() => {
     const works = team.works(), done = works.filter(w => !w.error && (w.closed || w.stages.every(s => s.state === 'принят')));
@@ -111,7 +114,7 @@ async function compact(team, quota) {
       if (c.requestMark && !seen.has(c.requestMark)) {
         seen.add(c.requestMark); rows.push('Запрос ' + c.requestMark + ': ' + short(c.request, 200) + ' · полный текст: ' + c.card);
       }
-      rows.push(short(changeTitle(c), 65) + ': ' + c.status + ' ' + (c.candidate || '').slice(0, 8) + '; Grok: ' + grokText(c));
+      rows.push(short(changeTitle(c), 65) + ': ' + c.status + ' ' + (c.candidate || '').slice(0, 8));
     }
   });
   await section(() => {

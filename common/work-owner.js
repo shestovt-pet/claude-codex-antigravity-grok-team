@@ -1,6 +1,6 @@
 'use strict';
 const fs = require('fs'), path = require('path');
-const { repoRoot } = require('./paths');
+const { repoRoot, samePath } = require('./paths');
 const { inside, name, atomic } = require('./team-git');
 const workLock = new (require('async_hooks').AsyncLocalStorage)();
 
@@ -26,7 +26,7 @@ function touch(workName, owner, root = repoRoot) {
 async function withWork(args, action, root = repoRoot) {
   if (!args.work) return action();
   const held = workLock.getStore();
-  if (held?.active && held.root === root) { touch(args.work, args.owner, root); return action(); }
+  if (held?.active && samePath(held.root, root)) { touch(args.work, args.owner, root); return action(); }
   return require('./deploy').locked(root, async () => {
     touch(args.work, args.owner, root);
     const lease = { root, active: true };
@@ -36,6 +36,7 @@ async function withWork(args, action, root = repoRoot) {
 }
 
 function reminder(root = repoRoot, now = Date.now(), scope = require('./request-context').context.getStore() || {}) {
+  if (!scope.owner) return '';
   const dir = path.join(root, 'works');
   const overdue = [];
   if (!fs.existsSync(dir)) return '';
@@ -43,6 +44,7 @@ function reminder(root = repoRoot, now = Date.now(), scope = require('./request-
     if (!/^[a-z0-9-]{1,40}\.json$/.test(entry)) continue;
     try {
       const w = JSON.parse(fs.readFileSync(inside(root, 'works', entry), 'utf8'));
+      if (w.closed === true) continue; // team-v28 Р2: закрытая работа напоминаний не даёт.
       if (scope.owner && w.owner !== scope.owner) continue;
       if (scope.work && (w.name || entry.slice(0, -5)) !== scope.work) continue;
       if (!w.stages?.some(s => s.state !== 'принят')) continue;
@@ -81,7 +83,7 @@ async function reconcileJobs(workName) {
 
 function hasLiveJobs(workName) {
   const stores = require('./team-store');
-  for (const who of ['codex', 'antigravity', 'grok']) {
+  for (const who of require('./members').helpers) {
     const { jobs, errors } = stores.list(who, false);
     if (errors.length) throw Error('Нельзя проверить поручения работы: ' + errors.join('; '));
     if (jobs.some(j => (j.workName || j.work) === workName &&

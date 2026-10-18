@@ -93,15 +93,19 @@ register(
     next_step: z.string().optional(),
     plan_change: z.string().optional().describe('Пояснение изменения плана.'),
     reminders: z.array(z.string().min(1)).max(3).optional().describe('Идентификаторы напоминаний Claude.'),
+    continue_stage: z.object({ id: z.string().min(1), author: z.object({ family: z.enum(['openai', 'google', 'xai']), model: z.string().min(1) }),
+      material: z.array(z.string()).optional() }).optional().describe('Запасной режим: этап-продолжение этапа Claude из снимка (rules/fallback.md).'),
   },
   (a) => team.work(a),
 );
 register(
   'team_change',
   'Изменение инструментария',
-  'Команда четырёх: обязательные голоса Codex и Antigravity, решение Claude, совещательный Grok; выпуск и откат.',
+  'Связка трёх: обязательные голоса Codex и Antigravity, решение Claude; fast — малая правка с карточкой note; выпуск и откат.',
   {
-    action: z.enum(['start', 'design', 'diff', 'precheck', 'commit', 'verdict', 'merge', 'deploy', 'rollback', 'close', 'list', 'cleanup']),
+    action: z.enum(['start', 'design', 'diff', 'precheck', 'commit', 'verdict', 'merge', 'deploy', 'rollback', 'close', 'list', 'cleanup', 'grok_slot']),
+    slot: z.enum(['codex', 'antigravity']).optional().describe('grok_slot: место выпавшего обязательного участника.'),
+    phase: z.enum(['design', 'verdict']).optional().describe('grok_slot: замысел (design) или пара база→кандидат (verdict).'),
     apply: z.boolean().optional().describe('Уборка: удалить по-настоящему; без него — сухой прогон.'),
     cleanup: z.boolean().optional().describe('Установка: уборка после установки; по умолчанию да.'),
     fingerprint: z.string().optional().describe('Отпечаток кандидата из прогона тестов; commit откажет при несовпадении.'),
@@ -111,8 +115,9 @@ register(
     owner: z.string().trim().min(1).optional().describe('Метка сеанса владельца.'),
     work: z.string().optional().describe('Связанная работа.'),
     request: z.string().min(20).optional().describe('Исходный запрос пользователя; обязателен для start.'),
-    design_file: z.string().optional().describe('Абсолютный путь замысла; обязателен для start.'),
-    note: z.string().optional().describe('Пояснение по фактам.'),
+    fast: z.boolean().default(false).describe('start: малая правка с карточкой note вместо замысла; границу проверяет сервер.'),
+      design_file: z.string().optional().describe('Абсолютный путь замысла; обязателен для обычного start.'),
+    note: z.string().optional().describe('Для start fast=true: симптом; что меняется; затронутые места; тест до/после; откат. Повтор start обновляет карточку и аннулирует принятия.'),
     restart_claude: z.boolean().default(false).describe('Перезапустить Claude после развёртывания.'),
     message: z.string().optional().describe('Сообщение коммита.'),
     from_char: z.number().int().nonnegative().default(0),
@@ -127,11 +132,23 @@ register(
       .optional(),
     job_id: z.string().optional(),
     decision: z.enum(['ПРИНЯТО', 'НЕ ПРИНЯТО', 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ']).optional(),
-    replaces: z.enum(['claude', 'codex', 'antigravity']).optional(),
+    replaces: z.enum(['claude', 'codex', 'antigravity']).optional().describe('Чьё место: замена Claude после двух отказов, решение пользователя (только история) или Grok на месте выпавшего (по grok_slot).'),
     quote: z.string().optional(),
     commit: z.string().optional().describe('Принятый коммит или main.'),
   },
   (a) => team.change(a),
+);
+register(
+  'team_word',
+  'Слово пользователя',
+  'Записать дословно слово пользователя «X отвалился» или показать записи. Слово о помощнике — чат Claude; слово о Claude — чат Codex или Antigravity (запасной режим, rules/fallback.md); правок и удалений нет.',
+  {
+    action: z.enum(['record', 'list', 'return', 'handover', 'rebind']),
+    who_down: z.enum(['codex', 'antigravity', 'grok', 'claude']).optional().describe('Кого пользователь назвал выпавшим.'),
+    quote: z.string().optional().describe('Реплика пользователя дословно.'),
+    owner: z.string().optional().describe('Метка сеанса дирижёра запасного режима (fallback-codex-<4 буквы>).'),
+  },
+  (a) => team.word(a),
 );
 if (require.main === module)
   require('../../common/state-migration').start(require('../../common/paths'))

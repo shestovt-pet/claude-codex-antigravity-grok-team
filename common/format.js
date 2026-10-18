@@ -35,7 +35,10 @@ function format(assistant, job = {}, body = '', next = 'Проверьте ре�
       ? 'Этап: ' + (job.stageTitle || job.stage) + ' (работа ' + require('./summary').workTitle(job.workName || (typeof job.work === 'string' ? job.work : '—')) + ')'
       : '',
     job.id ? 'Номер поручения: ' + job.id : '',
-    job.from ? 'Отправитель: ' + job.from : '',
+    job.from ? 'Отправитель: ' + job.from + (job.fromChat ? ' (чат)' : '') : '',
+    assistant === 'Codex' && job.id ? 'запрошено: модель ' + (job.model || 'unknown') + ', уровень ' + (job.effort || 'unknown') + '; подтверждено: модель unknown, уровень unknown' : '',
+    assistant === 'Codex' && job.fullAccessApplied === true
+      ? 'Доступ: полный (от имени пользователя, без песочницы); изменения вне папки поручения в список изменённых файлов не попадают' : '',
     !summary ? require('./provenance').format(job, ({ Antigravity: 'antigravity', Codex: 'codex', Grok: 'grok' })[assistant] || 'unknown') : '',
     require('./progress').progress(job),
     body,

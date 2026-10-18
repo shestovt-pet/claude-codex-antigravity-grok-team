@@ -1,6 +1,8 @@
 'use strict';
 // Состояние переживает ожидающий MCP-вызов и перезапуск Claude.
 const fs = require('fs'), path = require('path'), { randomUUID } = require('crypto');
+const { samePath } = require('./paths');
+const { realOrGiven, releasePolicy } = require('./path-compat');
 const { atomic } = require('./team-git');
 const WAIT_MS = 300000, terminal = ['завершено', 'перезапуск не запущен', 'перезапуск не подтверждён', 'откат', 'отказ', 'прервана'];
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -13,6 +15,7 @@ function alive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'ESRCH' ? false : null; }
 }
 function list(root, deps = {}) {
+  root = realOrGiven(root);
   const dir = path.join(root, 'state/deploy-ops');
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).filter(n => n.endsWith('.json')).map(n => {
@@ -27,8 +30,9 @@ function list(root, deps = {}) {
   }).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 function assertIdle(root, resultFile, dryRun = false) {
+  root = realOrGiven(root);
   const pending = list(root, { reconcile: !dryRun }).find(op => !terminal.includes(op.status) &&
-    (!resultFile || path.resolve(resultFile) !== path.resolve(root, 'state/deploy-ops', op.id + '.json')));
+    (!resultFile || !samePath(resultFile, path.join(root, 'state/deploy-ops', op.id + '.json'))));
   if (pending) throw Error('Идёт установка ' + pending.id);
 }
 const quote = s => "'" + String(s).replace(/'/g, "''") + "'";
@@ -47,14 +51,18 @@ function launch(release, args) {
     }));
 }
 async function start({ root, release, configs, restartClaude, cleanup = true }, deps = {}) {
+  root = realOrGiven(root);
+  release = realOrGiven(release);
+  const policy = releasePolicy(root, release);
   const lock = await require('./locks').tryLock('deploy_operation', root, {}, path.join(root, 'state'));
   if (!lock.ok) throw Error('Идёт создание операции установки.');
   let file, id;
   try {
     const pending = list(root, deps).find(op => !terminal.includes(op.status));
     if (pending) throw Error('Идёт установка ' + pending.id);
-    id = randomUUID(); file = path.join(root, 'state/deploy-ops', id + '.json');
-    atomic(file, JSON.stringify({ id, root, release, status: 'запущена', ...(cleanup === false ? { noCleanup: true } : {}), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
+    id = randomUUID(); file = path.join(policy.root, 'state/deploy-ops', id + '.json');
+    // reason успешный старый execute сохраняет; старый team.js показывает его и после restart.
+    atomic(file, JSON.stringify({ id, root: policy.root, release, status: 'запущена', ...(cleanup === false || policy.oldCode ? { noCleanup: true } : {}), ...(policy.oldCode ? { oldCode: true, reason: oldCodeLine } : {}), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
     const args = ['--config-only', '--release', release, '--result', file, ...configs.flatMap(f => ['--config', f]), ...(restartClaude ? ['--restart-claude'] : [])];
     try {
       const pid = await (deps.launch || launch)(release, args);
@@ -68,7 +76,7 @@ async function start({ root, release, configs, restartClaude, cleanup = true }, 
     const op = list(root, deps).find(op => op.id === id);
     if (terminal.includes(op.status)) {
       if (op.status !== 'завершено') throw Error('Установка ' + id + ': ' + op.status + ' · ' + (op.reason || ''));
-      return 'Установка ' + id + ': завершено. ' + (op.message || '') + (op.restart ? '\n' + op.restart : '') + (op.cleanup ? '\n' + cleanupLine(op.cleanup) : '');
+      return 'Установка ' + id + ': завершено. ' + (op.message || '') + (op.oldCode ? '\n' + oldCodeLine : '') + (op.restart ? '\n' + op.restart : '') + (op.cleanup ? '\n' + cleanupLine(op.cleanup) : '');
     }
     await sleep(250);
   } while (now() < deadline);
@@ -103,13 +111,14 @@ async function execute(options, action, deps = {}) {
     throw e;
   }
 }
+const oldCodeLine = 'уборка отключена: релиз старого кода (до team-v21). После возврата на любой релиз старого кода (без common/path-compat.js) не запускать team_change cleanup.';
 // Строка уборки после установки (team-v10 Р5); у старых операций поля нет — и строки нет.
 function cleanupLine(c, now = Date.now()) {
   if (!c) return '';
   if (c.state === 'отключена') return 'уборка: отключена';
   if (c.state === 'идёт') return now - Date.parse(c.started) > 1800000 ? 'уборка: прервана' : 'уборка: идёт';
   if (c.state === 'ошибка') return 'уборка: ошибка: ' + c.reason;
-  if (c.state === 'готово') return 'уборка: удалено ' + c.removed + ', не удалено ' + c.failed + (c.blocked?.length ? ' · релизы не удалялись: ' + c.blocked.join('; ') : '');
+  if (c.state === 'готово') return 'уборка: удалено ' + c.removed + ', не удалено ' + c.failed + (c.blocked?.length ? ' · релизы не удалялись: ' + c.blocked.join('; ') : '') + (c.uncheckedHiddenProcesses ? ' · не проверено процессов со скрытыми сведениями: ' + c.uncheckedHiddenProcesses : '');
   return 'уборка: состояние неизвестно';
 }
-module.exports = { WAIT_MS, terminal, list, start, execute, update, launch, alive, assertIdle, cleanupLine };
+module.exports = { WAIT_MS, terminal, list, start, execute, update, launch, alive, assertIdle, cleanupLine, oldCodeLine };

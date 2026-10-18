@@ -2,31 +2,20 @@
 // Извлечено из моста 0.2.0: владение каналом ОС, а не проверка одного PID.
 const fs = require('fs'),
   net = require('net'),
-  os = require('os'),
   path = require('path'),
   crypto = require('crypto');
 const { stateDir: STATE_DIR } = require('./paths');
+const { lockNames, channel } = require('./path-compat');
 const isWindows = process.platform === 'win32',
   isLinux = process.platform === 'linux';
 const INSTANCE = crypto.randomUUID(),
   STARTED_AT = new Date().toISOString(),
   PROBE_TIMEOUT_MS = 2000;
-const sha = (s) => crypto.createHash('sha256').update(s).digest('hex'),
-  nowIso = () => new Date().toISOString(),
+const nowIso = () => new Date().toISOString(),
   errText = (e) => String(e.message || e),
   sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function pipeName(kind, key, state = STATE_DIR) {
-  // Одна папка не должна получить два замка из-за разных --state-dir.
-  const scope = kind === 'team_repo' ? 'team_repo' : state;
-  const h = sha(scope + '|' + kind + '|' + key).slice(0, 32);
-  if (isWindows) return '\\\\.\\pipe\\most-' + h;
-  if (isLinux) return '\0most-' + h;
-  return path.join(os.tmpdir(), 'most-' + h + '.sock');
-}
-
-function lockInfoPath(kind, key, state = STATE_DIR) {
-  return path.join(state, 'locks', kind + '-' + sha(state + '|' + kind + '|' + key).slice(0, 20) + '.json');
-}
+// Прежняя формула доступна для совместимых клиентов; захват всегда через lockNames.
+function pipeName(kind, key, state = STATE_DIR) { return channel(kind, key, state); }
 
 // Спросить владельца канала, кто он. alive — ответил; hung — канал есть, но ответа нет; none — канала нет.
 function probe(name) {
@@ -64,6 +53,8 @@ function probe(name) {
 function listenPipe(name, infoFn) {
   return new Promise((resolve) => {
     const srv = net.createServer((sock) => {
+      // Клиент пробы может закрыть канал до ответа; EPIPE приходит событием, вне try/catch.
+      sock.on('error', () => sock.destroy());
       try {
         sock.end(JSON.stringify(infoFn()));
       } catch (e) {
@@ -83,52 +74,40 @@ function listenPipe(name, infoFn) {
 }
 // Захват замка. Занят — { ok:false, busy:true, owner, state: alive|hung }.
 async function tryLock(kind, key, info, state = STATE_DIR) {
-  fs.mkdirSync(path.join(state, 'locks'), { recursive: true });
-  const name = pipeName(kind, key, state);
+  const names = lockNames(kind, key, state), held = [];
   const owner = Object.assign({ kind, instance: INSTANCE, pid: process.pid, since: nowIso() }, info || {});
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const r = await listenPipe(name, () => owner);
-    if (r.ok) {
+  const release = async () => {
+    for (const { entry, srv } of held.splice(0).reverse()) {
+      await new Promise(res => { try { srv.close(res); } catch { res(); } });
       try {
-        fs.writeFileSync(lockInfoPath(kind, key, state), JSON.stringify(owner));
-      } catch (e) {}
-      return {
-        ok: true,
-        owner,
-        release: () =>
-          new Promise((res) => {
-            try {
-              r.srv.close(() => res());
-            } catch (e) {
-              res();
-            }
-            try {
-              const p = lockInfoPath(kind, key, state);
-              const cur = JSON.parse(fs.readFileSync(p, 'utf8'));
-              if (cur.instance === INSTANCE && cur.since === owner.since)
-                if (!process.env.MOST_TEST_KEEP) fs.unlinkSync(p);
-            } catch (e) {}
-          }),
-      };
+        const cur = JSON.parse(fs.readFileSync(entry.infoPath, 'utf8'));
+        if (cur.instance === INSTANCE && cur.since === owner.since && !process.env.MOST_TEST_KEEP) fs.unlinkSync(entry.infoPath);
+      } catch {}
     }
-    if (r.code !== 'EADDRINUSE') return { ok: false, error: r.error };
-    const p = await probe(name);
-    if (p.state === 'alive') return { ok: false, busy: true, owner: p.info || {}, state: 'alive' };
-    if (p.state === 'hung') {
-      let last = null;
-      try {
-        last = JSON.parse(fs.readFileSync(lockInfoPath(kind, key, state), 'utf8'));
-      } catch (e) {}
-      return { ok: false, busy: true, owner: last || {}, state: 'hung' };
+  };
+  for (const entry of names) {
+    let r;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      r = await listenPipe(entry.name, () => owner);
+      if (r.ok) break;
+      if (r.code !== 'EADDRINUSE') { await release(); return { ok: false, error: r.error }; }
+      const p = await probe(entry.name);
+      if (p.state !== 'none') {
+        let last;
+        try { last = JSON.parse(fs.readFileSync(entry.infoPath, 'utf8')); } catch {}
+        await release();
+        return { ok: false, busy: true, owner: p.info || last || {}, state: p.state };
+      }
+      if (!isWindows && !isLinux) { try { fs.unlinkSync(entry.name); } catch {} }
     }
-    // канала уже нет (гонка) или остался файл сокета (не Windows/Linux) — пробуем ещё раз
-    if (!isWindows && !isLinux) {
-      try {
-        fs.unlinkSync(name);
-      } catch (e) {}
-    }
+    if (!r.ok) { await release(); return { ok: false, busy: true, error: 'не удалось захватить замок' }; }
+    held.push({ entry, srv: r.srv });
+    try {
+      fs.mkdirSync(path.dirname(entry.infoPath), { recursive: true });
+      fs.writeFileSync(entry.infoPath, JSON.stringify(owner));
+    } catch (e) { await release(); return { ok: false, error: errText(e) }; }
   }
-  return { ok: false, error: 'не удалось захватить замок' };
+  return { ok: true, owner, names: names.map(n => n.name), release };
 }
 
 async function waitLock(kind, key, info, waitMs) {
@@ -140,28 +119,35 @@ async function waitLock(kind, key, info, waitMs) {
   }
 }
 
-async function ownerState(owner) {
+function ownerReply(owner, p) {
+  if (p.state === 'none') return 'dead';
+  if (p.state !== 'alive' || !p.info || p.info.instance !== owner.instance ||
+      (owner.pid && !p.info.pid) || (owner.startedAt && !p.info.startedAt)) return 'unknown';
+  if ((owner.pid && p.info.pid !== owner.pid) || (owner.startedAt && owner.startedAt !== p.info.startedAt)) return 'dead';
+  return 'alive';
+}
+async function probeOwner(owner, state = STATE_DIR) {
+  const replies = await Promise.all(lockNames('instance', owner.instance, state).map(n => probe(n.name)));
+  const live = replies.find(p => ownerReply(owner, p) === 'alive');
+  return live || { state: replies.some(p => ownerReply(owner, p) === 'unknown') ? 'hung' : 'none' };
+}
+async function ownerState(owner, state = STATE_DIR) {
   if (!owner || !owner.instance) return 'unknown';
   if (owner.instance === INSTANCE) return 'self';
-  const p = await probe(pipeName('instance', owner.instance));
-  if (p.state === 'alive') {
-    if (!p.info || p.info.instance !== owner.instance) return 'unknown';
-    if (owner.pid && !p.info.pid) return 'unknown';
-    if (owner.pid && p.info.pid !== owner.pid) return 'dead';
-    if (owner.startedAt && p.info.startedAt && owner.startedAt !== p.info.startedAt) return 'dead';
-    return 'alive';
-  }
-  if (p.state === 'none') return 'dead';
-  return 'unknown';
+  const p = await probeOwner(owner, state);
+  return p.state === 'alive' ? 'alive' : p.state === 'none' ? 'dead' : 'unknown';
 }
-
-async function startOwner(info = {}) {
-  return listenPipe(pipeName('instance', INSTANCE), () => ({
-    ...info,
-    instance: INSTANCE,
-    pid: process.pid,
-    startedAt: STARTED_AT,
-  }));
+async function startOwner(info = {}, state = STATE_DIR) {
+  const held = [];
+  const close = cb => {
+    Promise.all(held.splice(0).map(srv => new Promise(res => { try { srv.close(res); } catch { res(); } }))).then(() => cb?.());
+  };
+  for (const entry of lockNames('instance', INSTANCE, state)) {
+    const r = await listenPipe(entry.name, () => ({ ...(typeof info === 'function' ? info() : info), instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT }));
+    if (!r.ok) { await new Promise(close); return r; }
+    held.push(r.srv);
+  }
+  return { ok: true, srv: { close }, release: () => new Promise(close) };
 }
 
 function owner() {
@@ -174,6 +160,9 @@ module.exports = {
   startOwner,
   ownerState,
   pipeName,
+  lockNames,
+  probeOwner,
+  ownerReply,
   probe,
   listenPipe,
   tryLock,

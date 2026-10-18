@@ -118,7 +118,7 @@ async function migrate(options = {}) {
   const state = options.state || options.stateDir;
   const env = options.env || process.env;
   if ((env.MOST_CLIENT || 'claude') !== 'claude' || env.MOST_PROBE_ONLY === '1') return;
-  if (path.resolve(state).toLowerCase() !== path.resolve(root, 'state').toLowerCase()) return;
+  if (!require('./paths').samePath(state, path.join(root, 'state'))) return;
   fs.mkdirSync(state, { recursive: true });
   const locks = require('./locks');
   let lock;

@@ -38,7 +38,7 @@ function run() {
     mcpAlive: false,
   };
 
-  // 1) rules propose while Claude offline → orchestrator=grok, offline includes claude
+  // 1) rules propose while Claude offline → orchestrator=antigravity, offline includes claude
   const p1 = roles.propose({
     worksRoot,
     fallbackDir,
@@ -48,7 +48,7 @@ function run() {
     detect: fakeDetectOffline,
   });
   assert(p1.status === 'proposed', 'status proposed');
-  assert(p1.slots.orchestrator === 'grok', 'orch=grok when offline');
+  assert(p1.slots.orchestrator === 'antigravity', 'orch=antigravity when offline');
   assert(p1.slots.offline.includes('claude'), 'claude offline');
   assert(p1.slots.coder === 'codex', 'coder=codex');
   assert(p1.slots.judge === 'user', 'judge=user');
@@ -144,7 +144,7 @@ function run() {
     ok: true,
     tmp,
     checks: [
-      'propose-offline-grok',
+      'propose-offline-antigravity',
       'self-review-reject',
       'claude-orch-offline-reject',
       'confirm',

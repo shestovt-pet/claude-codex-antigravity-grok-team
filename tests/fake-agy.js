@@ -31,7 +31,7 @@ const val = (name) => { const d = has(name); return d ? d.slice(name.length + 1)
 function out(obj) { process.stdout.write(JSON.stringify(obj) + "\n"); }
 
 (async () => {
-  if(process.env.FAKE_AGY_LOG) fs.appendFileSync(process.env.FAKE_AGY_LOG,JSON.stringify({cwd:process.cwd(),prompt,model:arg('--model')})+'\n');
+  if(process.env.FAKE_AGY_LOG) fs.appendFileSync(process.env.FAKE_AGY_LOG,JSON.stringify({cwd:process.cwd(),prompt,model:arg('--model'),env:{MOST_JOB_ID:process.env.MOST_JOB_ID||null,MOST_CLIENT:process.env.MOST_CLIENT||null,MOST_AUTHORITY:process.env.MOST_AUTHORITY||null}})+'\n');
   if(has('quota')) return out({status:'ERROR',error:{message:'RESOURCE_EXHAUSTED quota exceeded'}});
   if(has('transient')) return out({status:'ERROR',error:{message:'HTTP 429 Too many requests'}});
   if (has("pidfile")) fs.writeFileSync(val("pidfile"), String(process.pid));

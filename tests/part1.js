@@ -99,6 +99,28 @@ async function test(name, fn) {
 }
 (async () => {
   console.log('Дополнительные тесты: ' + process.platform + ' ' + process.version + '; ' + RUN);
+  await test('Канал замка: разрыв клиента при ответе не завершает сервер', async () => {
+    const net = require('net'), { EventEmitter } = require('events');
+    const createServer = net.createServer;
+    let accept, destroyed = false;
+    // Отдельно доставляем асинхронное событие после возврата обработчика соединения.
+    net.createServer = fn => {
+      accept = fn;
+      const server = new EventEmitter();
+      server.listen = (name, ready) => ready(); server.unref = () => {};
+      return server;
+    };
+    try {
+      assert((await locks.listenPipe('test-disconnected-client', () => ({ pid: 1 }))).ok);
+      const socket = new EventEmitter();
+      socket.end = () => {}; socket.destroy = () => { destroyed = true; };
+      accept(socket);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.doesNotThrow(() => socket.emit('error', Object.assign(Error('write EPIPE'), { code: 'EPIPE' })));
+      assert(destroyed, 'закрывается только оборванное соединение');
+      ok(true, 'EPIPE обработан');
+    } finally { net.createServer = createServer; }
+  });
   await test('Codex: защита обработчиков и уборка временной записи', async () => {
     const { guarded } = require('../common/cards');
     const original = console.error,

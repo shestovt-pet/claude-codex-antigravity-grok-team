@@ -101,15 +101,15 @@ test('Р1: отпечаток кандидата видит новые файл�
 });
 test('Р1/Р2: правила прогона, самопроверки и уборки', () => {
   const text = f => fs.readFileSync(path.join(ROOT, f), 'utf8');
-  assert.match(text('rules/grok.md'), /## Полный прогон тестов по поручению \(team-v9\)/);
-  assert.match(text('rules/grok.md'), /node tools\/fingerprint\.js[\s\S]*node tests\/run\.js[\s\S]*оба отпечатка/);
-  assert.match(text('rules/grok.md'), /Это вывод прогона, а не собственные записи Grok/);
-  assert.match(text('rules/roles.md'), /полный прогон тестов Windows в клоне изменения/);
-  assert.match(text('rules/roles.md'), /Когда пишет код, гоняет только свои новые и затронутые наборы; полный прогон тестов Windows делает Grok/);
+  assert.match(text('rules/grok.md'), /Grok выключен из связки/);
+  assert.match(text('rules/grok.md'), /Grok выключен из связки/);
+  assert.match(text('rules/grok.md'), /Grok выключен из связки/);
+  assert.match(text('rules/roles.md'), /полный прогон тестов Windows делает Codex/);
+  assert.match(text('rules/roles.md'), /Когда пишет код, гоняет только свои новые и затронутые наборы; полный прогон тестов Windows делает Codex/);
   const claude = text('rules/claude.md');
-  for (const re of [/team_change precheck name/, /commit fingerprint=<отпечаток после>/, /ПОЛНЫЙ sha256 замысла/, /team_change cleanup owner=<метка>/, /оставляет там `index\.lock` и временные объекты/])
+  for (const re of [/team_change precheck name/, /До кандидата запускаются затронутые наборы/, /ПОЛНЫЙ sha256 замысла/, /team_change cleanup owner=<метка>/, /оставляет там `index\.lock` и временные объекты/])
     assert.match(claude, re);
-  assert.match(text('rules/brief.md'), /`precheck` \(самопроверка\) → полный прогон тестов — Grok, отпечаток → `commit fingerprint=…`/);
+  assert.match(text('rules/brief.md'), /`precheck` \(самопроверка\) → затронутые тесты — Codex, отпечаток → `commit fingerprint=…`/);
   assert.match(text('tests/run.js'), /'team-v8\.js', 'team-v9\.js'/);
   assert.match(text('tests/run.js'), /'windows-test-output-' \+ path\.basename\(path\.resolve\(__dirname, '\.\.'\)\)/);
 });
@@ -137,8 +137,8 @@ function cleanupFixture(name) {
   write(path.join(root, 'README.md'), 'x'); write(path.join(root, 'tests/.tmp-v6-tracked.ps1'), 'x'); git(root, ['add', '-f', 'tests/.tmp-v6-tracked.ps1']);
   write(path.join(root, '.gitignore'), 'tests/.tmp-*\n.work/\nlive/\n'); let main = commit(root, 'main');
   const live = path.join(root, 'live'), work = path.join(root, '.work'), temp = path.join(base, 'temp'), changes = path.join(base, 'changes');
-  const rel = {}; for (const k of ['cur', 'prev', 'cfg', 'bak', 'proc', 'exe', 'free']) { rel[k] = path.join(live, (k + '0'.repeat(40)).replace(/[^0-9a-f]/g, 'a').slice(0, 40)); fs.mkdirSync(path.join(rel[k], 'servers/team'), { recursive: true }); }
-  rel.stale = path.join(live, '.stale-free-1'); fs.mkdirSync(rel.stale);
+  const rel = {}; for (const k of ['cur', 'prev', 'cfg', 'bak', 'proc', 'exe', 'free']) { rel[k] = path.join(live, (k + '0'.repeat(40)).replace(/[^0-9a-f]/g, 'a').slice(0, 40)); write(path.join(rel[k], 'servers/team/index.js'), ''); write(path.join(rel[k], 'node.exe'), ''); }
+  rel.stale = path.join(live, '.stale-free-1'); fs.mkdirSync(rel.stale); write(path.join(rel.stale, 'x.js'), '');
   json(path.join(live, 'deployed.json'), { commit: path.basename(rel.cur) });
   write(path.join(live, '.archive-old.tar'), 'x'); fs.utimesSync(path.join(live, '.archive-old.tar'), OLD, OLD);
   write(path.join(live, '.archive-new.tar'), 'x');
@@ -232,7 +232,7 @@ test('Р4: недоступная командная строка, относи�
     assert(exists(f.rel.free) && exists(f.rel.stale), label);
     assert(r.plan.blocked.length, label);
     assert.match(cl.cleanupText(r), /Релизы не удаляются: /, label);
-    assert(!exists(f.clones.merged), label + ': клоны и временные папки проверяются отдельно');
+    assert(exists(f.clones.merged), label + ': team-v21 — непроверенные процессы защищают и клоны');
   }
 });
 test('Р4: путь процесса с точками узнаётся; повторная проверка — перед каждым удалением', () => {

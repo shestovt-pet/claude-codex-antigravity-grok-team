@@ -82,25 +82,25 @@ test('Р3 случаи 7, 20–24: самопроверка называет н�
     grokDesign: { job_id: 'g', designHash: old, decision: 'ПРИНЯТО' } };
   const s8 = d.slice(0, 8);
   assert.deepEqual(pc.designVoteWarnings(c), [
-    'Codex не голосовал по замыслу ' + s8 + ': commit откажет — отправьте ему эту редакцию',
-    'Grok не запрошен по замыслу ' + s8 + ': merge откажет — отправьте ему эту редакцию']);
+    'Codex не голосовал по замыслу ' + s8 + ': commit откажет — отправьте ему эту редакцию']);
   c.designVotes.push({ who: 'codex', decision: 'НЕ ПРИНЯТО', designHash: d });
   c.grokDesign = { job_id: 'g2', designHash: d, status: 'running' };
-  assert.deepEqual(pc.designVoteWarnings(c), ['Codex: по замыслу ' + s8 + ' — НЕ ПРИНЯТО; commit откажет', 'Grok: ждём ответ по замыслу ' + s8 + ' (g2)']);
-  c.designVotes.push({ who: 'user', replaces: 'codex', decision: 'ПРИНЯТО', designHash: d });
+  assert.deepEqual(pc.designVoteWarnings(c), ['Codex: по замыслу ' + s8 + ' — НЕ ПРИНЯТО; commit откажет']);
+  // team-v18: место закрывает замена Claude после двух отказов, а не запись пользователя.
+  c.designVotes.push({ who: 'claude', replaces: 'codex', decision: 'ПРИНЯТО', designHash: d });
   c.grokDesign = { job_id: 'g3abcdefgh', designHash: d, status: 'done', decision: 'НЕ ПРИНЯТО' };
-  assert.deepEqual(pc.designVoteWarnings(c), ['Grok: НЕ ПРИНЯТО по замыслу ' + s8 + ' — merge потребует абзац с «Где закрыто:» или «Отклонено:» для g3abcdef']);
+  assert.deepEqual(pc.designVoteWarnings(c), []);
   c.grokDesign = { job_id: 'g5abcdefgh', designHash: d, status: 'failed' };
-  assert.deepEqual(pc.designVoteWarnings(c), ['Grok: отказ поручения по замыслу ' + s8 + ' — merge потребует абзац с «Отклонено:» или «Grok недоступен:» для g5abcdef']);
+  assert.deepEqual(pc.designVoteWarnings(c), []);
   c.grokDesign = { status: 'недоступен', designHash: d };
-  assert.match(pc.designVoteWarnings(c)[0], /Grok недоступен по замыслу .*«Grok недоступен x:»/);
+  assert.deepEqual(pc.designVoteWarnings(c), []);
   c.grokDesign = { job_id: 'g4', designHash: d, status: 'done', decision: 'ПРИНЯТО' };
   assert.deepEqual(pc.designVoteWarnings(c), []);
   // Файл замысла изменён без вызова design: хеш из файла, карточка не сохраняется, все голоса по прежнему хешу — устаревшие.
   write(file, 'замысел, редакция 2');
   const w = pc.designVoteWarnings(c);
   assert.match(w[0], new RegExp('файл замысла изменён после записи: [0-9a-f]{8} вместо ' + s8));
-  assert.equal(w.length, 4); assert.equal(c.designHash, d, 'карточка не изменена');
+  assert.equal(w.length, 3); assert.equal(c.designHash, d, 'карточка не изменена');
   write(file, 'замысел');
   assert.deepEqual(pc.designVoteWarnings({ ...c, designFile: path.join(RUN, 'нет.md') }), [pc.designVoteWarnings({ ...c, designFile: path.join(RUN, 'нет.md') })[0]]);
   assert.match(pc.designVoteWarnings({ ...c, designFile: path.join(RUN, 'нет.md') })[0], /файл замысла не прочитан .* голоса по замыслу не проверены/);
@@ -183,9 +183,9 @@ test('Р6 случай 11: обновление публичной копии �
 
 test('Р5–Р6: правила, README и порядок публикации', () => {
   const t = (f) => read(path.join(ROOT, f)).replace(/\s+/g, ' ');
-  assert.match(t('rules/claude.md'), /## Подтверждения Grok Bot и публикация \(team-v12\)/);
-  assert.match(t('rules/claude.md'), /Срок подтверждения истек/); assert.match(t('rules/claude.md'), /каждую редакцию отправляй всем троим/);
-  assert.match(t('README.md'), /Всегда разрешать/); assert.match(t('README.md'), /docs\/publish\.md/);
+  assert.match(t('rules/claude.md'), /## Публикация[^#]*только по docs\/publish\.md/);
+  assert.match(t('rules/claude.md'), /## Публикация[^#]*только по docs\/publish\.md/);
+  assert.match(t('README.md'), /Grok выключен/); assert.match(t('README.md'), /docs\/publish\.md/);
   const p = t('docs/publish.md');
   for (const re of [/## Первая публикация/, /## Обновление опубликованной копии/, /git clone --no-checkout/, /без `--force`/, /users\.noreply\.github\.com/,
     /только после этого/i, /state\\public-export\.json/, /2e8a6260/, /git read-tree HEAD/, /git add -A -f \./, /один в один/, /Отклонён/]) assert.match(p, re);

@@ -1,13 +1,14 @@
 'use strict';
 // Снимок содержит материал и автора; журнал решений привязан к снимку, но не входит в его хеш.
 const cw = () => require('./consilium-workflow');
-const seats = { codex: 'openai', antigravity: 'google', grok: 'xai' };
+const seats = require('./members').seats;
 function need(ok, why) { if (!ok) throw Object.assign(Error(why), { workflowCode: 2 }); }
 function author(s) {
   const a = s.author;
-  need(a && ['anthropic', 'openai', 'google', 'xai'].includes(a.family) && a.model?.trim(), 'Нужна семья и модель автора этапа.');
+  const authors = Array.isArray(a) ? a.flatMap(p => p.authors || [p]) : a?.authors || [a];
+  need(authors.length && authors.every(a => a && ['anthropic', 'openai', 'google', 'xai'].includes(a.family) && a.model?.trim()), 'Нужна семья и модель автора этапа.');
   need(!s.level || ['обычный', 'высокий'].includes(s.level), 'Неизвестный уровень этапа консилиума.');
-  return a.family;
+  return [...new Set(authors.map(a => a.family))];
 }
 const sent = j => Date.parse(j.startedAt || j.createdAt || j.created_at);
 function ordered(rows, ready = false) {
@@ -20,7 +21,7 @@ function ordered(rows, ready = false) {
   });
 }
 async function check({ ctx, w, s, snapshot, adapter, usedJobs, files }) {
-  const api = cw(), family = author(s), candidates = Object.values(seats).filter(f => f !== family);
+  const api = cw(), families = author(s), family = families.includes('anthropic') ? 'anthropic' : families[0], candidates = Object.values(seats).filter(f => !families.includes(f));
   const observed = [], votes = [], opinions = [];
   for (const who of api.QUORUM) for (const card of await adapter.list(who)) {
     const text = api.taskText(card);
@@ -43,13 +44,14 @@ async function check({ ctx, w, s, snapshot, adapter, usedJobs, files }) {
     const last = ordered(observed.filter(j => j.who === who && api.matches(api.taskText(j), w.work_id, s.id, snapshot))).at(-1);
     return last ? [{ participant: who, job_id: last.id, status: last.status }] : [];
   });
-  for (const ref of s.reviews) {
+  for (const ref of s.reviews.filter(r => r.participant !== 'grok')) {
     need(ref.source === 'bridge', 'Версия 2 принимает голоса только из хранилища моста.');
     need(ref.job_id && !usedJobs.has(ref.job_id), 'Повтор/отсутствие job_id.'); usedJobs.add(ref.job_id);
     const v = current.find(v => v.id === ref.job_id && v.who === ref.participant);
     need(v && v.task_sha256 === ref.task_sha256 && v.response_sha256 === ref.response_sha256, 'Нет действующего голоса или не совпадает хеш: ' + ref.job_id);
   }
-  const journal = s.decisions || [];
+  const historical = new Set(s.reviews.filter(r => r.participant === 'grok').map(r => r.job_id));
+  const journal = (s.decisions || []).filter(d => d.replacement !== 'grok' && !historical.has(d.job_id));
   need(Array.isArray(journal), 'Журнал решений должен быть массивом.');
   const dismissals = journal.filter(d => d.kind === 'dismiss' && d.version === snapshot);
   for (const d of journal) {
@@ -74,25 +76,36 @@ async function check({ ctx, w, s, snapshot, adapter, usedJobs, files }) {
   const replacementDecisions = new Map();
   for (const d of journal.filter(d => d.kind === 'replace' && d.version === snapshot)) replacementDecisions.set(d.replacement, d);
   for (const d of replacementDecisions.values()) {
-    need(family !== 'anthropic' && seats[d.replacement] && candidates.includes(seats[d.replacement]), 'Помощник не занимает место при этом авторе.');
-    need(d.family === 'anthropic' && d.model?.trim(), 'Журнал замены требует семью anthropic и модель помощника.');
+    need(family !== 'anthropic' && candidates.length === 1 && seats[d.replacement] && candidates.includes(seats[d.replacement]), 'Помощник не занимает место при этом авторе.');
+    need(d.family === 'anthropic' && /sonnet/i.test(d.model || ''), 'Журнал замены требует семью anthropic и модель помощника.');
     const last = ordered(observed.filter(j => j.who === d.replacement && api.matches(api.taskText(j), w.work_id, s.id, snapshot))).at(-1);
     if (last?.status === 'done' && eligible.some(v => v.id === last.id)) {
       opinions.push('заменённый проверяющий вернулся: ' + d.replacement);
       continue;
     }
-    need(last && last.id === d.evidence && !last.cancelled && !last.cancel_requested && !last.lateHash &&
-      ['lost', 'failed', 'waiting_quota'].includes(last.status), 'Нет недоступности последнего поручения.');
-    if (last.status === 'waiting_quota') need(last.retryKind === 'quota' && Number.isFinite(Date.parse(last.lastQuotaAt)) && Date.parse(last.nextAttemptAt) > Date.now(), 'Нет подтверждённой нехватки квоты.');
-    for (const rejection of dismissals.filter(d => current.some(v => v.id === d.job_id && v.who === last.who)))
-      need(sent(last) > Date.parse(rejection.at) && api.taskText(last).includes(rejection.job_id) && api.taskText(last).includes(rejection.reason), 'Нужно недоступное поручение на пересмотр с причиной.');
+    const word = /^word-/.test(d.evidence || '');
+    if (word) {
+      // team-v18 К5: действующее на момент решения слово пользователя — доказательство недоступности наравне с поручением;
+      // поручение на пересмотр после отклонения оно не заменяет.
+      const words = require('./user-word'), record = words.byId(d.evidence);
+      need(!dismissals.some(x => current.some(v => v.id === x.job_id && v.who === d.replacement)), 'Нужно недоступное поручение на пересмотр с причиной.');
+      need(record && record.who_down === d.replacement && words.holds(record, Date.parse(d.at)), 'Нет действующего слова пользователя о недоступности ' + d.replacement + '.');
+      // team-v19 К4 (в): слово, записанное дирижёром его семьи-автора, недоступность не доказывает.
+      need(!record.source || record.source === 'chat-claude' || require('./fallback').FAMILY[record.recorded_by] !== family, 'Слово записал дирижёр семьи автора: нужно доказательство поручением.');
+    } else {
+      need(last && last.id === d.evidence && !last.cancelled && !last.cancel_requested && !last.lateHash &&
+        ['lost', 'failed', 'waiting_quota'].includes(last.status), 'Нет недоступности последнего поручения.');
+      if (last.status === 'waiting_quota') need(last.retryKind === 'quota' && Number.isFinite(Date.parse(last.lastQuotaAt)) && Date.parse(last.nextAttemptAt) > Date.now(), 'Нет подтверждённой нехватки квоты.');
+      for (const rejection of dismissals.filter(d => current.some(v => v.id === d.job_id && v.who === last.who)))
+        need(sent(last) > Date.parse(rejection.at) && api.taskText(last).includes(rejection.job_id) && api.taskText(last).includes(rejection.reason), 'Нужно недоступное поручение на пересмотр с причиной.');
+    }
     const ref = typeof d.file === 'string' ? { path: d.file } : d.file;
     const file = await api.readFile(ctx, ref, api.LIMITS.text, true);
     need(api.marker(file.text, 'snapshot_sha256') === snapshot && api.marker(file.text, 'family') === 'anthropic' &&
       api.marker(file.text, 'model') === d.model && api.marker(file.text, 'replacement') === d.replacement && api.marker(file.text, 'evidence') === d.evidence,
     'Файл помощника: нужны хеш, семья anthropic, модель, замена и доказательство.');
-    helperRows.push({ who: d.replacement, family: d.family, model: d.model, hash: file.sha256, accepted: api.verdict(file.text) });
-    opinions.push('замена ' + d.replacement + ' помощником anthropic; сервер происхождение файла не проверял');
+    helperRows.push({ who: d.replacement, family: d.family, model: d.model, hash: file.sha256, accepted: api.verdict(file.text), ...(word ? { word_id: d.evidence } : {}) });
+    opinions.push('замена ' + d.replacement + ' помощником anthropic' + (word ? ' по слову пользователя ' + d.evidence : '') + '; сервер происхождение файла не проверял');
   }
   need(helperRows.length <= 1, 'Помощник занимает только одно обязательное место.');
   const blockers = [];
@@ -101,7 +114,7 @@ async function check({ ctx, w, s, snapshot, adapter, usedJobs, files }) {
     const accepted = eligible.some(n => n.who === v.who && n.accepted && Date.parse(n.finishedAt) > Date.parse(v.finishedAt) &&
       (!d || (sent(n) > Date.parse(d.at) && api.taskText(n).includes(v.id) && api.taskText(n).includes(d.reason))));
     if (accepted) continue;
-    if (d && family === 'anthropic') opinions.push('особое мнение: отклонено с причиной ' + v.who + ': ' + d.reason);
+    if (d && family === 'anthropic' && !require('./user-word').mode(Date.parse(d.at)).active) opinions.push('особое мнение: отклонено с причиной ' + v.who + ': ' + d.reason);
     else if (!(d && helperRows.some(h => h.who === v.who && h.accepted))) blockers.push(v.who + (d ? ': отклонено, ждёт пересмотра' : ': открыто'));
   }
   const active = new Map(); for (const v of eligible) active.set(v.provenance.family, v);
@@ -112,14 +125,14 @@ async function check({ ctx, w, s, snapshot, adapter, usedJobs, files }) {
     need(Array.isArray(s.fresh_reviews) && s.fresh_reviews.length, 'Высокий риск требует дополнительного помощника.');
     const extra = await api.readFile(ctx, s.fresh_reviews.at(-1), api.LIMITS.text, true);
     need(!helperRows.some(h => h.hash === extra.sha256), 'Один файл помощника нельзя засчитать дважды.');
-    need(api.marker(extra.text, 'snapshot_sha256') === snapshot && api.marker(extra.text, 'family') === 'anthropic' && api.marker(extra.text, 'model'), 'Нет семьи, модели или снимка дополнительного помощника.');
+    need(api.marker(extra.text, 'snapshot_sha256') === snapshot && api.marker(extra.text, 'family') === 'anthropic' && /sonnet/i.test(api.marker(extra.text, 'model') || ''), 'Нет семьи, модели или снимка дополнительного помощника.');
     if (!api.verdict(extra.text)) blockers.push('дополнительный помощник');
   }
   for (const old of votes.filter(v => v.snapshot !== snapshot && !v.accepted && candidates.includes(v.provenance.family)))
     if (!eligible.some(v => v.who === old.who && v.accepted) && (family === 'anthropic' || helperRows.some(h => h.who === old.who && h.accepted)))
       opinions.push('особое мнение: исправлено без подтверждения ' + old.who + ', ' + old.id);
   need(!blockers.length, 'Есть НЕ ПРИНЯТО: ' + blockers.join('; '));
-  need(approvals.size >= 2, 'Нужны два ПРИНЯТО разных семей, отличных от автора.');
+  need(candidates.length > 0 && approvals.size >= candidates.length, 'Нужны ПРИНЯТО всех внешних семей, отличных от автора.');
   return { stage: s.id, snapshot_sha256: snapshot, votes: receiptVotes(), replacements: helperRows, availability, opinions };
 }
 module.exports = { author, check };

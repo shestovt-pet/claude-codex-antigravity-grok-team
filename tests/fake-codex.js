@@ -32,7 +32,8 @@ if (args[0] === 'app-server') {
       resume = args.includes('resume');
     const thread = resume ? args[args.length - 2] : '12345678-' + require('crypto').randomUUID().slice(9);
     if (process.env.FAKE_CODEX_LOG)
-      fs.appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify({ args, cwd: process.cwd(), prompt }) + '\n');
+      fs.appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify({ args, cwd: process.cwd(), prompt,
+        env: { MOST_JOB_ID: process.env.MOST_JOB_ID || null, MOST_CLIENT: process.env.MOST_CLIENT || null, MOST_AUTHORITY: process.env.MOST_AUTHORITY || null } }) + '\n');
     out({ type: 'thread.started', thread_id: thread });
     if (prompt.includes('HANG')) {
       setInterval(() => {}, 1000);
@@ -60,6 +61,8 @@ if (args[0] === 'app-server') {
         : resume
           ? 'ПРОДОЛЖЕНО ' + thread
           : 'ПРИНЯТО';
+    // team-v19: поручение с записью — «ЗАПИШИ ФАЙЛ <имя>» пишет файл в папке поручения.
+    for (const m of prompt.matchAll(/ЗАПИШИ ФАЙЛ (\S+)/g)) fs.writeFileSync(path.join(process.cwd(), m[1]), 'Codex написал ' + m[1] + '\n');
     fs.writeFileSync(result, text);
     out({ type: 'item.completed', item: { type: 'agent_message', text } });
     out({ type: 'turn.completed' });

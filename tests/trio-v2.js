@@ -185,6 +185,8 @@ test('E1: гостевые списки инструментов, очередь
   const {StdioClientTransport}=require('@modelcontextprotocol/sdk/client/stdio.js');
   for (const who of ['codex','antigravity']) {
     const state=path.join(RUN,'queue-'+who), folder=path.join(RUN,'project-'+who);fs.mkdirSync(folder);
+    // team-v19 (Codex 7a3bd85b п. 1): поручения гостя — только при прочитанной записи основного сервера; Claude Desktop запускался раньше.
+    write(path.join(state,'ready','team.json'),JSON.stringify({release:path.resolve(__dirname,'..'),pid:2147483000,startedAt:new Date(Date.now()-3600000).toISOString()}));
     const env={...process.env,MOST_REPO_ROOT:root,MOST_STATE_DIR:state,MOST_CODEX_JOBS_DIR:path.join(state,'codex-jobs'),MOST_JOURNAL:path.join(state,'agy.log'),MOST_INPUT_DIR:path.join(state,'input'),AGY_PATH:path.join(__dirname,'fake-agy.js'),MOST_TEST_KEEP:'1',MOST_QUEUE_TICK_MS:'50'};
     const clients=[];
     async function connect(server,client) {
@@ -193,7 +195,7 @@ test('E1: гостевые списки инструментов, очередь
     }
     try {
       const guest=await connect(who,who==='codex'?'antigravity':'codex');
-      const listed=(await guest.listTools()).tools.map(t=>t.name);assert.deepEqual(listed.sort(),[who+'_send',who+'_status',who+'_result'].sort());
+      const listed=(await guest.listTools()).tools.map(t=>t.name);assert.deepEqual(listed.sort(),[who+'_send',who+'_status',who+'_result',...(who==='antigravity'?['antigravity_apply']:[])].sort());
       const forbidden=await guest.callTool({name:who+'_cancel',arguments:{id:'none'}});assert(forbidden.isError);
       if(who==='codex')assert((await guest.callTool({name:'codex_send',arguments:{folder,task:'Проверка',write:true}})).isError);
       const out=await guest.callTool({name:who+'_send',arguments:{folder,task:'[[FAKE:accept]] Проверка',role:'совет',stage:'Этап',work:'work',owner:'test-owner',...(who==='antigravity'?{mode:'text'}:{write:'false'})}});
@@ -213,7 +215,7 @@ test('E1: гостевые списки инструментов, очередь
       }
       assert.equal(read(path.join(state,'ready',who+'.json')).release,path.resolve(__dirname,'..'));
       const result=await guest.callTool({name:who+'_result',arguments:{id}});assert.match(result.content[0].text,/Принято 100 %/);
-      const team=await connect('team','codex');const teamTools=(await team.listTools()).tools;assert.deepEqual(teamTools.map(t=>t.name).sort(),['team_rules','team_status','team_work']);
+      const team=await connect('team','codex');const teamTools=(await team.listTools()).tools;assert.deepEqual(teamTools.map(t=>t.name).sort(),['team_rules','team_status','team_word','team_work']);
       assert(teamTools.find(t=>t.name==='team_work').inputSchema.properties.stages.items.properties.closes);
       assert((await team.callTool({name:'team_status',arguments:{notify_test:true}})).isError);
       assert((await team.callTool({name:'team_work',arguments:{owner: 'test-owner', action: 'create',name:'no'}})).isError);
@@ -233,7 +235,7 @@ test('E3: TOML сохраняет посторонние байты, повто�
 test('E3: JSON, резервная копия, откат, компенсация',async()=>{
   const file=path.join(RUN,'mcp.json');process.env.MOST_AGY_MCP_CONFIG=file;json(file,{foreign:{secret:'KEEP'},mcpServers:{other:{command:'keep'}}});
   const s={...d.snapshot(file),kind:'agy'}, plans=cc.plans([s],root,root,RUN,process.execPath);
-  await d.switchConfigs(plans); assert.equal(read(file).foreign.secret,'KEEP');assert.equal(read(file).mcpServers.team.env.MOST_CLIENT,'antigravity'); assert(!read(file).mcpServers.antigravity);
+  await d.switchConfigs(plans); assert.equal(read(file).foreign.secret,'KEEP');assert.equal(read(file).mcpServers.team.env.MOST_CLIENT,'antigravity'); assert.equal(read(file).mcpServers.antigravity.env.MOST_CLIENT,'antigravity'); // team-v19 К2: сервер своей семьи — гостем
   await d.rollback({root,configs:[file]}); assert.deepEqual(read(file),s.config);
   const a=path.join(RUN,'a.json'),b=path.join(RUN,'b.json');json(a,{});json(b,{});
   await assert.rejects(d.switchConfigs([a,b].map(file=>({...d.snapshot(file),next:'{"x":1}',backup:true})),async label=>{if(label==='config2')throw Error('сбой')}));assert.deepEqual(read(a),{});
@@ -245,9 +247,9 @@ test('E3–E4: deploy обновляет три приложения; повто
   process.env.MOST_CODEX_CONFIG=codex;process.env.MOST_AGY_MCP_CONFIG=agy;process.env.MOST_AGY_CONFIG=permissions;process.env.MOST_CLAUDE_CONFIGS=JSON.stringify([claude]);
   write(codex,'# чужие байты\r\nmodel = "keep"\r\n');json(agy,{foreign:123});json(permissions,{userSettings:{globalPermissionGrants:{allow:['keep']}}});json(claude,{foreign:456});
   const before=[codex,agy,permissions,claude].map(f=>fs.readFileSync(f,'utf8')), calls=[];
-  const deps={archive:async(root,commit,temp)=>{for(const n of ['team','codex','antigravity','grok'])write(path.join(temp,'servers',n,'index.js'),'// подделка');},install:async()=>{},probe:async(file,env)=>{calls.push(env.MOST_CLIENT);return {tools:(env.MOST_CLIENT==='claude'?[]:path.basename(path.dirname(file))==='team'?['team_status','team_rules','team_work']:['status','send','result'].map(n=>path.basename(path.dirname(file))+'_'+n)).map(name=>({name}))};}};
+  const deps={archive:async(root,commit,temp)=>{for(const n of ['team','codex','antigravity'])write(path.join(temp,'servers',n,'index.js'),'// подделка');write(path.join(temp,'common','access.js'),fs.readFileSync(path.join(__dirname,'..','common','access.js')));/* team-v28 Р1 */},install:async()=>{},probe:async(file,env)=>{calls.push(env.MOST_CLIENT);return {tools:(env.MOST_CLIENT==='claude'?[]:require('../common/access').guestTools(path.basename(path.dirname(file)),env.MOST_CLIENT)).map(name=>({name}))};}};
   try {
-    await d.deploy({root,stateDir:path.join(RUN,'deploy-state')},deps);assert.equal(calls.length,10);
+    await d.deploy({root,stateDir:path.join(RUN,'deploy-state')},deps);assert.equal(calls.length,9);
     const after=[codex,agy,permissions,claude].map(f=>fs.readFileSync(f,'utf8'));assert(after[0].startsWith(before[0]));
     assert.equal(read(agy).foreign,123);assert.equal(read(claude).foreign,456);assert.equal(read(claude).mcpServers.team.env.MOST_STATE_DIR,read(agy).mcpServers.team.env.MOST_STATE_DIR);
     assert.equal(read(claude).mcpServers.team.env.MOST_STATE_DIR,path.join(root,'state'));
@@ -262,7 +264,7 @@ test('E3–E4: deploy обновляет три приложения; повто
 test('F1–F3: готовность, сценарий всех серверов и подтверждение запуска',async()=>{
   require('../common/access').ready('team'); assert.equal(read(path.join(process.env.MOST_STATE_DIR,'ready/team.json')).pid,process.pid);
   const restart=require('../common/restart'); const text=restart.script({runId:'test',log:'log',release:root,state:RUN});
-  for(const part of ["@('team', 'codex', 'antigravity', 'grok')",'startedAt','AddSeconds(300)','CloseMainWindow','Start-Sleep -Seconds 8','if (-not (Get-Process']) assert(text.includes(part));
+  for(const part of ["@('team', 'codex', 'antigravity')",'startedAt','AddSeconds(300)','CloseMainWindow','Start-Sleep -Seconds 8','if (-not (Get-Process']) assert(text.includes(part));
   const out=await restart.restart({root,release:root,state:RUN},{launch:async(file,{log,runId})=>write(log,'запущен '+runId+'\n')});assert.match(out,/Перезапуск Claude запланирован/);
   await assert.rejects(restart.restart({root,release:root,state:RUN},{waitMs:30,launch:async(file,{log})=>write(log,'запущен старый-запуск\n')}),/не подтверждён/);
   assert.match(restart.launchCommand('C:\\x.ps1'),/-ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\\x\.ps1"/);

@@ -16,40 +16,48 @@ function read(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function list(who, includeArchive = true) {
-  const r = roots(),
-    result = [],
-    errors = [];
-  for (const [dir, archived] of [[r[who], false], ...(who === 'codex' && includeArchive && r.archive ? [[r.archive, true]] : [])]) {
-    if (!fs.existsSync(dir)) continue;
-    for (const name of fs.readdirSync(dir)) {
-      if (name.includes('.conflict-') || name.startsWith('.')) continue;
-      let file = path.join(dir, name);
-      try {
-        const bundle = who === 'antigravity' || fs.statSync(file).isDirectory();
-        file = bundle ? path.join(dir, name, 'card.json') : file;
-        if (!bundle && !name.endsWith('.json')) continue;
-        if (!bundle && fs.existsSync(path.join(dir, name.slice(0, -5), 'card.json'))) continue;
-        if (!fs.existsSync(file)) continue;
-        if (!isInsideReal(file, dir)) throw Error('Карточка вне хранилища.');
-        const j = read(file);
-        result.push({ ...j, archived, cardFile: file });
-      } catch (e) {
-        // Карточка могла исчезнуть после перечисления; это не сбой её чтения.
-        if (e.code !== 'ENOENT') errors.push(file + ': ' + e.message);
+// Сканирование сохраняет ошибки действующего хранилища и архива отдельно.
+function scan(who, includeArchive = true) {
+  const r = roots();
+  return [[r[who], false], ...(who === 'codex' && includeArchive && r.archive ? [[r.archive, true]] : [])].map(([dir, archived]) => {
+    const jobs = [], errors = [];
+    try {
+      if (fs.existsSync(dir)) for (const name of fs.readdirSync(dir)) {
+        if (name.includes('.conflict-') || name.startsWith('.')) continue;
+        let file = path.join(dir, name);
+        try {
+          const bundle = who === 'antigravity' || fs.statSync(file).isDirectory();
+          file = bundle ? path.join(dir, name, 'card.json') : file;
+          if (!bundle && !name.endsWith('.json')) continue;
+          if (!bundle && fs.existsSync(path.join(dir, name.slice(0, -5), 'card.json'))) continue;
+          if (!fs.existsSync(file)) continue;
+          if (!isInsideReal(file, dir)) throw Error('Карточка вне хранилища.');
+          jobs.push({ ...read(file), archived, cardFile: file });
+        } catch (e) {
+          // Карточка могла исчезнуть после перечисления; это не сбой её чтения.
+          if (e.code !== 'ENOENT') errors.push(file + ': ' + e.message);
+        }
       }
-    }
-  }
-  return { jobs: result, errors };
+      return { archived, jobs, errors };
+    } catch (error) { return { archived, jobs, errors, error }; }
+  });
+}
+function listing(entries, includeArchive = true) {
+  const selected = entries.filter(e => includeArchive || !e.archived);
+  for (const e of selected) if (e.error) throw e.error;
+  return { jobs: selected.flatMap(e => e.jobs), errors: selected.flatMap(e => e.errors) };
+}
+function list(who, includeArchive = true, snapshot) {
+  return snapshot ? snapshot.list(who, includeArchive) : listing(scan(who, includeArchive));
 }
 
-function review(who, id, base, candidate, decision = 'ПРИНЯТО', requestMark, designHash, workReview = false) {
+function review(who, id, base, candidate, decision = 'ПРИНЯТО', requestMark, designHash, workReview = false, snapshot) {
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id || '')) throw Error('Некорректный номер ревью.');
   if (fs.existsSync(path.join(path.dirname(roots()[who]), 'quarantine', id, 'card.json')))
     throw Error('ПЕРЕНОС: ПОВРЕЖДЁН — задание находится в карантине.');
-  const listed = list(who, false);
+  const listed = list(who, false, snapshot);
   if (listed.errors.length) throw Object.assign(Error(id + ': нельзя прочитать поручения: ' + listed.errors.join('; ')), { code: 'STAGE_READ_FAILED' });
-  const j = listed.jobs.find((j) => j.id === id);
+  const j = snapshot ? snapshot.get(who, id) : listed.jobs.find((j) => j.id === id);
   if (!j || j.status !== 'done' || j.archived)
     throw Error('Нужно завершённое задание ревью из действующего хранилища.');
   if (who === 'codex' && (j.write || j.previous) && (!workReview || j.role !== 'совет'))
@@ -103,10 +111,10 @@ function resultPath(job, dir = roots().codex) {
   return path.join(base, filename);
 }
 // Проверка источника текста не требует вердикта, но использует те же сохранённые байты и хеши.
-function source(who, id) {
-  const listed = list(who, false);
+function source(who, id, snapshot) {
+  const listed = list(who, false, snapshot);
   if (listed.errors.length) throw Object.assign(Error(id + ': нельзя прочитать источник: ' + listed.errors.join('; ')), { code: 'STAGE_READ_FAILED' });
-  const j = listed.jobs.find(j => j.id === id);
+  const j = snapshot ? snapshot.get(who, id) : listed.jobs.find(j => j.id === id);
   if (!j || !['done', 'applied'].includes(j.status) || j.cancelled || j.lateHash) throw Error(id + ': нет принятого сервером результата текста.');
   const dir = roots()[who];
   const file = who === 'antigravity' ? path.join(path.dirname(j.cardFile), 'result.txt') : who === 'grok' ? path.join(dir, id + '.result.txt') : resultPath(j, dir);
@@ -118,4 +126,4 @@ function source(who, id) {
     throw Error(id + ': хеш результата текста не совпадает.');
   return text;
 }
-module.exports = { list, review, roots, resultPath, source };
+module.exports = { scan, listing, list, review, roots, resultPath, source };

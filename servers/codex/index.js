@@ -42,12 +42,20 @@ function findCli() {
       .readdirSync(root)
       .map((n) => path.join(root, n, 'codex.exe'))
       .filter((p) => fs.existsSync(p))
-      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0] || null; // пустой bin — null, как и без bin
   } catch {
     return null;
   }
 }
-const binary = findCli();
+// team-v28 Р4: приложение Codex при обновлении переезжает в новую папку bin\<хеш>; запомненный путь проверяется
+// перед каждым использованием, иначе поручения падали с ENOENT до перезапуска Claude.
+// Пропавший путь ищется сразу; если Codex не найден вовсе — не чаще раза в минуту (очередь опрашивает часто).
+let cachedBinary = findCli(), searchedAt = Date.now();
+function currentBinary() {
+  if (cachedBinary && fs.existsSync(cachedBinary)) return cachedBinary;
+  if (cachedBinary || Date.now() - searchedAt >= 60000) { searchedAt = Date.now(); cachedBinary = findCli(); }
+  return cachedBinary;
+}
 function file(id) {
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw Error('Некорректный номер поручения.');
   const bundle = path.join(dir, id, 'card.json');
@@ -143,7 +151,7 @@ function reply(j, body, next = 'Проверьте результат.', error =
 
 function view(j, offset = 0) {
   let body = j.error || '';
-  if (j.status === 'queued') body = access.queued;
+  if (j.status === 'queued') body = access.queued + (j.fallbackHold ? '. Ждёт: ' + j.fallbackHold : '');
   if (j.archived) {
     body = 'Архивное поручение (только чтение).\n' + body;
     if (['running', 'interrupted'].includes(j.status)) j = { ...j, status: 'lost' };
@@ -169,6 +177,52 @@ function view(j, offset = 0) {
           ? 'Дождитесь квоты или отмените поручение.'
           : 'Проверьте результат.',
   );
+}
+
+function fullAccessAllowed(card) {
+  return card.fullAccess === true && card.write === true && ['текст', 'совет'].includes(card.role) &&
+    card.from === 'claude' && !card.fallbackWord && !Object.hasOwn(card, 'fromChat');
+}
+
+function fullAccessFolderRefusal(folder) {
+  const paths = require('../../common/paths');
+  if (!path.isAbsolute(folder) || !fs.statSync(folder).isDirectory())
+    return 'Нужна абсолютная существующая папка.';
+  if ([paths.repoRoot, path.resolve(__dirname, '../..')].some(root => paths.isSameOrInsideReal(folder, root) || paths.isSameOrInsideReal(root, folder)))
+    return 'Полный доступ запрещён в папке связки, её рабочей копии или релиза, а также в содержащей их папке.';
+  return null;
+}
+
+function chatFolderRefusal(folder) {
+  const refusal = fullAccessFolderRefusal(folder);
+  return refusal && refusal.replace('Полный доступ запрещён', 'Запись из чата Codex запрещена');
+}
+
+function chatCardRefusal(card) {
+  if (!Object.hasOwn(card, 'fromChat')) return null;
+  if (card.fromChat !== 'codex' || card.from !== 'codex' || card.fullAccess === true)
+    return 'Карточка чата Codex отклонена: противоречивые поля fromChat, from или fullAccess.';
+  return card.write ? chatFolderRefusal(card.folder) : null;
+}
+
+function ownChatJob(card, a = {}) {
+  if (!access.guest() || access.client() !== 'codex') return;
+  // Codex c9116d5d: подтверждённый дирижёр активного запасного режима сохраняет прежние права (О9) — любые поручения.
+  if (require('../../common/fallback').session(a)?.active) return;
+  if (card.from !== 'codex' || card.fromChat !== 'codex')
+    throw Error('Чат Codex может продолжать и отменять только свои поручения.');
+}
+
+function fullAccessRefusal(a) {
+  if (!a.full_access) return null;
+  if (access.guest()) return 'Гостю полный доступ Codex запрещён; изменения не выполнены.';
+  if (a.write !== true) return 'Полный доступ требует write=true.';
+  if (!['текст', 'совет'].includes(a.role)) return 'Для полного доступа явно укажите роль «текст» или «совет»; проверка остаётся в песочнице.';
+  return fullAccessFolderRefusal(a.folder);
+}
+
+function sandboxMode(job) {
+  return fullAccessAllowed(job) ? 'danger-full-access' : job.write ? 'workspace-write' : 'read-only';
 }
 
 async function execute(job, folderLock) {
@@ -210,8 +264,16 @@ async function execute(job, folderLock) {
       const f = classifyCodex({ type: 'error', error: { message: error || errors } });
       if (f.kind !== 'none') failure = f;
     }
+    let writes = [];
+    if (job.write) { try { writes = require('../../common/fallback').folderChanges(job.folder, writesBefore); } catch { writes = null; } }
     try {
       await mutate(job.id, (c) => {
+        if (!writes) { c.writes = null; c.writesUnknown = 'список записанных файлов не составлен'; }
+        else if (c.writes !== null) {
+          const byPath = new Map((Array.isArray(c.writes) ? c.writes : []).map(e => [e.path, e]));
+          for (const e of writes) byPath.set(e.path, e);
+          c.writes = [...byPath.values()];
+        }
         c.threadId = job.threadId;
         c.provenance = provenance.forJob(job, 'codex');
         c.finishedAt = new Date().toISOString();
@@ -255,21 +317,58 @@ async function execute(job, folderLock) {
       return;
     }
   }
-  const args = ['-a', 'never', '-s', job.write ? 'workspace-write' : 'read-only', 'exec'];
+  const args = ['-a', 'never', '-s', sandboxMode(job), 'exec'];
   if (job.threadId) args.push('resume');
   else args.push('--cd', job.folder, '--color', 'never');
+  if (job.model !== undefined) args.push('-m', job.model);
+  if (job.effort !== undefined) args.push('-c', 'model_reasoning_effort="' + job.effort + '"');
   job.resultFile = path.join(path.dirname(file(job.id)),
     job.id + '.attempt-' + (job.quotaAttempts || 0) + '.result.txt');
   args.push('--skip-git-repo-check', '--json', '--output-last-message', job.resultFile);
   if (job.threadId) args.push(job.threadId);
   args.push('-');
+  // team-v19 (Grok cfb0705b Б2): поручение с записью оставляет в карточке список изменённых файлов папки с sha256 —
+  // состояние до и после, под замком codex_folder; без записи список пуст.
+  const writesBefore = job.write ? require('../../common/fallback').folderState(job.folder) : null;
+  // Повторный realpath после замков и снимка файлов, непосредственно перед запуском.
+  // Это отдельный выход: исполнитель ещё ничего не выполнял.
+  try {
+    job.fullAccessApplied = false;
+    const chatRefusal = chatCardRefusal(job);
+    if (chatRefusal) throw Error(chatRefusal);
+    if (job.fromChat && job.fallbackWord) {
+      const hold = require('../../common/fallback').queueHold(job);
+      if (hold) throw Error(hold);
+    }
+    if (fullAccessAllowed(job)) {
+      const refusal = fullAccessFolderRefusal(job.folder);
+      if (refusal) throw Error(refusal);
+    } else if (Object.hasOwn(job, 'fullAccess') && job.fullAccess !== false) {
+      console.error('Codex: полный доступ карточки отклонён (значение, запись, роль или происхождение); запуск в песочнице.');
+    }
+  } catch (e) {
+    try {
+      await mutate(job.id, c => {
+        c.status = 'failed'; c.error = e.message; c.fullAccessApplied = false;
+        c.finishedAt = new Date().toISOString();
+      });
+    } finally {
+      await execution.release();
+      if (sessionLock?.ok) await sessionLock.release();
+      if (folderLock) await folderLock.release();
+    }
+    return;
+  }
+  job.fullAccessApplied = sandboxMode(job) === 'danger-full-access';
   try {
     await mutate(job.id, (c) => {
+      c.fullAccessApplied = job.fullAccessApplied;
       c.resultFile = job.resultFile;
     });
-    const c = command(binary, args);
+    const c = command(currentBinary(), args);
     child = spawn(c.bin, c.args, {
       cwd: job.folder,
+      env: require('../../common/fallback').jobEnv(job.id),
       windowsHide: true,
       detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -323,7 +422,9 @@ async function execute(job, folderLock) {
     child.stdin.end(
       [
         'Это отдельное поручение пользователя через Claude. Не считай, что знаешь другие чаты.',
-        job.write
+        job.fullAccessApplied
+          ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; не изменяй файлы связки (E:\\most, C:\\most, E:\\test-most); удаления запрещены; каждое действие вне папки поручения перечисли в отчёте.'
+          : job.write
           ? 'Изменения разрешены только в рамках поручения. Перечисли файлы и проверки.'
           : 'Только чтение. Не изменяй файлы.',
         'Не обходи ограничения. Отвечай по-русски.',
@@ -345,6 +446,7 @@ async function stop(id, reason = 'cancel') {
     await mutate(id, (c) => {
       if (!['running', 'cancelling', 'stop_unconfirmed'].includes(c.status)) return false;
       c.status = 'cancelling';
+      c.cancellingAt ||= new Date().toISOString();
       c.stopReason = reason;
       requested = true;
     });
@@ -387,13 +489,19 @@ async function stop(id, reason = 'cancel') {
 
 async function send(a) {
   access.guard('codex', 'codex_send', a);
+  const refusal = fullAccessRefusal(a);
+  if (refusal) throw Error(refusal);
   const support = require('../../common/brief-support');
   const extra = support.text(support.support(a.folder, a.opora));
   if (extra) a.text = (a.text || '') + extra;
-  if (!binary && !access.guest()) throw Error('Исполнитель Codex не найден. Укажите CODEX_PATH.');
+  if (!currentBinary() && !access.guest()) throw Error('Исполнитель Codex не найден. Укажите CODEX_PATH.');
   if (closing) throw Error('Сервер останавливается.');
   if (!path.isAbsolute(a.folder) || !fs.statSync(a.folder).isDirectory())
     throw Error('Нужна абсолютная существующая папка.');
+  if (access.guest() && access.client() === 'codex' && a.write) {
+    const refusal = chatFolderRefusal(a.folder);
+    if (refusal) throw Error(refusal);
+  }
   if (a.work && !a.stage) throw Error('Для работы укажите этап.');
   const folder = fs.realpathSync(a.folder),
     id = randomUUID();
@@ -405,6 +513,7 @@ async function send(a) {
       priorLock = await locks.tryLock('codex_queue', a.continue_id, { jobId: id });
       if (!priorLock.ok) throw Error('Предыдущее поручение возобновляется.');
       prior = await normalized(a.continue_id);
+      ownChatJob(prior, a);
       if (
         prior.archived ||
         !['done', 'waiting_quota', 'failed', 'needs_decision'].includes(prior.status) ||
@@ -412,8 +521,9 @@ async function send(a) {
         prior.stopUnconfirmed
       )
         throw Error('Продолжение недоступно: нужен сеанс с threadId и подтверждённой остановкой.');
-      if (canon(prior.folder) !== canon(folder) || prior.write !== a.write)
-        throw Error('Сохраните папку и режим записи предыдущего поручения.');
+      if (canon(prior.folder) !== canon(folder) || prior.write !== a.write ||
+        (prior.fullAccessApplied === true) !== (a.full_access === true))
+        throw Error('Сохраните папку, режим записи и доступ предыдущего поручения.');
     }
     if (a.write) {
       folderLock = await locks.tryLock('codex_folder', canon(folder), { jobId: id });
@@ -428,18 +538,28 @@ async function send(a) {
         }
       }
     }
+    a.model ??= prior?.model; a.effort ??= prior?.effort;
+    if (a.model !== undefined && !/^[A-Za-z0-9._:-]+$/.test(a.model)) throw Error('Недопустимая модель Codex.');
+    if (a.effort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(a.effort)) throw Error('Недопустимый уровень Codex.');
     await require('../../common/stage-gate').prepareJob(a, 'codex');
     const job = {
       id,
       folder,
       write: a.write,
+      fullAccess: a.full_access === true,
+      model: a.model, effort: a.effort,
+      requestedSettings: { model: a.model || 'unknown', effort: a.effort || 'unknown' },
+      confirmedSettings: { model: 'unknown', effort: 'unknown' },
       task: a.task,
       stage: a.stage, stageTitle: a.stageTitle, stageId: a.stageId, gateOrder: a.gateOrder, scopeTask: a.scopeTask, role: a.role, replaces: a.replaces, replacementEvidence: a.replacementEvidence,
       work: a.work,
       from: access.client(),
+      ...(access.guest() && access.client() === 'codex' ? { fromChat: 'codex' } : {}),
       status: access.guest() ? 'queued' : 'running',
       startedAt: new Date().toISOString(),
       owner: access.guest() ? null : locks.owner(),
+      // team-v19 К2: запись по поручению дирижёра запасного режима; основной сервер сверит слово при взятии.
+      ...(access.guest() && a.write && require('../../common/user-word').mode().active ? { fallbackWord: require('../../common/user-word').mode().entry.id } : {}),
       threadId: prior?.threadId || null,
       previous: prior?.id || null,
       quotaAttempts: 0,
@@ -458,9 +578,10 @@ async function send(a) {
         }
       });
     if (access.guest()) return reply(job, access.queued);
-    execute(job, folderLock).catch(logFailure);
+    const lock = folderLock;
     folderLock = null;
-    return view(job);
+    await execute(job, lock);
+    return view(load(job.id));
   } finally {
     if (priorLock?.ok) await priorLock.release();
     if (folderLock?.ok) await folderLock.release();
@@ -468,29 +589,63 @@ async function send(a) {
 }
 
 async function queue() {
-  if (access.guest() || !binary || scanning || closing) return;
+  if (access.guest() || !currentBinary() || scanning || closing) return;
   scanning = true;
   try {
     await require('../../common/progress').longRunning('Codex', list(), mutate);
     for (const j of list()) {
-      if (!['queued', 'waiting_quota'].includes(j.status) || j.write || Date.parse(j.nextAttemptAt) > Date.now()) continue;
+      if (!['queued', 'waiting_quota'].includes(j.status) || Date.parse(j.nextAttemptAt) > Date.now()) continue;
+      // team-v25: противоречивая карточка чата получает отказ даже без записи.
+      let refusal;
+      try { refusal = chatCardRefusal(j); } catch (e) { refusal = e.message; }
+      if (refusal) {
+        await mutate(j.id, c => {
+          if (!['queued', 'waiting_quota'].includes(c.status)) return false;
+          let reason;
+          try { reason = chatCardRefusal(c); } catch (e) { reason = e.message; }
+          if (!reason) return false;
+          c.status = 'failed'; c.error = reason; c.fullAccessApplied = false; c.finishedAt = new Date().toISOString();
+        });
+        continue;
+      }
+      // Запись: прежнее слово или согласованная карточка чата; слово всегда имеет приоритет.
+      if (j.write) {
+        if (!j.fallbackWord && j.fromChat !== 'codex') continue;
+        const hold = require('../../common/fallback').queueHold(j);
+        if (hold) { if (j.fallbackHold !== hold) await mutate(j.id, (c) => { c.fallbackHold = hold; }).catch(logFailure); continue; }
+      }
       if (j.status !== 'queued' && !['self', 'dead'].includes(await locks.ownerState(j.owner))) continue;
       const l = await locks.tryLock('codex_queue', j.id, { jobId: j.id });
       if (!l.ok) continue;
+      let folderLock = null;
       try {
+        if (j.write) {
+          folderLock = await locks.tryLock('codex_folder', canon(j.folder), { jobId: j.id });
+          if (!folderLock.ok) { folderLock = null; continue; }
+        }
         let claimed = false;
         const c = await mutate(j.id, (c) => {
           if (!['queued', 'waiting_quota'].includes(c.status) || Date.parse(c.nextAttemptAt) > Date.now()) return false;
+          let refusal;
+          try { refusal = chatCardRefusal(c); } catch (e) { refusal = e.message; }
+          if (refusal) {
+            c.status = 'failed'; c.error = refusal; c.fullAccessApplied = false; c.finishedAt = new Date().toISOString();
+            return;
+          }
+          const hold = (c.write || c.fallbackWord) && require('../../common/fallback').queueHold(c);
+          if (hold) { c.fallbackHold = hold; return; }
           c.status = 'running';
           c.owner = locks.owner();
+          delete c.fallbackHold;
           if (c.retryKind === 'quota' && !c.knownReset) c.quotaAttempts = (c.quotaAttempts || 0) + 1;
           delete c.finishedAt;
           claimed = true;
         });
-        if (claimed) await execute(c, null);
+        if (claimed) { const lock = folderLock; folderLock = null; await execute(c, lock); }
       } catch (e) {
         if (e.code !== 'ENOENT') throw e;
       } finally {
+        if (folderLock) await folderLock.release();
         await l.release();
       }
     }
@@ -504,6 +659,10 @@ function register(name, title, description, inputSchema, fn) {
   server.registerTool(name, { title, description, inputSchema: require('../../common/schema').compatible(inputSchema) }, async (a) => {
     try {
       access.guard('codex', name, a);
+      if (name === 'codex_send') {
+        const refusal = fullAccessRefusal(a);
+        if (refusal) throw Error(refusal);
+      }
       return name === 'codex_send'
         ? await require('../../common/work-owner').withWork(a, () => fn(a)) : await fn(a);
     } catch (e) {
@@ -525,6 +684,9 @@ register(
     task: z.string().min(1).describe('Поручение.'),
     text: z.string().optional().describe('Материал для работы.'),
     write: z.boolean().default(false).describe('Разрешить изменения по поручению.'),
+    full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя; только Claude, с записью и ролью текст или совет.'),
+    model: z.string().regex(/^[A-Za-z0-9._:-]+$/).optional().describe('Запрошенная модель; продолжение наследует прежнюю, если не задана.'),
+    effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional().describe('Запрошенный уровень рассуждения; не меняет доступ.'),
     continue_id: z.string().optional().describe('Номер предыдущего поручения.'),
     stage: z.string().optional().describe('Этап.'),
     owner: z.string().optional().describe('Метка сеанса владельца работы.'),
@@ -556,12 +718,13 @@ register(
   'Отменить Codex',
   'Остановить поручение или отменить ожидание квоты.',
   { id: z.string().describe('Номер поручения.') },
-  async ({ id }) => {
+  async (a) => {
+    const { id } = a;
     const j = await mutate(id, (c) => {
-      if (['waiting_quota', 'queued'].includes(c.status)) {
-        c.status = 'cancelled';
-        c.finishedAt = new Date().toISOString();
-      } else if (c.status === 'running') c.status = 'cancelling';
+      ownChatJob(c, a);
+      // Общий переход с сервером team (grok_slot): common/job-cancel.js.
+      if (require('../../common/job-cancel').cancelWaiting(c)) return;
+      if (c.status === 'running') { c.status = 'cancelling'; c.cancellingAt ||= new Date().toISOString(); }
     });
     if (active.has(id)) await stop(id);
     return view(j);
@@ -581,7 +744,7 @@ register(
           rows.push(format('Codex', c, c.error || '', 'Запросите результат.'));
       } catch (e) { if (e.code !== 'ENOENT') throw e; }
     }
-    const q = binary ? await codexQuota(binary) : { source: 'данные не предоставлены' };
+    const binary = currentBinary(), q = binary ? await codexQuota(binary) : { source: 'данные не предоставлены' };
     return reply(
       { status: 'done' },
       'Версия процесса: ' +

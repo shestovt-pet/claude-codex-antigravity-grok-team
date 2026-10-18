@@ -13,6 +13,7 @@ process.env.MOST_CODEX_RULES = path.join(RUN, 'missing-codex.md'); process.env.M
 const d = require('../common/deploy'), ops = require('../common/deploy-ops'), gate = require('../common/grok-gate');
 const write = (f, s) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, s); };
 const json = (f, v) => write(f, JSON.stringify(v)), read = f => JSON.parse(fs.readFileSync(f, 'utf8'));
+write(path.join(RUN, 'common/path-compat.js'), '// team-v21 fixture');
 const tests = [], test = (label, fn) => tests.push({ label, fn });
 function plan(name) { const file = path.join(RUN, name + '.json'); json(file, { old: true }); return { ...d.snapshot(file), next: '{"new":true}', backup: true }; }
 test('Р1: равный текст двух разных файлов записывается дважды', async () => {
@@ -152,15 +153,16 @@ test('Codex-1: отказ запуска перезапуска сохранён
 });
 function release(name, complete = true) {
   const root = path.join(RUN, name), id = 'a'.repeat(40), dir = path.join(root, 'live', id);
-  for (const n of ['team', 'codex', 'antigravity', ...(complete ? ['grok'] : [])]) write(path.join(dir, 'servers', n, 'index.js'), '');
+  for (const n of ['team', 'codex', ...(complete ? ['antigravity'] : [])]) write(path.join(dir, 'servers', n, 'index.js'), '');
+  write(path.join(dir, 'common', 'access.js'), fs.readFileSync(path.join(__dirname, '..', 'common', 'access.js'))); // team-v28 Р1
   json(path.join(dir, 'probe-ok.json'), { root, commit: id, at: new Date().toISOString(), servers: ['antigravity', 'codex', 'team'] });
   return { root, dir };
 }
 test('Р2 Р3: config-only повторяет десять проб и сохраняет deployed.json', async () => {
   const r = release('legacy'), p = plan('legacy-config'); let probes = 0;
   await d.configure({ release: r.dir, configs: [p.file] }, { probe: async () => { probes++; } });
-  assert.equal(probes, 10); assert.equal(read(path.join(r.root, 'live/deployed.json')).method, 'внешним сценарием');
-  assert.equal(read(path.join(r.dir, 'probe-ok.json')).servers.length, 4);
+  assert.equal(probes, 9); assert.equal(read(path.join(r.root, 'live/deployed.json')).method, 'внешним сценарием'); // team-v19 К2: + сервер своей семьи у гостей
+  assert.equal(read(path.join(r.dir, 'probe-ok.json')).servers.length, 3);
 });
 test('Р2: неполный релиз не меняет конфиги и метку', async () => {
   const r = release('incomplete', false), p = plan('incomplete-config'), marker = fs.readFileSync(path.join(r.dir, 'probe-ok.json'), 'utf8');
@@ -170,10 +172,10 @@ test('Р2: неполный релиз не меняет конфиги и ме�
 test('Р2 Р3 Д4: clients-only пробует релиз, сохраняет отметку, нераспознанные правила не мешают другим', async () => {
   const r = release('client-release'); write(process.env.MOST_CODEX_CONFIG, ''); json(process.env.MOST_AGY_MCP_CONFIG, {}); json(process.env.MOST_AGY_CONFIG, {});
   const good = path.join(RUN, 'good.md'), bad = path.join(RUN, 'bad.md');
-  write(good, '# Личное\nНе менять\n## Связка трёх ИИ\nСтарое\n## Мой раздел\nТочное содержимое\n'); write(bad, '# Личное\n');
+  write(good, '# Личное\nНе менять\n## Связка четырёх ИИ\nСтарое\n## Мой раздел\nТочное содержимое\n'); write(bad, '# Личное\n');
   let probes = 0;
   const out = await d.configureClients({ release: r.dir }, { probe: async () => { probes++; }, rules: { files: [{ file: bad, role: 'codex' }, { file: good, role: 'antigravity' }] } });
-  assert.equal(probes, 10); assert.match(out, /отказ/); assert.match(fs.readFileSync(good, 'utf8'), /Связка четырёх ИИ/);
+  assert.equal(probes, 9); assert.match(out, /отказ/); assert.match(fs.readFileSync(good, 'utf8'), /Связка трёх ИИ/);
   assert.equal(read(path.join(r.root, 'live/deployed.json')).commit, path.basename(r.dir));
   assert(fs.existsSync(good + '.prev')); assert(fs.readFileSync(good, 'utf8').endsWith('## Мой раздел\nТочное содержимое\n'));
   assert.match((await require('../common/client-rules').configure({ files: [good], rollback: true })).join(''), /восстановлен/);
@@ -182,7 +184,7 @@ test('Р2 Р3 Д4: clients-only пробует релиз, сохраняет о
 test('Д4: метки, чужие байты, идемпотентность и отказ неоднозначного раздела', () => {
   const rules = require('../common/client-rules'), text = '\uFEFFличное\r\n<!-- most:begin -->\r\nстарое\r\n<!-- most:end -->\r\nхвост';
   const next = rules.replace(text); assert(next.startsWith('\uFEFFличное\r\n')); assert(next.endsWith('\r\nхвост')); assert.equal(rules.replace(next), next);
-  for (const bad of ['<!-- most:begin -->', '## Связка трёх ИИ\n## Связка трёх ИИ\n', 'личное']) assert.throws(() => rules.replace(bad));
+  for (const bad of ['<!-- most:begin -->', '## Связка четырёх ИИ\n## Связка четырёх ИИ\n', 'личное']) assert.throws(() => rules.replace(bad));
 });
 test('63af002a: точные копии глобальных правил — обрамление, внешние байты, повтор и откат', async () => {
   const rules = require('../common/client-rules');
@@ -205,14 +207,14 @@ test('63af002a: точные копии глобальных правил — о
     assert(fs.readFileSync(file).equals(original));
   }
   for (const tail of ['# Верхний\nЧужое', '## Равный\nЧужое', '</WRAPPER>\nЧужое']) {
-    const text = (tail.startsWith('</') ? '<WRAPPER>\n' : '') + '## Связка трёх ИИ\nСтарое\n' + tail;
+    const text = (tail.startsWith('</') ? '<WRAPPER>\n' : '') + '## Связка четырёх ИИ\nСтарое\n' + tail;
     assert(rules.replace(text).endsWith(tail));
   }
 });
 test('63af002a: повреждённое обрамление и кодировка — отказ до записи и резервной копии', async () => {
   const rules = require('../common/client-rules');
-  const bad = ['<RULE[user_global]>\n## Связка трёх ИИ\nтекст\n</OTHER>',
-    '<RULE[user_global]>\n## Связка трёх ИИ\nтекст',
+  const bad = ['<RULE[user_global]>\n## Связка четырёх ИИ\nтекст\n</OTHER>',
+    '<RULE[user_global]>\n## Связка четырёх ИИ\nтекст',
     '<WRAPPER>\n<!-- most:begin -->\nтекст\n</WRAPPER>\n<!-- most:end -->',
     Buffer.from([0xff, 0xfe, 0x23, 0])];
   for (let i = 0; i < bad.length; i++) {
@@ -343,7 +345,7 @@ test('Д3 Д5 Д6 Д7 Д8: собственные тексты, версия и 
 });
 test('Д9 Д10: все запрещённые формы обнаруживаются в собственном тексте, common, servers и docs охвачены', () => {
   const scanner = require('./interface-texts'), root = path.resolve(__dirname, '..');
-  for (const phrase of ['трёх ИИ', 'Связка трёх', 'Квоты трёх', 'квоты четырёх', 'проверка трёх голосов', 'трое проверяющих', 'трио']) {
+  for (const phrase of ['Квоты трёх', 'квоты четырёх', 'проверка трёх голосов', 'трое проверяющих', 'трио']) {
     assert.deepEqual(scanner.violations('Заголовок: ' + phrase), [1], phrase);
     assert.deepEqual(scanner.violations('return "' + phrase + '";'), [1], phrase);
     assert.deepEqual(scanner.violations('notify(`' + phrase + '`);'), [1], phrase);
@@ -362,12 +364,11 @@ test('AG-1 AG-3 AG-5: настройка Grok остаётся пользова�
   const root = path.resolve(__dirname, '..');
   for (const file of ['rules/common.md', 'rules/claude.md', 'rules/grok.md']) {
     const text = fs.readFileSync(path.join(root, file), 'utf8');
-    assert.match(text, /Пользователь добавляет правило сам; код и Claude настройки Grok Bot не меняют/);
-    assert(text.includes('C:\\most\\state\\grok') && text.includes('C:\\most\\works'));
+    assert.match(text, /Grok выключен из связки/);
     assert(!text.includes('исправляет дирижёр'));
   }
   const brief = fs.readFileSync(path.join(root, 'rules/brief.md'), 'utf8');
-  assert(!brief.includes('verdict ×3')); assert.match(brief, /вердикты Codex и Antigravity \(обязательные\), Claude, плюс Grok по итоговой паре/);
+  assert(!brief.includes('verdict ×3')); assert.match(brief, /вердикты Codex и Antigravity \(обязательные\), Claude/);
   const claude = fs.readFileSync(path.join(root, 'rules/claude.md'), 'utf8');
   assert.equal((claude.match(/restart_claude=true/g) || []).length, 1);
   assert.equal((claude.match(/claude_usage/g) || []).length, 1);
@@ -413,7 +414,7 @@ test('Р4: полная оболочка ответа на копии текущ
     console.log('Размер сводки копии текущих карточек: ' + text.length); assert(text.length <= 3000, text);
   } finally { stores.list = oldList; grok.refresh = oldRefresh; locks.ownerState = oldOwner; require('../common/quota').codexQuota = oldQuota; if (oldBinary === undefined) delete process.env.CODEX_PATH; else process.env.CODEX_PATH = oldBinary; }
 });
-test('Р5: настоящие ворота merge требуют Grok даже при трёх обязательных принятиях', async () => {
+test('Р5: настоящие ворота merge без запроса Grok и без абзаца о недоступности', async () => {
   const g = require('../common/team-git'), { Team } = require('../common/team'), root = path.join(RUN, 'merge-gate'); fs.mkdirSync(root);
   g.git(root, ['init', '-b', 'main']); g.git(root, ['config', 'user.name', 'Тест']); g.git(root, ['config', 'user.email', 'test@example.invalid']);
   write(path.join(root, '.gitignore'), '.work/\nstate/\nworks/\n'); write(path.join(root, 'base.txt'), 'база');
@@ -425,9 +426,20 @@ test('Р5: настоящие ворота merge требуют Grok даже п
   card.designVotes = ['codex', 'antigravity'].map(who => ({ who, decision: 'ПРИНЯТО', designHash: card.designHash })); json(t.changeFile('gate'), card);
   write(path.join(folder, 'base.txt'), 'кандидат');
   await t.change({ action: 'commit', name: 'gate', message: 'Тестовый кандидат' }); card = read(t.changeFile('gate'));
-  for (const who of ['claude', 'codex', 'antigravity']) await t.change({ action: 'verdict', name: 'gate', base: card.base, candidate: card.candidate, who: 'user', replaces: who, decision: 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ', quote: 'Тестовая цитата принятия вместо ' + who });
-  await assert.rejects(t.change({ action: 'merge', name: 'gate' }), /Grok не запрошен/);
-  require('./grok-fixture').accepted(t, 'gate');
+  // team-v18: «РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ» место не закрывает — нужны настоящие ПРИНЯТО.
+  for (const who of ['claude', 'codex', 'antigravity']) {
+    let job_id;
+    if (who !== 'claude') {
+      job_id = 'r5-' + who;
+      const dir = who === 'codex' ? path.join(RUN, 'state/codex-jobs') : path.join(RUN, 'state/jobs', job_id);
+      const result = path.join(dir, who === 'codex' ? job_id + '.txt' : 'result.txt'); write(result, 'ПРИНЯТО');
+      json(path.join(dir, who === 'codex' ? job_id + '.json' : 'card.json'), { id: job_id, status: 'done', mode: 'review', resultFile: result,
+        task: card.requestMark + ' ' + card.base + ' ' + card.candidate });
+      if (who === 'antigravity') json(path.join(dir, 'meta.json'), { hash: crypto.createHash('sha256').update('ПРИНЯТО').digest('hex') });
+    }
+    await t.change({ action: 'verdict', name: 'gate', base: card.base, candidate: card.candidate, who, job_id, decision: 'ПРИНЯТО' });
+  }
+
   assert.match(await t.change({ action: 'merge', name: 'gate' }), /Слито в main/);
   assert.equal(g.hash(root), card.candidate);
   assert(Number.isFinite(Date.parse(read(t.changeFile('gate')).mergedAt)));
