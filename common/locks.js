@@ -110,10 +110,10 @@ async function tryLock(kind, key, info, state = STATE_DIR) {
   return { ok: true, owner, names: names.map(n => n.name), release };
 }
 
-async function waitLock(kind, key, info, waitMs) {
+async function waitLock(kind, key, info, waitMs, state = STATE_DIR) {
   const until = Date.now() + waitMs;
   for (;;) {
-    const l = await tryLock(kind, key, info);
+    const l = await tryLock(kind, key, info, state);
     if (l.ok || !l.busy || Date.now() > until) return l;
     await sleep(60);
   }

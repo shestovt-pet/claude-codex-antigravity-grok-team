@@ -105,10 +105,10 @@ test('Р1 Д2: мёртвый PID немедленно, неизвестный �
   assert.equal(ops.list(root, { alive: () => null })[0].status, 'прервана');
 });
 test('Р1: исполнитель сохраняет переключение раньше перезапуска', async () => {
-  const file = path.join(RUN, 'executor.json'); json(file, { root: RUN }); let restart = 0;
+  const root = path.join(RUN, 'executor-isolated'), file = path.join(root, 'executor.json'); json(file, { root }); let restart = 0;
   await ops.execute({ result: file, release: RUN, restartClaude: true }, async options => {
     assert.equal(read(file).status, 'проба'); assert.equal(options.restartClaude, false); return 'успех';
-  }, { restart: async () => { assert.equal(read(file).status, 'перезапуск идёт'); restart++; return 'перезапуск запланирован'; } });
+  }, { restart: async options => { assert.equal(options.state, path.join(root, 'state')); return require('../common/restart-hold').locked(options.state, () => { assert.equal(read(file).status, 'перезапуск идёт'); restart++; return 'перезапуск запланирован'; }); } });
   assert.equal(restart, 1); assert.equal(read(file).pid, process.pid);
   assert.equal(read(file).status, 'завершено');
   await assert.rejects(ops.execute({ result: file, release: RUN, restartClaude: true }, async () => { throw Error('отказ'); }, { restart: () => { restart++; } }), /отказ/);
@@ -127,7 +127,7 @@ test('Codex-1: незавершённый restart блокирует втору�
   const enteredRestart = new Promise(resolve => { entered = resolve; });
   const blocked = new Promise(resolve => { releaseRestart = resolve; });
   const execution = ops.execute({ result: file, release: RUN, restartClaude: true }, async () => 'Настройки обновлены', {
-    restart: async () => { entered(); await blocked; return 'Перезапуск запланирован'; },
+    restart: async options => { assert.equal(options.state, path.join(root, 'state')); return require('../common/restart-hold').locked(options.state, async () => { entered(); await blocked; return 'Перезапуск запланирован'; }); },
   });
   try {
     await enteredRestart;
@@ -143,7 +143,7 @@ test('Codex-1: отказ запуска перезапуска сохранён
   const root = path.join(RUN, 'restart-failure'), file = path.join(root, 'state/deploy-ops/first.json');
   json(file, { id: 'first', root, createdAt: new Date().toISOString() });
   await assert.rejects(ops.execute({ result: file, release: RUN, restartClaude: true }, async () => 'обновлено', {
-    restart: async () => { throw Error('CIM отказ'); },
+    restart: async options => { assert.equal(options.state, path.join(root, 'state')); return require('../common/restart-hold').locked(options.state, () => { throw Error('CIM отказ'); }); },
   }), /Настройки переключены.*CIM отказ/);
   assert.equal(read(file).status, 'перезапуск не запущен'); assert(read(file).switchedAt);
   assert.doesNotThrow(() => ops.assertIdle(root));
@@ -383,6 +383,8 @@ test('Grok ab708007: решение из lessons.md соответствует �
 });
 test('Р4: полная оболочка ответа на копии текущих карточек — не более 3000 символов', async () => {
   const source = process.env.MOST_TEST_STATUS_SOURCE || 'C:/most', root = path.join(RUN, 'current-copy');
+  if (!process.env.MOST_TEST_STATUS_SOURCE && !fs.existsSync(source)) return 'нет копии текущих данных';
+  assert(fs.existsSync(source), 'MOST_TEST_STATUS_SOURCE: папка не существует');
   const { Team } = require('../common/team'), t = new Team(rootForCopy(), path.join(root, 'state/team'));
   function rootForCopy() { fs.mkdirSync(root, { recursive: true }); return root; }
   for (const [from, to] of [['state/team/changes', 'state/team/changes'], ['works', 'works']]) {
@@ -445,7 +447,7 @@ test('Р5: настоящие ворота merge без запроса Grok и �
   assert(Number.isFinite(Date.parse(read(t.changeFile('gate')).mergedAt)));
 });
 (async () => {
-  let passed = 0, failed = 0;
-  for (const { label, fn } of tests) { try { await fn(); passed++; console.log('ПРОЙДЕНО: ' + label); } catch (e) { failed++; console.error('ПРОВАЛЕНО: ' + label + '\n' + e.stack); } }
-  console.log(`Итого: пройдено ${passed}, провалено ${failed}, пропущено 0`); process.exitCode = failed ? 1 : 0;
+  let passed = 0, failed = 0, skipped = 0;
+  for (const { label, fn } of tests) { try { const reason = await fn(); if (reason) { skipped++; console.log('ПРОПУЩЕНО: ' + label + ' — ' + reason); continue; } passed++; console.log('ПРОЙДЕНО: ' + label); } catch (e) { failed++; console.error('ПРОВАЛЕНО: ' + label + '\n' + e.stack); } }
+  console.log(`Итого: пройдено ${passed}, провалено ${failed}, пропущено ${skipped}`); process.exitCode = failed ? 1 : 0;
 })();

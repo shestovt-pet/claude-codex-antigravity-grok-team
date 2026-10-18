@@ -29,10 +29,18 @@ function parseQuota(data, email = accountEmail()) {
     groups.get(key).models.push({ label: m.label, explicit: /Gemini 3\.1 Pro.*High|Gemini 3\.8 Flash.*Medium/i.test(m.label) || (defaultModel && m.modelOrAlias?.model === defaultModel) });
   }
   return [...invalid, ...[...groups.values()].map(({q, models}) => {
-    const named = models.filter(m => m.explicit);
-    for (const m of models) { if (named.length >= 2) break; if (!named.includes(m)) named.push(m); }
+    const names = new Map();
+    for (const m of models) {
+      const match = /^(.*?) \((Low|Medium|High)\)$/.exec(m.label);
+      const key = match ? match[1] : m.label;
+      if (!names.has(key)) names.set(key, { label: key, levels: [], family: require('./model-family').family(m.label) || 'не определена' });
+      if (match) names.get(key).levels.push(match[2]);
+    }
+    const grouped = [...names.values()], lastAnthropic = grouped.findLastIndex(m => m.family === 'anthropic');
+    const labels = grouped.map((m, i) => m.label + (m.levels.length ? ' (' + m.levels.join(', ') + ')' : '') + ' [семья ' + m.family + ']' +
+      (i === lastAnthropic ? ' (та же семья, что ведущий — не проверяет работу Claude; расходует квоту Antigravity, а не лимит Claude пользователя)' : '')).join(', ');
     const reset = new Date(q.resetTime), today = reset.toDateString() === new Date().toDateString();
-    return models.map(m => m.label + ' [семья ' + (require('./model-family').family(m.label) || 'не определена') + ']' + (require('./model-family').family(m.label) === 'anthropic' ? ' (та же семья, что ведущий — не проверяет работу Claude; расходует квоту Antigravity, а не лимит Claude пользователя)' : '')).join(', ') + (q.remainingFraction === 0 ? ': исчерпано (осталось 0 %)' : ': осталось ' + Math.round(q.remainingFraction * 100) + ' %') + ', сброс ' + (today ? '' : reset.toLocaleDateString('ru-RU') + ' ') + reset.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    return labels + (q.remainingFraction === 0 ? ': исчерпано (осталось 0 %)' : ': осталось ' + Math.round(q.remainingFraction * 100) + ' %') + ', сброс ' + (today ? '' : reset.toLocaleDateString('ru-RU') + ' ') + reset.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
   })].join('; ') + ' · ' + (!email || !status.email ? 'аккаунт agy не удалось сверить' : email.toLowerCase() === status.email.toLowerCase() ? 'аккаунт agy совпадает' : 'аккаунт agy не совпадает');
 }
 function ps(code, deadline) {

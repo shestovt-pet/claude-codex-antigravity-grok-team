@@ -265,7 +265,7 @@ test('F1–F3: готовность, сценарий всех серверов 
   require('../common/access').ready('team'); assert.equal(read(path.join(process.env.MOST_STATE_DIR,'ready/team.json')).pid,process.pid);
   const restart=require('../common/restart'); const text=restart.script({runId:'test',log:'log',release:root,state:RUN});
   for(const part of ["@('team', 'codex', 'antigravity')",'startedAt','AddSeconds(300)','CloseMainWindow','Start-Sleep -Seconds 8','if (-not (Get-Process']) assert(text.includes(part));
-  const out=await restart.restart({root,release:root,state:RUN},{launch:async(file,{log,runId})=>write(log,'запущен '+runId+'\n')});assert.match(out,/Перезапуск Claude запланирован/);
+  const out=await restart.restart({root,release:root,state:path.join(RUN,'restart-isolated')},{launch:async(file,{log,runId})=>write(log,'запущен '+runId+'\n')});assert.match(out,/Перезапуск Claude запланирован/);
   await assert.rejects(restart.restart({root,release:root,state:RUN},{waitMs:30,launch:async(file,{log})=>write(log,'запущен старый-запуск\n')}),/не подтверждён/);
   assert.match(restart.launchCommand('C:\\x.ps1'),/-ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\\x\.ps1"/);
   process.env.MOST_CLIENT='codex';require('../common/access').ready('guest');assert(!fs.existsSync(path.join(process.env.MOST_STATE_DIR,'ready/guest.json')));delete process.env.MOST_CLIENT;

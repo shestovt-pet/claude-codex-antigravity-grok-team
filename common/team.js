@@ -410,6 +410,10 @@ class Team {
       if (change.work) require('./work-owner').check(read(this.workFile(change.work)), a.owner);
     }
     if (a.action === 'deploy') {
+      if (a.restart_claude) {
+        const live = await require('./live-jobs').running({ stateDir: path.dirname(this.state) });
+        if (live.length) throw Error('Установка с перезапуском Claude не начата: перезапуск оборвёт идущие поручения — ' + require('./live-jobs').describe(live) + '. Дождитесь их окончания и повторите. Без перезапуска (restart_claude=false) настройки переключатся, а новые серверы заработают после следующего перезапуска Claude.');
+      }
       const pending = require('./deploy-ops').list(this.root).find(op => !require('./deploy-ops').terminal.includes(op.status));
       if (pending) throw Error('Идёт установка ' + pending.id);
       let deployedCommit = null;
@@ -447,6 +451,7 @@ class Team {
     if (a.action === 'list') return this.changesText();
     if (a.action === 'cleanup') {
       if (!a.owner?.trim()) throw Error('Для уборки нужна метка владельца owner.');
+      if (a.apply === true) await require('./restart-hold').cleanup(path.dirname(this.state));
       const c = require('./cleanup');
       const run = () => c.cleanupText(c.cleanup({ root: this.root, apply: a.apply === true, owner: a.owner }, this.cleanupDeps || {}));
       return a.apply === true ? deployer.locked(this.root, run) : run();
@@ -879,6 +884,7 @@ class Team {
   // Уборка после последней установки (team-v10 Р5): только основной сервер; MOST_AFTER_DEPLOY=off выключает (тесты).
   async afterDeploy(waitMs = 0) {
     if (require('./access').guest() || process.env.MOST_AFTER_DEPLOY === 'off') return 'уборка после установки: не на этом сервере';
+    await require('./restart-hold').cleanup(path.dirname(this.state));
     return require('./after-deploy').afterLatest({ root: this.root, waitMs });
   }
   async status(claudeQuota, claudeUsage, notifyTest, full = false, scope = {}) {
@@ -926,12 +932,19 @@ class Team {
     });
     const readStatusWorks = () => { if (statusWorksError) throw statusWorksError; return statusWorks; };
     const quota = await require('./quota-line').quotaLine({ state: this.state, binary: process.env.CODEX_PATH || findCodex(), advice: !full, agyModel: scope.agy_model });
-    const warning = [require('./server-instructions').read().warning, require('./work-owner').reminder(this.root, undefined, scope)].filter(Boolean).join('\n');
+    const current = require('./request-context').context.getStore();
+    const reminder = current?.publicSnapshot?.warning ?? require('./work-owner').reminder(this.root, undefined, scope);
+    const rulesWarning = require('./server-instructions').read().warning;
+    const warning = [rulesWarning, reminder].filter(Boolean).join('\n');
     if (!full) {
-      const text = await require('./summary').compact({ root: this.root, state: this.state, works: readStatusWorks }, quota, snapshot);
-      return (warning ? warning + '\n' : '') + text + (notifyTest ? '\nПробное уведомление: ' + await require('./notify').notify('Связка: пробное уведомление', 'Уведомления команды работают.') : '');
+      const notification = notifyTest ? 'Пробное уведомление: ' + await require('./notify').notify('Связка: пробное уведомление', 'Уведомления команды работают.') : '';
+      // Прямые вызовы тоже учитывают стандартную оболочку; MCP передаёт точный бюджет.
+      const budget = scope.summaryBudget ?? (3000 - format('Команда', { status: 'done' }, '', 'Проверьте результат и выберите следующий шаг.').length - 1);
+      const prefix = !current?.publicSnapshot && reminder ? reminder + '\n' : '';
+      const required = [rulesWarning, notification].filter(Boolean);
+      return prefix + await require('./summary').compact({ root: this.root, state: this.state, works: readStatusWorks }, quota, snapshot, { budget: budget - prefix.length, required });
     }
-    rows.push(quota);
+    rows.push(quota, ...require('./restart-hold').warnings(path.dirname(this.state)));
     await section('Расхождение версий', () => rows.push(...require('./release-drift').lines(this.root, stateDir)));
     if (warning) rows.unshift(warning);
     await section('Нагрузка', () => rows.push(require('./summary').loadLine(this.state, Object.fromEntries(require('./members').helpers.map(who => [who, stores.list(who, true, snapshot).jobs])))));
@@ -974,7 +987,7 @@ class Team {
             }
           }
           if (
-            !['running', 'queued', 'waiting_quota', 'needs_decision', 'cancelling', 'stop_unconfirmed'].includes(j.status)
+            !j.stopUnconfirmed && !['running', 'queued', 'waiting_quota', 'needs_decision', 'cancelling', 'cancel_requested', 'delivery_unclear', 'applying', 'stop_unconfirmed'].includes(j.status)
           )
             continue;
           const owner = await snapshot.ownerState(j.owner);

@@ -15,6 +15,13 @@ const { format } = require('../../common/format');
 const { classifyCodex, retryPlan, codexQuota, quotaText, command } = require('../../common/quota');
 const { readCard, logFailure, guarded } = require('../../common/cards');
 const access = require('../../common/access');
+const restartHold = require('../../common/restart-hold');
+let restartServer;
+// Вызывается только под job_start: обработчики могут загрузиться до стартового цикла.
+function admitExecution() {
+  restartServer ||= restartHold.server(stateDir, 'codex');
+  restartHold.assertAdmitted(stateDir, restartServer);
+}
 const VERSION = '0.5.9',
   dir = path.resolve(process.env.MOST_CODEX_JOBS_DIR || path.join(stateDir, 'codex-jobs'));
 const archive =
@@ -541,6 +548,7 @@ async function send(a) {
     a.model ??= prior?.model; a.effort ??= prior?.effort;
     if (a.model !== undefined && !/^[A-Za-z0-9._:-]+$/.test(a.model)) throw Error('Недопустимая модель Codex.');
     if (a.effort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(a.effort)) throw Error('Недопустимый уровень Codex.');
+    if (!access.guest() && restartServer) restartHold.assertAdmitted(stateDir, restartServer, { early: true });
     await require('../../common/stage-gate').prepareJob(a, 'codex');
     const job = {
       id,
@@ -569,7 +577,8 @@ async function send(a) {
       fs.writeFileSync(job.textFile, a.text);
     }
     job.provenance = provenance.forJob(job, 'codex');
-    save(job);
+    if (access.guest()) save(job);
+    else await restartHold.locked(stateDir, () => { admitExecution(); save(job); });
     if (prior?.status === 'waiting_quota')
       await mutate(prior.id, (c) => {
         if (c.status === 'waiting_quota') {
@@ -624,7 +633,7 @@ async function queue() {
           if (!folderLock.ok) { folderLock = null; continue; }
         }
         let claimed = false;
-        const c = await mutate(j.id, (c) => {
+        const c = await restartHold.locked(stateDir, () => mutate(j.id, (c) => {
           if (!['queued', 'waiting_quota'].includes(c.status) || Date.parse(c.nextAttemptAt) > Date.now()) return false;
           let refusal;
           try { refusal = chatCardRefusal(c); } catch (e) { refusal = e.message; }
@@ -634,16 +643,17 @@ async function queue() {
           }
           const hold = (c.write || c.fallbackWord) && require('../../common/fallback').queueHold(c);
           if (hold) { c.fallbackHold = hold; return; }
+          admitExecution();
           c.status = 'running';
           c.owner = locks.owner();
           delete c.fallbackHold;
           if (c.retryKind === 'quota' && !c.knownReset) c.quotaAttempts = (c.quotaAttempts || 0) + 1;
           delete c.finishedAt;
           claimed = true;
-        });
+        }));
         if (claimed) { const lock = folderLock; folderLock = null; await execute(c, lock); }
       } catch (e) {
-        if (e.code !== 'ENOENT') throw e;
+        if (e.code !== 'ENOENT' && !e.restartHold) throw e;
       } finally {
         if (folderLock) await folderLock.release();
         await l.release();
@@ -763,6 +773,7 @@ register(
 async function shutdown() {
   if (closing) return;
   closing = true;
+  if (restartServer) restartServer.closed = true;
   await Promise.all([...active.keys()].map((id) => stop(id, 'shutdown').catch(logFailure)));
   const end = Date.now() + 5000;
   while (active.size && Date.now() < end) await sleep(100);
@@ -771,6 +782,8 @@ async function shutdown() {
 
 (async () => {
   await require('../../common/state-migration').start(require('../../common/paths'));
+  restartServer = access.guest() ? null : restartHold.server(stateDir, 'codex');
+  process.stdin.on('close', guarded(shutdown));
   const owner = await locks.startOwner({ version: VERSION, file: __filename });
   if (!owner.ok) throw Error('Не удалось открыть канал владельца.');
   process.stdin.on('end', guarded(shutdown));

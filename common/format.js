@@ -20,7 +20,7 @@ function format(assistant, job = {}, body = '', next = 'Проверьте ре�
   const summaryHeader = 'Команда · ' + (job.status === 'failed' ? 'ошибка' : 'сводка') + ' · ' +
     new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
   const embedded = body.match(/^(?:⚠ Статус пользователю[^\n]*\n)+/)?.[0];
-  const warning = embedded ? embedded.trimEnd() : require('./work-owner').reminder();
+  const warning = embedded ? embedded.trimEnd() : (require('./request-context').context.getStore()?.publicSnapshot?.warning ?? require('./work-owner').reminder());
   if (embedded) body = body.slice(embedded.length);
   return [
     warning,

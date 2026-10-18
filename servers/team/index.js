@@ -12,11 +12,17 @@ function register(name, title, description, inputSchema, fn) {
   server.registerTool(name, { title, description, inputSchema: require('../../common/schema').compatible(inputSchema) }, async (a) => {
     try {
       require('../../common/access').guard('team', name, a);
+      // Один снимок и одна функция оболочки для измерения и отправки.
+      const transport = require('../../common/public-transport');
+      const current = require('../../common/request-context').context.getStore();
+      if (name === 'team_status') transport.snapshot(current);
+      const render = body => format('Команда', { status: 'done' }, body, 'Проверьте результат и выберите следующий шаг.');
+      if (name === 'team_status' && !a.full) a.summaryBudget = 3000 - transport.decorate(render(''), current).length - 1;
       return {
         content: [
           {
             type: 'text',
-            text: format('Команда', { status: 'done' }, await fn(a), 'Проверьте результат и выберите следующий шаг.'),
+            text: render(await fn(a)),
           },
         ],
       };
@@ -152,6 +158,7 @@ register(
 );
 if (require.main === module)
   require('../../common/state-migration').start(require('../../common/paths'))
+    .then(() => require('../../common/restart-hold').cleanup(require('../../common/paths').stateDir))
     .then(() => server.connect(require('../../common/public-transport').publicTransport(new StdioServerTransport()))).then(() => require('../../common/access').ready('team'))
     // team-v10 Р5: новый сервер после установки с перезапуском сам выполняет уборку.
     .then(() => { setTimeout(() => team.afterDeploy(600000).catch(() => {}), 5000).unref(); }).catch((e) => {

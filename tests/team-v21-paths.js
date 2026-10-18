@@ -39,7 +39,7 @@ function oldModule(name, overrides = {}, current = false) {
   const Module = require('module'), filename = path.join(ROOT, 'common', name + '.js');
   const m = new Module(filename, module); m.filename = filename; m.paths = module.paths;
   const req = Module.createRequire(filename); m.require = id => overrides[id] || req(id);
-  m._compile(current ? fs.readFileSync(filename, 'utf8') : cp.execFileSync('git', ['show', '97e948f0:common/' + name + '.js'], { cwd: ROOT, encoding: 'utf8' }), filename);
+  m._compile(current ? fs.readFileSync(filename, 'utf8') : fs.readFileSync(path.join(__dirname, 'fixtures/release-97e948f0/common', name + '.js.txt')).toString('utf8'), filename);
   return m.exports;
 }
 async function patched(obj, key, value, fn) { const old = obj[key]; obj[key] = value; try { return await fn(); } finally { obj[key] = old; } }

@@ -2,6 +2,20 @@
 
 // Напоминание добавляется на границе протокола, в том числе к отказам проверки схемы SDK.
 // Форматирование обычных ответов также работает при прямом вызове без транспорта.
+function snapshot(current = require('./request-context').context.getStore(), root) {
+  if (current?.publicSnapshot) return current.publicSnapshot;
+  const warning = require('./work-owner').reminder(root, undefined, current || {});
+  let banner = '';
+  try { banner = require('./fallback').banner(current || {}); } catch {}
+  const value = { warning, banner };
+  if (current) current.publicSnapshot = value;
+  return value;
+}
+function decorate(text, current) {
+  const { warning, banner } = snapshot(current);
+  const body = text.replace(/^(?:⚠ Статус пользователю[^\n]*\n)+/, '');
+  return (banner ? banner + '\n' : '') + (warning ? warning + '\n' : '') + body;
+}
 function publicTransport(transport) {
   const { context, scope } = require('./request-context');
   const requests = new Map();
@@ -23,14 +37,9 @@ function publicTransport(transport) {
     if (message?.result || message?.error) requests.delete(message.id);
     const content = message?.result?.content;
     if (Array.isArray(content)) {
-      const warning = require('./work-owner').reminder(undefined, undefined, current);
-      // team-v19 К6: баннер запасного режима — первой строкой ответа основного сервера и гостя.
-      let banner = '';
-      try { banner = require('./fallback').banner(current); } catch {}
       const first = content.find(item => item.type === 'text');
       if (first) {
-        const body = first.text.replace(/^(?:⚠ Статус пользователю[^\n]*\n)+/, '');
-        const text = (banner ? banner + '\n' : '') + (warning ? warning + '\n' : '') + body;
+        const text = decorate(first.text, current);
         message = { ...message, result: { ...message.result,
           content: content.map(item => item === first ? { ...item, text } : item) } };
       }
@@ -39,4 +48,4 @@ function publicTransport(transport) {
   };
   return transport;
 }
-module.exports = { publicTransport };
+module.exports = { publicTransport, snapshot, decorate };

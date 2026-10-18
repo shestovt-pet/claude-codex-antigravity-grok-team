@@ -72,8 +72,8 @@ test('К5: обе копии совпадают с принятым блоком
   const a = block(brief, brief.split('\n')[0]);
   const b = block(helpers, helpersTitle);
   assert.equal(a, b);
-  // Хеш файла e2/block.md из принятого замысла ред. 7; внешние файлы тесту не нужны.
-  assert.equal(sha256(a), '5b1d72c2542d695b8afa6bd73c6a222f2f8fbc22fe0c8698413d826b951d4714');
+  // Принятый блок ред. 7, имя заменено в team-v29, чтобы закреплённый текст не менялся выгрузкой.
+  assert.equal(sha256(a), 'c611ddc143fc5ec06e1c16c8a50d606f9519a7d626cce7657edf3d0fbb4cace8');
   assert(lineCount(a) <= 15, 'Блок длиннее 15 строк');
   assert(a.length <= 1500, 'Блок длиннее 1500 знаков');
 });

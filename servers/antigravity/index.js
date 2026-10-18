@@ -51,6 +51,11 @@ const MAX_CMDLINE_CHARS = 30000;                                           // ж
 const MAX_SOURCE_BYTES = Number(process.env.MOST_MAX_SOURCE_BYTES || 8 * 1024 * 1024);
 const DRAFT_NAME = "_antigravity_result.txt";
 const STATE_DIR = require('../../common/paths').stateDir;
+const restartHold = require('../../common/restart-hold');
+let restartServer;
+// Метка внутреннего результата очереди не попадает в ответ MCP.
+const heldApplies = new WeakSet();
+function restartRefusal(result) { const out = fail(result.reason); heldApplies.add(out); return out; }
 const JOBS_DIR = path.join(STATE_DIR, "jobs");
 const LOCKS_DIR = path.join(STATE_DIR, "locks");
 const INPUT_DIR = path.resolve(process.env.MOST_INPUT_DIR || path.join(STATE_DIR, "input"));
@@ -1235,6 +1240,7 @@ register(
   },
   async ({ papka_proekta, poruchenie, fayl, stroki, opora, model, rezhim }) => {
     if (shuttingDown) return fail("мост останавливается");
+    if (!access.guest()) { const gate = restartHold.admit(STATE_DIR, restartServer, { early: true }); if (!gate.ok) return restartRefusal(gate); }
     if (!AGY) return fail("agy не найден.");
     if (!instancePipeOk) return fail("канал экземпляра моста не открыт — задания не принимаются (см. журнал). Перезапусти Claude.");
     if (!papka_proekta || !fs.existsSync(papka_proekta) || !fs.statSync(papka_proekta).isDirectory()) return fail("папки проекта нет: " + papka_proekta);
@@ -1337,11 +1343,15 @@ register(
       poruchenie, task: context.getStore()?.args.scopeTask ?? poruchenie,
       owner: { instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT },
     };
-    try { fs.mkdirSync(jobDir(id), { recursive: true }); saveJob(job); }
+    try {
+      const save = () => { fs.mkdirSync(jobDir(id), { recursive: true }); saveJob(job); };
+      if (access.guest()) save();
+      else await restartHold.locked(STATE_DIR, () => { restartHold.assertAdmitted(STATE_DIR, restartServer); save(); });
+    }
     catch (e) {
       await lock.release();
       if (inputDir) { try { keepRm(inputDir, { recursive: true, force: true }); } catch (e2) {} }
-      return fail("не удалось сохранить карточку задания: " + errText(e));
+      return e.restartHold ? restartRefusal({ reason: e.message }) : fail("не удалось сохранить карточку задания: " + errText(e));
     }
     log("задание " + id + " запущено: режим " + rezhim + ", модель " + job.model + ", " +
       (work ? (work.range ? "строки " + work.range.from + "–" + work.range.to : "весь файл") : "новый текст") +
@@ -1484,6 +1494,7 @@ register(
     perezapisat: z.boolean().optional().describe("Только для нового текста (text): разрешить заменить существующий файл to."),
   },
   async ({ nomer, kuda, perezapisat, quote }, opts = {}) => {
+    if (!access.guest()) { const gate = restartHold.admit(STATE_DIR, restartServer, { early: true }); if (!gate.ok) return restartRefusal(gate); }
     if (shuttingDown) return fail("мост останавливается");
     let job = await loadNorm(nomer);
     if (!job) return fail("задания " + nomer + " нет." + legacyNote(nomer));
@@ -1531,7 +1542,7 @@ register(
     const lock = await waitLock("apply", targetKey, { jobId: nomer }, 10000);
     if (!lock.ok) return fail(lock.busy ? "в этот файл сейчас переносится другое задание (" + (lock.owner.jobId || "?") + "); попробуй чуть позже" : "не удалось захватить файл: " + lock.error);
     APPLYING.add(nomer);
-    const owner = { instance: INSTANCE, pid: process.pid };
+    const owner = { instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT };
     const attempt = crypto.randomBytes(6).toString("hex");
     try {
       let bytes, expectedHash, rangeTxt = null, noChange = false, verify;
@@ -1554,12 +1565,14 @@ register(
       }
       const newHash = sha(bytes);
       // фиксируем намерение в карточке (под замком задания, со свежей проверкой статуса)
-      let refused = null;
-      await updateJob(nomer, (c) => {
+      let refused = null, pauseRefusal = null;
+      await restartHold.locked(STATE_DIR, () => updateJob(nomer, (c) => {
         if (c.status !== "done") { refused = why(c); return false; }
+        restartHold.assertAdmitted(STATE_DIR, restartServer);
         if (noChange) { Object.assign(c, { status: "applied", appliedAt: nowIso(), appliedTo: target, applyNote: "изменений не было — файл не трогали" }); return; }
         c.status = "applying"; c.apply = { target, expectedHash, newHash, owner, attempt, at: nowIso() };
-      }).catch((e) => { refused = "не удалось сохранить карточку перед переносом: " + errText(e) + ". Файл не изменён."; });
+      })).catch((e) => { if (e.restartHold) pauseRefusal = e; else refused = "не удалось сохранить карточку перед переносом: " + errText(e) + ". Файл не изменён."; });
+      if (pauseRefusal) return restartRefusal({ reason: pauseRefusal.message });
       if (refused) return fail(refused);
       if (noChange) return reply("Изменений нет — " + target + " не тронут.");
 
@@ -1654,6 +1667,7 @@ register(
 async function shutdown(reason) {
   if (shuttingDown) return;
   shuttingDown = true;
+  if (restartServer) restartServer.closed = true;
   log("мост останавливается: " + reason + "; заданий идёт: " + RUNNING.size);
   const ids = [...RUNNING.keys()];
   const withDeadline = (p, ms) => Promise.race([p.catch(() => {}), sleep(ms)]);
@@ -1722,6 +1736,7 @@ async function resumeQueue() {
       const hold = !m.active ? 'запасной режим снят — перенос ждёт Claude' : m.entry.id !== r.word ? 'дирижёр сменился — перенос ждёт нового запроса' : '';
       if (hold) { if (r.hold !== hold) await updateJob(j.id, (c) => { if (c.applyRequest) c.applyRequest.hold = hold; }).catch(() => {}); continue; }
       const out = await context.run({ args: { id: j.id } }, () => HANDLERS.most_perenesti({ nomer: j.id, kuda: r.kuda || undefined, perezapisat: r.perezapisat }, { fallback: true }));
+      if (heldApplies.has(out)) continue;
       const text = (out.content || []).map((c) => c.text).join('\n').slice(0, 2000);
       await updateJob(j.id, (c) => { if (c.applyRequest) { Object.assign(c.applyRequest, { done: nowIso(), ok: !out.isError, result: text }); delete c.applyRequest.hold; } }).catch(() => {});
     }
@@ -1735,19 +1750,20 @@ async function resumeQueue() {
       let claimed = false,
         cur;
       try {
-        cur = await updateJob(j.id, async (c) => {
+        cur = await restartHold.locked(STATE_DIR, () => updateJob(j.id, async (c) => {
           if (
             !['waiting_quota', 'queued'].includes(c.status) ||
             Date.parse(c.nextAttemptAt) > Date.now() ||
             (c.status !== 'queued' && !['self', 'dead'].includes(await ownerState(c.owner)))
           )
             return false;
+          restartHold.assertAdmitted(STATE_DIR, restartServer);
           c.status = 'running';
           c.owner = { instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT };
           if (c.retryKind === 'quota' && !c.knownReset) c.quotaAttempts = (c.quotaAttempts || 0) + 1;
           else if (c.retryKind === 'transient') c.transientAttempts = (c.transientAttempts || 0) + 1;
           claimed = true;
-        });
+        }));
       } catch (e) {
         log('Не удалось возобновить: ' + errText(e));
       }
@@ -1761,6 +1777,9 @@ async function resumeQueue() {
 // ---------- запуск ----------
 (async () => {
   await require('../../common/state-migration').start(require('../../common/paths'));
+  restartServer = access.guest() ? null : restartHold.server(STATE_DIR, 'antigravity');
+  process.stdin.on('end', () => { if (restartServer) restartServer.closed = true; });
+  process.stdin.on('close', () => { if (restartServer) restartServer.closed = true; });
   rotateJournal();
   if (!access.guest() && !process.env.MOST_TEST_KEEP) pruneOld();
   // канал экземпляра: по нему другие экземпляры моста узнают, жив ли этот

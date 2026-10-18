@@ -171,10 +171,18 @@ async function locked(root, fn, state) {
 
 async function deploy({ root, commit = 'main', configs, dryRun = false, releaseOnly = false, stateDir, nodeModulesFrom, restartClaude = false, external = false, cleanup = true }, deps = {}) {
   root = fs.realpathSync(root);
-  require('./deploy-ops').assertIdle(root, null, dryRun);
   repository(root, deployGit);
   const id = hash(root, commit, deployGit),
     release = inside(root, 'live', id);
+  if (restartClaude && external) {
+    let source = '';
+    try { source = deployGit(root, ['cat-file', 'blob', id + ':common/restart-hold.js']); } catch {}
+    const declarations = source.match(/\bconst\s+RESTART_HOLD_PROTOCOL\s*=/g) || [];
+    const version = source.match(/^const RESTART_HOLD_PROTOCOL = (\d+);\r?$/m);
+    if (declarations.length !== 1 || !version || !Number.isSafeInteger(Number(version[1])) || Number(version[1]) < 1)
+      throw Error('Релиз ' + id.slice(0, 8) + ' не умеет безопасный перезапуск (нет паузы перезапуска team-v29): установка с перезапуском запрещена. Можно установить без перезапуска и перезапустить Claude вручную, когда задания закончатся; после возврата на такой релиз защиты от обрыва поручений не будет.');
+  }
+  require('./deploy-ops').assertIdle(root, null, dryRun);
   const state = path.join(root, 'state');
   const deployState = path.resolve(stateDir || inside(root, 'live', '.deploy-state'));
   const clients = releaseOnly || external ? [] : require('./client-configs').paths().filter(p => fs.existsSync(p.file));
@@ -193,7 +201,7 @@ async function deploy({ root, commit = 'main', configs, dryRun = false, releaseO
     return 'Проверочный режим; изменений нет.\n' + plan;
   }
   const execute = deps.repoLocked ? async (_root, fn) => fn() : locked;
-  return execute(root, async () => {
+  const output = await execute(root, async () => {
     const snaps = external ? [] : files.map(snapshot);
     const clientPlans = require('./client-configs').plans(clients.map(p => ({...snapshot(p.file), kind: p.kind})), release, root, state, nodeCommand());
     if (!releaseOnly && !(external ? files : snaps).length) throw Error('Не найден ни один существующий конфиг Claude.');
@@ -236,9 +244,10 @@ async function deploy({ root, commit = 'main', configs, dryRun = false, releaseO
     } catch (e) {
       throw Error('Конфиги обновлены, но отметка релиза не записана: ' + e.message);
     }
-    if (restartClaude) return 'Развёрнуто.\n' + plan + '\n' + await require('./restart').restart({ root, release, state }, deps.restart || {});
     return 'Развёрнуто, нужен перезапуск Claude.\n' + plan;
   }, deployState);
+  if (restartClaude && !external && !releaseOnly) return 'Развёрнуто.\n' + plan + '\n' + await require('./restart').restart({ root, release, state, close: true }, deps.restart || {});
+  return output;
 }
 
 // team-v28 Р1: строгое сравнение — тот же состав и без повторов (['a', 'a'] не равно ['a', 'b']).
@@ -368,7 +377,6 @@ async function configure({ release, configs, stateDir, dryRun = false, restartCl
       const mark = path.join(verified.root, 'live/deployed.json');
       atomic(mark, JSON.stringify({ ...JSON.parse(fs.readFileSync(mark, 'utf8')), rulesDelivery }, null, 2));
     }
-    if (restartClaude) return 'Конфиги обновлены.\n' + plan + '\n' + await require('./restart').restart({ root: verified.root, release: verified.release, state: path.join(verified.root, 'state') }, deps.restart || {});
     return 'Конфиги обновлены, нужен перезапуск Claude.\n' + plan;
   };
   // Один замок на каталог, даже если в нём несколько конфигов.
@@ -376,7 +384,9 @@ async function configure({ release, configs, stateDir, dryRun = false, restartCl
   const lockFolders = async (i) => i === folders.length
     ? run()
     : locked(folders[i], () => lockFolders(i + 1), path.resolve(stateDir || path.join(folders[i], '.deploy-state')));
-  return lockFolders(0);
+  const output = await lockFolders(0);
+  if (restartClaude) return 'Конфиги обновлены.\n' + plan + '\n' + await require('./restart').restart({ root: verified.root, release: verified.release, state: path.join(verified.root, 'state'), close: true }, deps.restart || {});
+  return output;
 }
 
 async function configureClients({ release, stateDir, dryRun = false, restartClaude = false }, deps = {}) {
@@ -392,12 +402,13 @@ async function configureClients({ release, stateDir, dryRun = false, restartClau
     await switchConfigs(plans(), deps.hook);
     const ruleText = '\n' + (await require('./client-rules').configure(deps.rules || {})).join('\n');
     deployed(verified, files.map(p => p.file));
-    if (restartClaude) return 'Подключения Codex и Antigravity обновлены.\n' + plan + ruleText + '\n' + await require('./restart').restart({ root: verified.root, release: verified.release, state }, deps.restart || {});
     return 'Подключения Codex и Antigravity обновлены.\n' + plan + ruleText;
   };
   const folders = [...new Set(files.map(p => fs.realpathSync(path.dirname(p.file))))].sort();
   const lockFolders = i => i === folders.length ? run() : locked(folders[i], () => lockFolders(i + 1), path.resolve(stateDir || path.join(folders[i], '.deploy-state')));
-  return lockFolders(0);
+  const output = await lockFolders(0);
+  if (restartClaude) return output + '\n' + await require('./restart').restart({ root: verified.root, release: verified.release, state, close: true }, deps.restart || {});
+  return output;
 }
 
 function checkPreviousServers(config, keys, configFile) {

@@ -98,7 +98,8 @@ test('F2: rollback возвращает предыдущий релиз посл
 test('F6: restart-claude вызывается после записи для обоих режимов',async()=>{
   for(const kind of ['clients','config']) {
     let started=false;
-    const deps={restart:{launch:async(file,{log,runId})=>{started=true;const f=kind==='clients'?files.agy:files.claude;assert.equal(read(f).mcpServers.team.args[0],path.join(current,'servers/team/index.js'));write(log,'запущен '+runId+'\n');}}};
+    // Между двумя попытками пауза должна быть решена; ответ всё равно подтверждает только запуск.
+    const deps={restart:{launch:async(file,info)=>{started=true;const f=kind==='clients'?files.agy:files.claude;assert.equal(read(f).mcpServers.team.args[0],path.join(current,'servers/team/index.js'));require('./fixtures/team-v29/restart-complete')(info);}}};
     const result=await (kind==='clients'?d.configureClients({release:current,restartClaude:true},deps):d.configure({release:current,configs:[files.claude],restartClaude:true},deps));
     assert(started);assert.match(result,/Перезапуск Claude запланирован \([a-f0-9-]+\)/);assert.match(result,/\.log/);
   }
@@ -155,7 +156,7 @@ test('L1–L2: configure и clients-only отделяют хранилище о�
   assert.equal(cc.toml(text,current,RUN,lockState,process.execPath),text);
   assert.throws(()=>cc.toml(text+'\n[mcp_servers.team]\ndefault_tools_approval_mode = "approve"\n',current,RUN,lockState,process.execPath),/вне служебного/);
   await require('../common/restart').restart({root:RUN,release:current,state:lockState},{launch:async(file,{log,runId})=>{
-    assert(fs.readFileSync(file,'utf8').includes("$state = '"+path.join(RUN,'state')+"'"));write(log,'запущен '+runId+'\n');
+    assert(fs.readFileSync(file,'utf8').includes("$state = '"+lockState+"'"));write(log,'запущен '+runId+'\n');
   }});
 });
 test('L3: преобразование строк сохраняет строгую проверку и значения по умолчанию',()=>{

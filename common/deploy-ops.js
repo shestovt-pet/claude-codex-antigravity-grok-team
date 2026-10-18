@@ -94,7 +94,7 @@ async function execute(options, action, deps = {}) {
       const op = read(file);
       try {
         update(file, { status: 'перезапуск идёт' });
-        const restart = await (deps.restart || require('./restart').restart)({ root: op.root, release: options.release, waitCompletion: true });
+        const restart = await (deps.restart || require('./restart').restart)({ root: op.root, release: options.release, state: path.join(op.root, 'state'), id: op.id, waitCompletion: true, close: true }, deps.restartDeps || {});
         update(file, { restart: typeof restart === 'string' ? restart : restart.message, restartEvidence: typeof restart === 'object' ? restart : null });
       }
       catch (e) {

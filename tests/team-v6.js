@@ -153,6 +153,7 @@ test('Р5: execute → restart → итог сценария; отказ гот�
     const execute = () => ops.execute({ result: file, release: 'candidate-release', restartClaude: true }, async () => 'обновлено', {
       restart: options => restart.restart(options, { launch: async (_, info) => {
         assert.equal(read(file).status, 'перезапуск идёт');
+        require('./fixtures/team-v29/restart-complete')(info);
         write(info.log, 'итог ' + info.runId + ' ' + (success ? 'True' : 'False') + '\n');
         json(info.result, { runId: info.runId, release: 'candidate-release', startedAt: '2026-09-27T10:00:00Z', finishedAt: '2026-09-27T10:01:00Z', success, reason: 'Пробный итог' });
         for (const name of ['team', 'codex', 'antigravity']) json(path.join(root, 'state/ready', name + '.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'candidate-release' });

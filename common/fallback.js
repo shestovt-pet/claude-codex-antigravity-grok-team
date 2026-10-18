@@ -24,7 +24,7 @@ let tableCache = null;
 // commandLine — для К12 (командные строки процессов-гостей), без кэша.
 function processTable(fresh = false, opts = {}) {
   // Подмена в тестах; pid «self» — процесс, который читает таблицу (гость, запущенный тестом).
-  if (process.env.NODE_ENV === 'test' && process.env.MOST_TEST_PROCESS_TREE)
+  if (!opts.native && process.env.NODE_ENV === 'test' && process.env.MOST_TEST_PROCESS_TREE)
     return JSON.parse(process.env.MOST_TEST_PROCESS_TREE).map(r => ({ ...r, pid: r.pid === 'self' ? process.pid : r.pid, ppid: r.ppid === 'self' ? process.pid : r.ppid }));
   const cmd = !!opts.commandLine;
   if (!fresh && !cmd && tableCache && Date.now() - tableCache.at < 30000) return tableCache.rows;
@@ -281,7 +281,7 @@ async function launchDesktop(deps = {}) {
     record.result = typeof out === 'object' ? out.result : (String(out).match(/итог — уведомлением Windows и в (.+)$/)?.[1] || '').trim() + '.json';
   } catch (e) { record.error = e.message; }
   require('./team-git').atomic(path.join(dir, 'launch-' + record.at.replace(/[:.]/g, '-') + '.json'), JSON.stringify(record, null, 2) + '\n');
-  if (record.error) return 'Claude Desktop не запускается — поручения ждут (' + record.error + ').';
+  if (record.error) return (kind === 'restart' ? 'Claude не перезапущен: ' : 'Claude Desktop не запускается — поручения ждут: ') + record.error;
   return kind === 'start' ? 'Открываю Claude Desktop — серверы связки живут в нём.' : 'Claude Desktop открыт без серверов связки — перезапускаю его.';
 }
 
