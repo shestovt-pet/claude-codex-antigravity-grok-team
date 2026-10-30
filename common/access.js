@@ -6,14 +6,16 @@ const fs = require('fs');
 const path = require('path');
 
 function client() {
-  const c = process.env.MOST_CLIENT;
-  if (!c || !String(c).trim()) {
+  const c0 = process.env.MOST_CLIENT;
+  let c;
+  if (!c0 || !String(c0).trim()) {
     // Under active fallback (authority=user): empty is unknown — never forge claude.
     // Outside fallback: historic default 'claude' so Desktop/tests without env stay conductor.
     if (authority() === 'user') return 'unknown';
-    return 'claude';
-  }
-  return String(c).trim();
+    c = 'claude';
+  } else c = String(c0).trim();
+  if (c === 'job' && require('./job-identity').currentJob()?.member === 'claude') return 'claude-print';
+  return c;
 }
 
 function readSessionAuthority(fallbackDir) {
@@ -43,7 +45,9 @@ function authority(opts = {}) {
 
 function guest(opts = {}) {
   const c = client();
-  if (c !== 'claude') return true;
+  // team-v46: claude-print всегда гость (исполнитель не наследует роли дирижёра); сопоставление — memberForClient.
+  try { if (!require('./members').memberForClient(c)?.roles.conductor) return true; }
+  catch { if (c !== 'claude') return true; } // Повреждение: прежний основной клиент сохраняет доступ к диагностике; записи ниже закрыты.
   const a = authority(opts);
   if (a === 'user') return true;
   if (a == null && process.env.MOST_FALLBACK_DIR) {
@@ -60,7 +64,7 @@ function isGateJudge(role) {
 function peerIsAuthority(opts = {}) {
   const a = authority(opts);
   if (!a) return false;
-  return ['grok', 'codex', 'antigravity', 'unknown'].includes(a);
+  return !isGateJudge(a);
 }
 
 function assertPeerNotJudge(opts = {}) {
@@ -87,7 +91,9 @@ function allowed(server, tool, opts = {}) {
   return guestTools(server, client()).includes(tool);
 }
 function legacyTools(server, c) {
-  if (!['codex', 'antigravity', 'grok', 'claude'].includes(c)) return [];
+  const member = require('./members').memberForClient(c);
+  if (!member && c !== 'grok') return []; // Grok: совместимость прежней пробы
+  if (member && !member.roles.sends) return server === 'team' ? ['team_status', 'team_rules', 'team_work'] : [server + '_status', server + '_result'];
   if (server === 'team') return ['team_status', 'team_rules', 'team_work'];
   return (c === 'claude' ? 'codex' : c) === server ? [] : [server + '_status', server + '_send', server + '_result'];
 }
@@ -95,10 +101,14 @@ function legacyTools(server, c) {
 // Инструменты гостя при старте (team-v19, К2): у гостей codex и antigravity — team_word и сервер своей семьи; право
 // пользоваться ими проверяет guard при вызове; чат Codex получает свой сервер и вне запасного режима (team-v25).
 function guestTools(server, c) {
-  // Live guests: codex / antigravity. Fallback also: grok guest, claude-named-as-guest.
-  if (!['codex', 'antigravity', 'grok', 'claude'].includes(c)) return [];
-  const seat = ['codex', 'antigravity'].includes(c);
-  if (server === 'team') return ['team_status', 'team_rules', 'team_work', ...(seat ? ['team_word'] : [])];
+  // Live guests: codex / antigravity / claude-print. Fallback also: grok guest, claude-named-as-guest.
+  const member = require('./members').memberForClient(c);
+  if (!member && c !== 'grok') return []; // Grok: совместимость прежней пробы
+  // team-v46: исполнитель claude-print не вызывает собственный сервер claude — исключено явно, не из сопоставления.
+  if (c === 'claude-print' && server === 'claude') return [];
+  if (member && !member.roles.sends) return server === 'team' ? ['team_status', 'team_rules', 'team_work'] : [server + '_status', server + '_result'];
+  const seat = !!member?.roles.fallback_conductor;
+  if (server === 'team') return ['team_status', 'team_rules', 'team_work', 'team_ask', 'team_ask_result', ...(seat ? ['team_word'] : [])];
   const base = [server + '_status', server + '_send', server + '_result'];
   if (seat && c === server) return [...base, ...(server === 'antigravity' ? ['antigravity_apply', 'antigravity_cancel'] : ['codex_cancel'])];
   const peer = c === 'claude' ? 'codex' : c;
@@ -107,17 +117,33 @@ function guestTools(server, c) {
 }
 
 function guard(server, tool, a = {}, opts = {}) {
+  const readOnly = /_(?:result|status)$/.test(tool) && !(tool === 'team_status' && (a.claude_quota || a.claude_usage || a.notify_test)) ||
+    tool === 'team_rules' || tool === 'team_work' && ['get', 'list'].includes(a.action) || tool === 'team_word' && a.action === 'list';
+  if (!readOnly) require('./members').snapshot();
   if (tool === 'codex_send' && a.full_access && guest(opts))
     throw Error('Гостю полный доступ Codex запрещён; изменения не выполнены.');
+  if (tool === 'deepseek_send' && a.full_access && guest(opts))
+    throw Error('Гостю полный доступ DeepSeek запрещён; изменения не выполнены.');
+  // team-v46: полный доступ Claude-исполнителю ставит только дирижёр; запись — как у Codex (проверяется ниже).
+  if (tool === 'claude_send' && a.full_access && guest(opts))
+    throw Error('Гостю полный доступ Claude запрещён; изменения не выполнены.');
   // Права дирижёра запасного режима (team-v19, К2) снимают запреты гостю на изменение работ и запись по поручению.
   const fallback = require('./fallback'), conductor = guest(opts) && fallback.conductorAllows(server, tool, a);
   if (!allowed(server, tool, opts) || (guest(opts) && (
     (tool === 'team_work' && !['get', 'list'].includes(a.action) && !conductor) ||
     (tool === 'team_status' && (a.claude_quota || a.claude_usage || a.notify_test)) ||
-    (tool === 'codex_send' && a.write && client() !== 'codex' && !conductor) ||
+    (tool === 'codex_send' && a.write && !require('./members').canWrite(client()) && !conductor) ||
+    (tool === 'deepseek_send' && a.write && !require('./members').canWrite(client()) && !conductor) ||
+    (tool === 'claude_send' && a.write && !require('./members').canWrite(client()) && !conductor) ||
+    tool === 'deepseek_cancel' ||
     tool === 'team_change'
   ))) {
     throw Error('Гостю это действие запрещено; изменения не выполнены.');
+  }
+  if (/_send$/.test(tool) && server !== 'grok') {
+    const members = require('./members'), recipient = members.receiver(server);
+    if (!members.canSend(client(), recipient?.id)) throw Error('Реестр участников запрещает отправку этому получателю.');
+    if (a.write && !members.canWrite(recipient.id)) throw Error('Реестр участников запрещает запись: получателю нужна роль writer.');
   }
   fallback.guard(server, tool, a);
 }

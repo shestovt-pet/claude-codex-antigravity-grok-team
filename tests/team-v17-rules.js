@@ -10,7 +10,7 @@ const brief = read('rules/brief.md');
 const helpers = read('skill/helpers/SKILL.md');
 const common = read('rules/common.md');
 const blockTitle = '## Сначала — результат и проверка';
-const helpersTitle = '# Работа с помощниками (связка трёх ИИ)';
+const helpersTitle = '# Работа с помощниками (связка ИИ)';
 const sha256 = text => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 const lineCount = text => (text.match(/\n/g) || []).length;
 let passed = 0, failed = 0;
@@ -72,8 +72,9 @@ test('К5: обе копии совпадают с принятым блоком
   const a = block(brief, brief.split('\n')[0]);
   const b = block(helpers, helpersTitle);
   assert.equal(a, b);
-  // Принятый блок ред. 7, имя заменено в team-v29, чтобы закреплённый текст не менялся выгрузкой.
-  assert.equal(sha256(a), 'c611ddc143fc5ec06e1c16c8a50d606f9519a7d626cce7657edf3d0fbb4cace8');
+  // Блок кандидата А: состав читается из team_status; прежний порядок КТ0–КТ5 сохранён.
+  // team-v39: КТ4 — «две голосующие семьи («2 из 3»)» (решения пользователя 12.10 и 20.10; сервер v16).
+  assert.equal(sha256(a), 'efa8645654fc0690573a475db4ae921b50e29995bf95ce2d6adc117c175350dd');
   assert(lineCount(a) <= 15, 'Блок длиннее 15 строк');
   assert(a.length <= 1500, 'Блок длиннее 1500 знаков');
 });

@@ -27,8 +27,56 @@ function fingerprint(pid) {
   if (process.platform !== 'win32') return require('./fallback').processTable(true, { native: true }).find(p => p.pid === pid) || null;
   const out = cp.execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
     "$ErrorActionPreference='Stop'; try { $p=Get-Process -Id " + pid + " -ErrorAction Stop } catch { if ($_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId*') { 'null'; exit 0 }; throw }; @{pid=$p.Id;startedAt=$p.StartTime.ToUniversalTime().ToString('o');name=$p.ProcessName} | ConvertTo-Json -Compress"],
-  { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+  { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
   return JSON.parse(out.trim());
+}
+// team-v46: прямой родитель без PowerShell на каждое поручение. При старте сервера один раз запускается
+// фоновый PowerShell-сторож: открывает дескрипторы родителя (process.ppid) и самого сервера ($p.Handle, $s.Handle —
+// пока дескриптор открыт, Windows не переиспользует pid), печатает время запуска родителя и ждёт, пока выйдет
+// родитель (exit 0) или сервер (exit 3) — так сторож не переживает принудительно убитый сервер.
+// Решение принимается по текущему состоянию, а не по сохранённому флагу: сторож жив (t1) → родитель жив (t2) →
+// сторож всё ещё жив (t3). Сторож жив на всём [t1, t3] (pid сторожа держит libuv), значит, дескриптор родителя
+// открыт и pid родителя на [t1, t3] не переиспользован — живой процесс в t2 и есть исходный родитель.
+// Время запуска не совпало с server.parent.startedAt, сторож не ответил или не работает — null → прежняя processState.
+let parentWatch = null;
+function watchParent(deps = {}, state = null) {
+  // В тестах (NODE_ENV=test) настоящий сторож не запускается — только подменённый deps.spawnWatch.
+  if (parentWatch || (!deps.spawnWatch && (process.platform !== 'win32' || process.env.NODE_ENV === 'test'))) return parentWatch;
+  const pid = process.ppid;
+  // Ответ сторожа дублируется в файл: вывод PowerShell в канал на ПК пользователя до сервера не доходил (29.10, сторожа живы, ответа нет).
+  const markFile = state ? path.join(state, 'restart-servers', process.pid + '.watch') : null;
+  const w = parentWatch = { pid, startedAt: null, child: null, exitCode: null, spawnedAt: Date.now(), markFile };
+  try {
+    w.child = (deps.spawnWatch || ((ppid, self) => cp.spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      "$ErrorActionPreference='Stop'; $p=Get-Process -Id " + ppid + "; $h=$p.Handle; $s=Get-Process -Id " + self + "; $sh=$s.Handle; " +
+      "$t=$p.StartTime.ToUniversalTime().ToString('o'); " +
+      (markFile ? "[IO.File]::WriteAllText('" + markFile.replace(/'/g, "''") + "', $t); " : '') +
+      "[Console]::Out.WriteLine($t); [Console]::Out.Flush(); " +
+      "while (-not $p.HasExited -and -not $s.HasExited) { Start-Sleep -Milliseconds 500 }; if ($p.HasExited) { exit 0 } else { exit 3 }"],
+    { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })))(pid, process.pid);
+  } catch { w.exitCode = -1; return w; }
+  let buf = '';
+  w.child.stdout?.on('data', d => { buf += d; if (buf.includes('\n') && !w.startedAt) w.startedAt = buf.split(/\r?\n/)[0].trim(); });
+  w.child.on('error', () => { w.exitCode = -1; });
+  w.child.on('exit', code => { w.exitCode = code; });
+  w.child.unref?.(); w.child.stdout?.unref?.();
+  process.once('exit', () => { try { w.child.kill(); } catch {} });
+  return w;
+}
+function directParentState(parent, w = parentWatch, kill = process.kill.bind(process)) {
+  if (!w || !w.child || !parent || parent.pid !== w.pid) return null;
+  if (!w.startedAt && w.markFile) { try { const t = fs.readFileSync(w.markFile, 'utf8').trim(); if (/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(t)) w.startedAt = t; } catch {} }
+  // Сторож ещё не ответил (PowerShell на ПК пользователя до 1 мин) — не ждать синхронный PowerShell внутри поручения.
+  // Ждём ответа сторожа не дольше 3 мин; дальше — прежняя проверка.
+  if (!w.startedAt) return w.exitCode === null && w.child.pid && Date.now() - (w.spawnedAt || 0) < 180000 ? 'pending' : null;
+  if (!Number.isFinite(stamp(w.startedAt)) || stamp(w.startedAt) !== stamp(parent.startedAt)) return null;
+  const alive = pid => { try { kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM' || e.code === 'EACCES' ? true : e.code === 'ESRCH' ? false : null; } };
+  if (w.exitCode === 0) return 'dead';
+  if (w.exitCode !== null || !w.child.pid) return null;
+  if (alive(w.child.pid) !== true) return null;           // t1: сторож жив
+  const p = alive(parent.pid);                              // t2: родитель
+  if (alive(w.child.pid) !== true) return null;           // t3: сторож всё ещё жив
+  return p === true ? 'alive' : null;
 }
 function processState(owner, deps = {}) {
   if (!owner?.pid || !Number.isFinite(stamp(owner.startedAt))) return 'unknown';
@@ -42,6 +90,8 @@ function capture(deps = {}) {
     const rows = (deps.processTable || (() => require('./fallback').processTable(true, { native: true })))();
     const byPid = new Map(rows.map(r => [r.pid, r])); let p = byPid.get(process.pid);
     if (!p) throw Error('Нет процесса сервера в дереве процессов.');
+    // team-v46: свой отпечаток — из того же снимка, без второго PowerShell при старте.
+    if (Number.isFinite(stamp(p.startedAt))) server.self = { pid: p.pid, startedAt: p.startedAt, name: p.name };
     const seen = new Set([p.pid]);
     while (p.ppid && p.pid !== 4 && p.ppid !== 4 && !seen.has(p.ppid)) {
       const next = byPid.get(p.ppid);
@@ -76,6 +126,7 @@ function refusal(kind, h = {}) {
   const text = kind === 'old' ? 'Этот сервер моста остался от закрытого Claude: поручение не принято. Повторите через минуту — ответит новый сервер.' :
     kind === 'doomed' ? `Этот Claude должен был закрыться при перезапуске моста (операция ${h.id}): его серверы поручения не принимают. Перезапустите Claude — после этого поручения пойдут.` :
     kind === 'parent' ? 'Не удалось проверить, что Claude этого сервера работает: поручение не принято, чтобы не оборваться. Если повторяется — это сбой моста, сообщите.' :
+    kind === 'starting' ? 'Сервер моста ещё готовится после запуска (проверка процессов Windows, до 1–2 мин): поручение не принято. Повторите через минуту.' :
     kind === 'unreadable' ? 'Не удалось прочитать состояние паузы перезапуска: поручение не принято, чтобы не оборваться. Если повторяется — это сбой моста, сообщите.' :
     `Идёт перезапуск Claude для установки моста (операция ${h.id}, с ${time(h)}): поручение не принято, чтобы не оборваться. Повторите через 2–3 минуты.`;
   return { ok: false, kind, reason: text };
@@ -90,6 +141,13 @@ function admit(state, server, { early = false, ...deps } = {}) {
   let processRows, targetTable;
   const processTable = () => processRows ??= (deps.processTable || (() => require('./fallback').processTable(true, { native: true })))();
   try {
+    try {
+      const registry = require('./members-store').create(state).read();
+      const members = require('./members');
+      if (Object.values(members.adapters).some(a => a.server === server.name) && !members.receiver(server.name, registry.members))
+        return { ok: false, kind: 'members', reason: 'Сервер ' + server.name + ' не имеет получателя поручений по реестру.' };
+    } catch (e) { return { ok: false, kind: 'members', reason: e.message }; }
+    if (server.pending) return refusal('starting');
     const r = hold(state);
     if (r.error) return refusal('unreadable');
     if (!r.missing) {
@@ -112,7 +170,7 @@ function admit(state, server, { early = false, ...deps } = {}) {
       }
     }
     // Повтор только при решающем допуске под job_start, до свежих проверок поколения и родителя.
-    const retryDue = server.error && (deps.now || Date.now)() - server.captureAttemptAt >= 10000;
+    const retryDue = server.error && !server.async && (deps.now || Date.now)() - server.captureAttemptAt >= 10000;
     if (retryDue && !early) {
       const fresh = capture({ ...deps, processTable, serverStartedAt: server.startedAt });
       server.captureAttemptAt = fresh.captureAttemptAt;
@@ -156,7 +214,10 @@ function admit(state, server, { early = false, ...deps } = {}) {
     // Ранняя проверка не восстанавливает снимок: она лишь пропускает запрос к job_start.
     if (server.error) return early && retryDue ? { ok: true } : refusal('parent');
     if (!server.parent) return refusal('old');
-    const parent = processState(server.parent, deps);
+    // team-v46: ответ фонового сторожа родителя (watchParent); без ответа — прежняя проверка (PowerShell 18–60 с на ПК пользователя).
+    const watched = !deps.fingerprint && directParentState(server.parent);
+    if (watched === 'pending') return refusal('starting');
+    const parent = watched || processState(server.parent, deps);
     if (parent === 'dead') return refusal('old');
     if (parent !== 'alive') return refusal('parent');
     return { ok: true };
@@ -238,14 +299,64 @@ function warnings(state, deps = {}) {
 }
 function saveServer(state, s, deps) {
   const dir = path.join(state, 'restart-servers'); fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, process.pid + '.json'), Buffer.from(JSON.stringify({ ...s, process: (deps.fingerprint || fingerprint)(process.pid) })));
+  fs.writeFileSync(path.join(dir, process.pid + '.json'), Buffer.from(JSON.stringify({ ...s, process: (!deps.fingerprint && s.self) || (deps.fingerprint || fingerprint)(process.pid) })));
+}
+// team-v46: снимок процессов асинхронно — сервер подключается к Claude, не дожидаясь PowerShell (18–60 с на ПК пользователя;
+// Claude Desktop ждёт ответа сервера ~60 с). Пока снимка нет, admit отвечает «сервер ещё готовится».
+// Запасной снимок без WMI: Get-Process только своего процесса и родителя (CIM при одновременном старте серверов
+// на ПК пользователя зависал дольше 5 мин). Даёт цепочку «сервер → прямой родитель» — достаточно для допуска.
+function selfParentRowsAsync() {
+  return new Promise((resolve, reject) => cp.execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    "Get-Process -Id " + process.pid + "," + process.ppid + " | Select-Object Id,ProcessName,@{n='Start';e={$_.StartTime.ToUniversalTime().ToString('o')}} | ConvertTo-Json -Compress"],
+  { encoding: 'utf8', windowsHide: true, timeout: 120000 }, (e, out) => {
+    if (e) return reject(e);
+    try {
+      resolve([].concat(JSON.parse(out || '[]')).map(r => ({ pid: r.Id, ppid: r.Id === process.pid ? process.ppid : null, name: r.ProcessName, startedAt: r.Start || null })));
+    } catch (err) { reject(err); }
+  }));
+}
+function processTableAsync(timeout = 90000) {
+  return new Promise((resolve, reject) => cp.execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,@{n='Start';e={if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}}} | ConvertTo-Json -Compress"],
+  { encoding: 'utf8', windowsHide: true, timeout, maxBuffer: 64e6 }, (e, out) => {
+    if (e) return reject(e);
+    try { resolve([].concat(JSON.parse(out || '[]')).map(r => ({ pid: r.ProcessId, ppid: r.ParentProcessId, name: r.Name, startedAt: r.Start || null }))); }
+    catch (err) { reject(err); }
+  }));
+}
+function serverAsync(state, name, deps = {}) {
+  if (process.platform !== 'win32' && !deps.processTableAsync) return server(state, name, deps);
+  const s = { startedAt: deps.serverStartedAt || locks.STARTED_AT, ancestors: [], parent: null, closed: false, ended: 'broken', captureAttemptAt: (deps.now || Date.now)(), name, pending: true, async: true };
+  const tries = deps.captureTries || 20, pause = deps.captureRetryMs ?? 10000;
+  let n = 0;
+  // Снимок только асинхронно: при сбое (на ПК пользователя при одновременном старте серверов CIM бывает дольше 2 мин) —
+  // повтор через паузу, без синхронного PowerShell внутри поручения; пока снимка нет — отказ «готовится».
+  const table = deps.processTableAsync || (() => processTableAsync().catch(() => selfParentRowsAsync()));
+  const attempt = () => table().then(rows => {
+    const c = { ...capture({ ...deps, processTable: () => rows }), name };
+    if (c.error) throw Error(c.error);
+    const closed = s.closed; delete s.error; Object.assign(s, c, { closed: closed || c.closed, async: true }); delete s.pending;
+    try { saveServer(state, s, deps); } catch (e) { process.stderr.write('Не записана цепочка предков сервера: ' + e.message + '\n'); }
+    if (!deps.processTableAsync) watchParent({}, state);
+    return s;
+  }).catch(e => {
+    s.error = e.message; s.captureAttemptAt = (deps.now || Date.now)();
+    process.stderr.write('Пауза перезапуска: ' + e.message + '\n');
+    if (++n >= tries) { delete s.pending; return s; }
+    return new Promise(r => { const t = setTimeout(r, pause); if (!deps.processTableAsync) t.unref?.(); }).then(attempt);
+  });
+  s.ready = attempt();
+  s.ready.catch(() => {});
+  return s;
 }
 function server(state, name, deps = {}) {
   const s = { ...capture(deps), name };
   if (s.error) process.stderr.write('Пауза перезапуска: ' + s.error + '\n');
   try { saveServer(state, s, deps); }
   catch (e) { process.stderr.write('Не записана цепочка предков сервера: ' + e.message + '\n'); }
+  // Сторож — только у настоящего сервера (вызов без подмен), после снимка: не соперничает с ним за запуск PowerShell.
+  if (!Object.keys(deps).length) watchParent({}, state);
   return s;
 }
-module.exports = { RESTART_HOLD_PROTOCOL, same, fingerprint, processState, capture, server, publish, cancel, holdFile, claimFile, hold, decision,
+module.exports = { RESTART_HOLD_PROTOCOL, same, fingerprint, watchParent, directParentState, resetParentWatch: () => { parentWatch = null; }, processState, capture, server, serverAsync, processTableAsync, selfParentRowsAsync, publish, cancel, holdFile, claimFile, hold, decision,
   admit, assertAdmitted, locked, resolved, cleanup, begin, abort, warnings };

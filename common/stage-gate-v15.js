@@ -3,7 +3,7 @@
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const stores = require('./team-store');
 const g = () => require('./stage-gate');
-const families = ['anthropic', 'openai', 'google', 'xai'];
+const families = require('./members').families;
 const seats = require('./members').seats;
 const fold = s => s.trim().toLowerCase().replace(/ё/g, 'е');
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');
@@ -153,7 +153,7 @@ function decisions(s, old, rows) {
     throw Error('Журнал решений неизменяем: допускается только добавление.');
   for (let i = 0; i < entries.length; i++) {
     const d = entries[i];
-    if (!['dismiss', 'reconsider', 'replace'].includes(d.kind) || !d.version || !d.reason?.trim()) throw Error('Некорректная запись журнала решений.');
+    if (!['dismiss', 'reconsider', 'reconsider_by_other', 'replace'].includes(d.kind) || !d.version || !d.reason?.trim()) throw Error('Некорректная запись журнала решений.');
     if (d.version !== s.version || d.replacement === 'grok' || (s.gate?.historicGrokIds || []).includes(d.job_id)) continue;
     if (d.kind === 'dismiss') {
       const row = rows.find(j => j.id === d.job_id && j.count);
@@ -172,6 +172,16 @@ function decisions(s, old, rows) {
           d.outcome !== (next.count ? 'повторный блокирующий отказ' : 'пересмотрено и принято'))
         throw Error('Пересмотр не подтверждён поручением того же проверяющего с причиной.');
     }
+    if (d.kind === 'reconsider_by_other') {
+      const original = rows.find(j => j.id === d.job_id && j.count), next = rows.find(j => j.id === d.review_job_id);
+      const dismissal = entries.find(x => x.kind === 'dismiss' && x.version === d.version && x.job_id === d.job_id);
+      if (!original || !next || !dismissal || next.who === original.who || next.count ||
+          g().at(next) <= Date.parse(dismissal.at) || !g().task(next).includes(original.id) || !g().task(next).includes(dismissal.reason))
+        throw Error('Пересмотр другой семьёй не подтверждён поручением ПРИНЯТО с причиной и позже отклонения.');
+      if (Number(s.rules_version) < 16) throw Error('reconsider_by_other допустим только по правилам 16.');
+      if (!require('./members').paused(original.who)) throw Error('reconsider_by_other допустим только для отказа участника на ручной паузе.');
+      if (next.family === original.family) throw Error('reconsider_by_other требует подтверждения другой семьи.');
+    }
     if (i >= previous.length && !d.at) d.at = new Date().toISOString();
     if (!Number.isFinite(Date.parse(d.at))) throw Error('Нет времени решения.');
   }
@@ -187,7 +197,10 @@ function materialSeen(w, s, p, j) {
   });
 }
 async function evaluate(w, s, old, jobs, snapshot) {
+  if (w.closed && s.override?.closed_by_word) return 'выдан без принятия (закрыто словом пользователя)';
   const messages = [], wantsAccept = s.state === 'принят' || !!s.criterion_met;
+  // Удаление или отключение обязательного голосующего не снижает требований: принятие ждёт (ревью Antigravity).
+  if (wantsAccept) require('./members').requiredVoters();
   const action = wantsAccept || s.state === 'выдан без принятия' || s.fresh_review_file || s.override || s.one_family || s.decisions?.length;
   if (!s.level || !s.author) { if (action) throw Error('Нужны level и author.'); return ''; }
   if (!['мелочь', 'обычный', 'высокий'].includes(s.level)) throw Error('Неизвестный level.');
@@ -237,10 +250,15 @@ async function evaluate(w, s, old, jobs, snapshot) {
     if (last.status !== 'done') messages.push(who + ': ' + (require('./states')[last.status] || last.status) + ' · поручение ' + last.id);
     return [{ who, job_id: last.id, status: last.status }];
   });
+  s.gate.quorum = [];
   for (const p of ps) {
     const label = p.part || 'этап';
-    const candidates = Object.values(seats).filter(f => !p.families.includes(f));
-    const needed = Math.max(1, candidates.length);
+    const candidates = [...new Set(Object.values(seats))].filter(f => !p.families.includes(f));
+    // v16 (team-v31, фаза B) — формула 3.2: min(2, |E|) разных внешних семей, кроме семей автора;
+    // при авторе anthropic — всегда 2 (при |E|=1 этап ждёт). v15 — все допустимые семьи.
+    const v16 = s.rules_version >= 16;
+    const needed = v16 ? Math.min(2, candidates.length) + (p.families.includes('anthropic') && candidates.length === 1 ? 1 : 0) : Math.max(1, candidates.length);
+    s.gate.quorum.push({ part: p.part || '', needed, families: candidates });
     const mixedSeat = false;
     const applicable = rows.filter(j => covers(j, p, ps));
     const regular = applicable.filter(j => j.who !== 'fresh' && j.role === 'проверка' && seats[j.who] === j.family && candidates.includes(j.family) && materialSeen(w, s, p, j));
@@ -272,9 +290,24 @@ async function evaluate(w, s, old, jobs, snapshot) {
       const d = dismissals.find(d => d.job_id === j.id);
       const reconsidered = d && regular.some(n => n.who === j.who && !n.count && g().at(n) > Date.parse(d.at) &&
         g().task(n).includes(d.job_id) && g().task(n).includes(d.reason));
+      const byOther = d && (s.decisions || []).some(x => x.kind === 'reconsider_by_other' && x.job_id === j.id &&
+        regular.some(n => n.id === x.review_job_id && n.who !== j.who && !n.count && seats[n.who] && candidates.includes(seats[n.who]) && covers(n, p, ps)));
       const replaced = d && replacements.some(h => h.replacement === j.who && !h.count);
       if (d && lenient(p, d)) messages.push('особое мнение: отклонено с причиной ' + j.who + ': ' + d.reason);
-      else if (!reconsidered && !replaced) negatives.push({ j, label, reason: d ? 'отклонено, ждёт пересмотра' : 'открыто' });
+      else if (!reconsidered && !byOther && !replaced) negatives.push({ j, label, reason: d ? 'отклонено, ждёт пересмотра' : 'открыто' });
+    }
+    // Пауза не снимает ранее полученный блокирующий отказ: он закрывается только reconsider_by_other другой семьи.
+    // Но отказ, который участник сам закрыл до паузы (поздним ПРИНЯТО на актуальном материале или пересмотром),
+    // блокером не становится.
+    const pausedBlockers = applicable.filter(j => j.who !== 'fresh' && j.role === 'проверка' && j.count &&
+      require('./members').paused(j.who) && !p.families.includes(j.family) && !regular.some(n => n.who === j.who) &&
+      materialSeen(w, s, p, j) &&
+      !applicable.some(n => n.who === j.who && !n.count && materialSeen(w, s, p, n) && g().compare(n, j) > 0));
+    for (const j of pausedBlockers) {
+      const d = dismissals.find(d => d.job_id === j.id);
+      const byOther = d && (s.decisions || []).some(x => x.kind === 'reconsider_by_other' && x.job_id === j.id &&
+        regular.some(n => n.id === x.review_job_id && n.who !== j.who && !n.count && seats[n.who] && candidates.includes(seats[n.who]) && covers(n, p, ps)));
+      if (!byOther) negatives.push({ j, label, reason: 'участник на паузе: отказ закрывается только reconsider_by_other' });
     }
     // Если отказ отклонён, положительный ответ без причины в поручении не считается пересмотром.
     for (const d of dismissals) {
@@ -286,10 +319,14 @@ async function evaluate(w, s, old, jobs, snapshot) {
     }
     const approved = new Set([...latest.values()].filter(j => !j.count).map(j => j.family));
     const replacement = replacements.at(-1);
-    if (candidates.length + (mixedSeat ? 1 : 0) < needed || latest.size + (replacement ? 1 : 0) < needed) unfilled.push(label);
+    if (v16 && candidates.length === 0) { missing.push(label + ': нет активной внешней семьи для приёмки'); }
+    else if (candidates.length + (mixedSeat ? 1 : 0) < needed || latest.size + (replacement ? 1 : 0) < needed) unfilled.push(label);
     if (replacement && !replacement.count) approved.add('anthropic');
-    if (candidates.length + (mixedSeat ? 1 : 0) < needed) missing.push(label + (needed === 1 ? ': нет проверяющего другой семьи' : ': нет двух проверяющих другой семьи'));
-    else if (approved.size < needed) missing.push(label + (needed === 1 ? ': нужно ПРИНЯТО другой семьи' : ': нужны два ПРИНЯТО разных семей'));
+    if (v16 && candidates.length === 0) { /* ждёт: выше */ }
+    else if (candidates.length + (mixedSeat ? 1 : 0) < needed) missing.push(label + (needed === 1 ? ': нет проверяющего другой семьи' : ': нет двух проверяющих другой семьи'));
+    // team-v39: прежние слова отказа (их читают тесты и пользователь) + сколько есть.
+    else if (approved.size < needed) missing.push(label + (needed === 1 ? ': нужно ПРИНЯТО другой семьи' : needed === 2 ? ': нужны два ПРИНЯТО разных семей' : ': нужны ' + needed + ' ПРИНЯТО разных семей') + ' (есть ' + approved.size + ': ' + ([...approved].join(', ') || 'нет') + ')');
+    else if (v16 && candidates.length === 1 && !p.families.includes('anthropic')) messages.push(label + ': принято одной семьёй: другой допустимой нет');
     if (replacement?.count) negatives.push({ j: replacement, label, reason: 'отказ помощника на месте замены' });
     if (s.level === 'высокий') {
       const extra = savedHelpers.filter(h => !h.replacement && h.hash !== replacement?.hash).at(-1);

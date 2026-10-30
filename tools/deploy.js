@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 'use strict';
-const { deploy, configure, configureClients, rollback } = require('../common/deploy');
 function parseArgs(args) {
-  const options = { root: process.env.MOST_REPO_ROOT || process.cwd() },
+  const options = {},
     configs = [];
   let undo = false;
   for (let i = 0; i < args.length; i++) {
@@ -39,24 +38,33 @@ function parseArgs(args) {
     throw Error('Параметры сборки неприменимы к откату; --state-dir допустим с --config-only.');
   if (undo && options.dryRun) throw Error('Для отката проверочный режим не предусмотрен.');
   if (options.result && (!options.configOnly || undo || options.dryRun)) throw Error('--result требует --config-only без отката и проверочного режима.');
+  if (options.result && !options.release) throw Error('--result требует --release.');
   return { options, undo };
 }
 async function main(args, deps = {}) {
   const {options, undo} = parseArgs(args);
+  const boot = require('./deploy-bootstrap');
+  boot.bootstrap(options, undo, __filename);
+  const { deploy, configure, configureClients, rollback } = require('../common/deploy');
+  if (!undo && !options.configOnly && !options.clientsOnly && !options.releaseOnly) options.external = true;
   if (undo && options.clientsOnly) {
     const clients = require('../common/client-configs').paths().filter(p => require('fs').existsSync(p.file));
-    const text = await rollback({ configOnly: true, configs: clients.map(p => p.file), stateDir: options.stateDir });
+    const text = await rollback({ root: options.root, configOnly: true, configs: clients.map(p => p.file), stateDir: options.stateDir });
     const result = text + '\n' + (await require('../common/client-rules').configure({ rollback: true })).join('\n');
     (deps.print || console.log)(result); return result;
   }
   const action = undo ? (deps.rollback || rollback) : options.clientsOnly ? (deps.configureClients || configureClients) : options.configOnly ? (deps.configure || configure) : (deps.deploy || deploy);
-  const result = options.result ? await require('../common/deploy-ops').execute(options, action, deps) : await action(options);
+  const result = options.result ? await require('../common/deploy-ops').execute(options, action,
+    { ...deps, validateResult: () => {
+      const context = boot.resultContext(options, __filename);
+      if (!boot.equal(context.file, options.result)) throw Error('Путь результата операции изменился перед записью.');
+    } }) : await action(options);
   (deps.print || console.log)(result);
   return result;
 }
 if (require.main === module)
   main(process.argv.slice(2)).catch((e) => {
-    console.error('Ошибка: ' + require('../common/errors').errorText(e));
+    console.error('Ошибка: ' + (e.message || String(e)));
     process.exitCode = 1;
   });
 module.exports = { main, parseArgs };

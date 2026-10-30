@@ -9,18 +9,22 @@ function duration(ms) {
   return [h ? h + ' ч' : '', m ? m + ' мин' : '', s + ' с'].filter(Boolean).join(' ');
 }
 
+function participant(assistant) { try { return require('./members').all().find(m => m.title === assistant)?.id; } catch { return 'unknown'; } }
+
 function format(assistant, job = {}, body = '', next = 'Проверьте результат.') {
   const elapsed =
     job.durationSec != null
       ? job.durationSec * 1000
       : (Date.parse(job.finishedAt) || Date.now()) - (Date.parse(job.startedAt) || Date.now());
   const normalized = ['lost', 'needs_decision'].includes(job.status);
-  const state = job.stopUnconfirmed && !normalized ? states.stop_unconfirmed : states[job.status] || states.failed;
+  const state = job.closedByWord ? 'ОТМЕНЕНО · закрыто словом пользователя ' + job.closedByWord.word_id : job.stopUnconfirmed && !normalized ? states.stop_unconfirmed : states[job.status] || states.failed;
   const summary = assistant === 'Команда' || !job.id;
   const summaryHeader = 'Команда · ' + (job.status === 'failed' ? 'ошибка' : 'сводка') + ' · ' +
     new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
   const embedded = body.match(/^(?:⚠ Статус пользователю[^\n]*\n)+/)?.[0];
-  const warning = embedded ? embedded.trimEnd() : (require('./request-context').context.getStore()?.publicSnapshot?.warning ?? require('./work-owner').reminder());
+  // team-v44 П3: напоминание только в team_status/team_work; без имени инструмента — нет, встроенная строка тоже снимается.
+  const allowed = ['team_status', 'team_work'].includes(require('./request-context').context.getStore()?.tool);
+  const warning = embedded ? (allowed ? embedded.trimEnd() : '') : (require('./request-context').context.getStore()?.publicSnapshot?.warning ?? (allowed ? require('./work-owner').reminder() : ''));
   if (embedded) body = body.slice(embedded.length);
   return [
     warning,
@@ -39,8 +43,9 @@ function format(assistant, job = {}, body = '', next = 'Проверьте ре�
     assistant === 'Codex' && job.id ? 'запрошено: модель ' + (job.model || 'unknown') + ', уровень ' + (job.effort || 'unknown') + '; подтверждено: модель unknown, уровень unknown' : '',
     assistant === 'Codex' && job.fullAccessApplied === true
       ? 'Доступ: полный (от имени пользователя, без песочницы); изменения вне папки поручения в список изменённых файлов не попадают' : '',
-    !summary ? require('./provenance').format(job, ({ Antigravity: 'antigravity', Codex: 'codex', Grok: 'grok' })[assistant] || 'unknown') : '',
+    !summary ? require('./provenance').format(job, (assistant === 'Grok' ? 'grok' : participant(assistant)) || 'unknown') : '',
     require('./progress').progress(job),
+    require('./text-format').warning(job),
     body,
     job.stopUnconfirmed && normalized ? 'ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА: проверьте оставшийся процесс исполнителя.' : '',
     job.write && job.status === 'done' ? 'ИЗМЕНЕНИЯ УЖЕ ВНЕСЕНЫ в ' + (job.folder || job.cwd) : '',

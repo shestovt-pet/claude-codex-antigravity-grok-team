@@ -1,6 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
 const fs = require('fs'), path = require('path'), assert = require('assert');
 const RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-review-'));
+process.env.MOST_REPO_ROOT = RUN;
 process.env.MOST_STATE_DIR = path.join(RUN, 'state');
 process.env.MOST_NOTIFY = 'file:' + path.join(RUN, 'notify.jsonl');
 const write = (f, s) => { fs.mkdirSync(path.dirname(f), {recursive:true}); fs.writeFileSync(f,s); };
@@ -90,7 +92,7 @@ test('F2: исправление записи того же релиза тож�
   for(const [k,f] of Object.entries(files))assert.equal(fs.readFileSync(f+'.prev','utf8'),backups[k].text);
 });
 test('F2: rollback возвращает предыдущий релиз после повторной установки',async()=>{
-  await d.rollback({configs:Object.values(files),configOnly:true});
+  await d.rollback({root:RUN,configs:Object.values(files),configOnly:true});
   assert.equal(fs.readFileSync(files.codex,'utf8'),original.codex);
   for(const k of ['agy','claude'])assert.equal(read(files[k]).mcpServers.team.args[0],path.join(oldRelease,'servers/team/index.js'));
   assert.deepEqual(read(files.permissions).userSettings.globalPermissionGrants.allow,['keep']);
@@ -111,10 +113,11 @@ test('F6: ошибка записи исключает перезапуск и �
 });
 test('F6: разбор параметров и выбор обработчика без реального перезапуска',async()=>{
   for(const mode of ['--clients-only','--config-only']) {
-    const args=[mode,'--release',current,'--restart-claude','--dry-run',...(mode==='--config-only'?['--config',files.claude]:[])];
-    const parsed=cli.parseArgs(args).options;assert(parsed.restartClaude&&parsed.dryRun);assert.equal(parsed.release,current);
+    const legal = require('./fixtures/team-v43/fixture').release(RUN,'c'.repeat(40));
+    const args=[mode,'--root',RUN,'--release',legal,'--restart-claude','--dry-run',...(mode==='--config-only'?['--config',files.claude]:[])];
+    const parsed=cli.parseArgs(args).options;assert(parsed.restartClaude&&parsed.dryRun);assert.equal(parsed.release,legal);
     const handler=async opts=>{assert(opts.restartClaude);return 'проверено';};
-    assert.equal(await cli.main(args,{configureClients:handler,configure:handler,deploy:()=>assert.fail('сборка'),print:()=>{}}),'проверено');
+    assert.equal(await require(path.join(legal,'tools/deploy.js')).main(args,{configureClients:handler,configure:handler,deploy:()=>assert.fail('сборка'),print:()=>{}}),'проверено');
   }
   for(const args of [['--clients-only'],['--clients-only','--config-only'],['--clients-only','--release-only'],['--clients-only','--release',current,'--config',files.claude],['--clients-only','--release',current,'--commit','main'],['--clients-only','--release',current,'--node-modules-from',RUN],['--clients-only','--release',current,'--rollback'],['--restart-claude'],['--config-only','--restart-claude'],['--config-only','--release',current,'--restart-claude','--rollback']])assert.throws(()=>cli.parseArgs(args));
 });

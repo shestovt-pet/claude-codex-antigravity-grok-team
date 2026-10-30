@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 // team-v25, #455d6490, замысел ред. 2. О1–О12, только временные данные клона.
 const fs = require('fs'), path = require('path'), cp = require('child_process'), assert = require('assert');
 const ROOT = path.resolve(__dirname, '..'), CASE = process.env.MOST_V25_CASE;
@@ -11,7 +15,7 @@ const read = f => JSON.parse(fs.readFileSync(f, 'utf8'));
 let RUN, REPO, STATE, PROJECT, JOBS, LOG, RELEASE;
 if (CASE !== undefined) {
   RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v25-'));
-  REPO = path.join(RUN, 'repo'); STATE = path.join(RUN, 'state'); PROJECT = path.join(RUN, 'program');
+  REPO = path.join(RUN, 'repo'); STATE = path.join(RUN, 'state'); PROJECT = (fs.mkdirSync(process.env.MOST_TEST_OUTSIDE || require('os').tmpdir(), { recursive: true }), fs.mkdtempSync(path.join(process.env.MOST_TEST_OUTSIDE || require('os').tmpdir(), 'v25-program-')));
   RELEASE = path.join(RUN, 'release');
   for (const name of ['common', 'rules', 'servers']) fs.cpSync(path.join(ROOT, name), path.join(RELEASE, name), { recursive: true });
   for (const name of ['package.json', 'AGENTS.md']) write(path.join(RELEASE, name), fs.readFileSync(path.join(ROOT, name)));
@@ -125,9 +129,9 @@ test('О2: запись, замок папки, needs_decision, перезапу
   ready(); const guest = await mcp(chatEnv()); let main;
   try {
     const j = await send(guest, { write: true, task: 'ЗАПИШИ ФАЙЛ result.txt' });
-    const held = await lib('locks').tryLock('codex_folder', lib('paths').canon(PROJECT), {}); assert(held.ok);
+    const held = lib('write-lock').acquire(PROJECT, { jobId: 'test-hold' }); assert(held.ok);
     try { main = await mcp(); await sleep(500); assert.equal(card(j.id).status, 'queued'); assert.equal(logs().length, 0); }
-    finally { await held.release(); }
+    finally { held.release(); }
     await until(() => card(j.id).status === 'done', 'запись');
     assert(fs.existsSync(path.join(PROJECT, 'result.txt'))); assert.equal(mode(logs()[0]), 'workspace-write');
     const failed = await send(guest, { write: true, task: 'QUOTA' });
@@ -144,7 +148,7 @@ test('О3: корень, клон, релиз, родители, junction; по�
   for (const folder of [clone, release]) fs.mkdirSync(folder, { recursive: true });
   const link = path.join(RUN, 'alias'); junction(link, REPO);
   const forbidden = [REPO, clone, release, RELEASE, path.join(RELEASE, 'common'), RUN, path.parse(RUN).root, link];
-  await withMcp(async guest => { for (const folder of forbidden) await refuse(guest, { folder, write: true }, /Запись из чата Codex запрещена/); }, chatEnv());
+  await withMcp(async guest => { for (const folder of forbidden) await refuse(guest, { folder, write: true }, /Запись запрещена/); }, chatEnv());
   await withMcp(async main => { for (const folder of [RUN, path.parse(RUN).root, link]) await refuse(main, { folder, write: true, full_access: true }, /Полный доступ запрещён/); });
   assert.equal(logs().length, 0); await freeLocks('unused');
 });
@@ -159,9 +163,9 @@ test('О3: смена realpath после постановки и после з�
   // Та же смена пути непосредственно перед spawn, после снимка файлов под замком.
   const j = seeded('late-path', { from: 'codex', fromChat: 'codex', write: true, status: 'running', threadId: 'late-thread' });
   const held = await locks.tryLock('codex_folder', paths.canon(PROJECT), {}); assert(held.ok);
-  const fallback = lib('fallback'), before = fallback.folderState;
-  fallback.folderState = (...args) => { const value = before(...args); fs.realpathSync.native = p => path.resolve(p) === PROJECT ? original(REPO) : original(p); return value; };
-  try { await api.execute(j, held); } finally { fallback.folderState = before; fs.realpathSync.native = original; }
+  const fallback = lib('fallback'), before = fallback.folderStateDetailed;
+  fallback.folderStateDetailed = (...args) => { const value = before(...args); fs.realpathSync.native = p => path.resolve(p) === PROJECT ? original(REPO) : original(p); return value; };
+  try { await api.execute(j, held); } finally { fallback.folderStateDetailed = before; fs.realpathSync.native = original; }
   assert.equal(card(j.id).status, 'failed'); assert.equal(logs().length, 0); await freeLocks(j.id, PROJECT, j.threadId);
 });
 
@@ -174,7 +178,7 @@ test('О4: поручение-сеанс не отправляет и не от�
     try {
       for (const continue_id of [undefined, 'foreign', 'own']) {
         const r = await guest.call(server + '_send', { ...defaults(), continue_id, mode: 'review' });
-        assert(r.isError); assert.match(text(r), /поручение-сеанс/i);
+        assert(r.isError); assert.match(text(r), server === 'codex' ? /своему же серверу/i : /поручение assigned-job не найдено/);
       }
       if (server === 'codex') for (const id of ['foreign', 'own']) {
         const r = await guest.call('codex_cancel', { id }); assert(r.isError); assert.match(text(r), /поручение-сеанс/i);
@@ -196,7 +200,8 @@ test('О4: поручение-сеанс не отправляет и не от�
     if (kind === 'empty-tree') process.env.MOST_TEST_PROCESS_TREE = '[]';
     if (kind === 'main-ancestor') process.env.MOST_TEST_PROCESS_TREE = tree(7000);
     lib('fallback').reset();
-    for (const [s, t, a] of actions) assert.throws(() => access.guard(s, t, a), /не могу подтвердить/);
+    for (const [s, t, a] of actions) assert.throws(() => access.guard(s, t, a),
+      kind === 'main-ancestor' && /_send$/.test(t) ? s === 'codex' ? /своему же серверу/i : /нет номера поручения-родителя/ : /не могу подтвердить/);
   }
 });
 
@@ -314,7 +319,8 @@ test('О9а: дирижёр активного режима продолжает
 
 test('О11: правила согласованы и доставляются; О12: адресная регрессия team-v19', async () => {
   const helper = fs.readFileSync(path.join(ROOT, 'rules/helpers/codex-section.md'), 'utf8');
-  for (const phrase of ['Чат Codex может сам ставить поручения', 'codex_cancel', 'только свои', 'Полного доступа у гостя нет', 'Поручение-сеанс поручений не ставит и не отменяет']) assert(helper.includes(phrase), phrase);
+  for (const phrase of ['Чат Codex может сам ставить поручения', 'codex_cancel', 'только свои', 'Полного доступа у гостя нет', 'может отправлять другому участнику подпоручения', 'Отмена из поручения запрещена']) assert(helper.includes(phrase), phrase);
+  assert(!helper.includes('Поручение-сеанс поручений не ставит и не отменяет'));
   assert(!helper.includes('не разрешение самостоятельно отправлять задания'));
   const common = fs.readFileSync(path.join(ROOT, 'rules/common.md'), 'utf8');
   assert(!common.includes('себя никто не получает')); assert(!common.includes('Codex на запись и перенос Antigravity — нельзя'));

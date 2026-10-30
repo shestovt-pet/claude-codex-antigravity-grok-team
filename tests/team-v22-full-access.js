@@ -2,6 +2,7 @@
 // team-v22, замысел ред. 4, #7b387133. Только изолированные данные внутри клона.
 // О9 и О16 — границы области кода; О19 требует живой проверки после установки.
 const fs = require('fs'), path = require('path'), cp = require('child_process'), assert = require('assert');
+const { serverReady } = require('./runner-support');
 const ROOT = path.resolve(__dirname, '..'), CASE = process.env.MOST_V22_CASE;
 const tests = [], test = (name, fn) => tests.push([name, fn]);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -49,6 +50,8 @@ async function mcp(extra = {}) {
   const client = new Client({ name: 'team-v22', version: '1' });
   try { await client.connect(transport); }
   catch (e) { await client.close().catch(() => {}); throw Error(e.message + '\n' + errors); }
+  // Негостевой сервер (дирижёр claude) готовит снимок процессов асинхронно — ждём маркер своего pid.
+  if ((extra.MOST_CLIENT || process.env.MOST_CLIENT) === 'claude') await serverReady(STATE, transport.pid);
   return { call: (name, a = {}) => client.callTool({ name, arguments: a }), close: () => client.close(), errors: () => errors };
 }
 async function withMcp(fn, env) { const c = await mcp(env); try { await fn(c); } finally { await c.close(); } }
@@ -183,7 +186,9 @@ test('О7: сохранённый режим виден во всех состо
 
 test('О8: старая карточка в очереди запускается без полного доступа', async () => {
   seeded('old');
-  await withMcp(async c => { await settled(c, 'old'); assert.equal(card('old').fullAccessApplied, false); assert.equal(mode(logs()[0]), 'read-only'); });
+  // Дожидаемся, пока очередь сервера подхватит старую карточку (queued→running), иначе settled вернётся на queued
+  // раньше исполнения, а закрытие клиента оборвёт ещё не начавшийся запуск.
+  await withMcp(async c => { await until(() => card('old').status !== 'queued', 'запуск old'); await settled(c, 'old'); assert.equal(card('old').fullAccessApplied, false); assert.equal(mode(logs()[0]), 'read-only'); });
 });
 
 test('О10: отказ раньше work, heartbeat, владельца и замков', async () => {
@@ -276,7 +281,9 @@ test('О15б: таймаут — состояние базы, нет автоп�
   const j = await send(c, { task: 'HANG' }); await settled(c, j.id);
   assert.equal(card(j.id).status, 'needs_decision'); assert.match(card(j.id).error, /Истёк предел времени/);
   await sleep(500); assert.equal(logs().length, 1);
-}, { MOST_CODEX_TIMEOUT_MS: '800' }));
+  // Срок отсчитывается от начала задания; на медленном ПК запуск сервера и очереди съедает сотни мс до spawn,
+  // поэтому 800 мс не хватало fake-codex даже записать строку запуска до kill. 3000 мс оставляет запас, HANG всё равно истекает.
+}, { MOST_CODEX_TIMEOUT_MS: '3000' }));
 
 test('О15в: остановка и перезапуск — только явное продолжение; неподтверждённая остановка блокирует', async () => {
   let c = await mcp(), j;

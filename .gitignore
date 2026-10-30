@@ -6,6 +6,8 @@ live/
 works/*.lock
 
 tests/.tmp-*
+tests/.deploy-state/
+tests/windows-test-output-team-v30.txt
 
 works/*.json
 works/status.md

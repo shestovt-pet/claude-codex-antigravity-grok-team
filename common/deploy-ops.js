@@ -36,11 +36,25 @@ function assertIdle(root, resultFile, dryRun = false) {
   if (pending) throw Error('Идёт установка ' + pending.id);
 }
 const quote = s => "'" + String(s).replace(/'/g, "''") + "'";
-function launch(release, args) {
-  const command = [process.execPath, path.join(release, 'tools/deploy.js'), ...args].map(s => {
-    if (/["\r\n]/.test(s)) throw Error('Недопустимый символ в пути исполнителя.');
-    return '"' + s + '"';
-  }).join(' ');
+function commandLine(release, args, root, node = process.execPath) {
+  const cmd = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe');
+  const check = s => {
+    if (typeof s !== 'string' || /["%!^\x00-\x1f\x7f]/.test(s)) throw Error('Недопустимый символ в команде исполнителя.');
+    return s;
+  };
+  for (const p of [cmd, node, root, release]) {
+    check(p);
+    if (!path.isAbsolute(p) || !fs.existsSync(p)) throw Error('Не найден абсолютный путь исполнителя: ' + p);
+  }
+  // Конечный слеш в SET перед закрывающей кавычкой не допускается.
+  if (/[\\/]$/.test(root)) throw Error('Корень исполнителя не должен оканчиваться разделителем.');
+  const argv = [node, path.join(release, 'tools/deploy.js'), ...args].map(s => '"' + check(s).replace(/\\+$/, m => m + m) + '"').join(' ');
+  const command = '"' + cmd + '" /d /v:off /s /c "set "MOST_REPO_ROOT=' + root + '"&& ' + argv + '"';
+  if (command.length >= 8191) throw Error('Команда исполнителя слишком длинная (8191 символ или больше).');
+  return command;
+}
+function launch(release, args, root) {
+  const command = commandLine(release, args, root);
   return new Promise((resolve, reject) => require('child_process').execFile('powershell.exe',
     ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command',
       '$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=' + quote(command) + '}; if ($r.ReturnValue -ne 0) { exit 1 }; $r.ProcessId'],
@@ -53,6 +67,7 @@ function launch(release, args) {
 async function start({ root, release, configs, restartClaude, cleanup = true }, deps = {}) {
   root = realOrGiven(root);
   release = realOrGiven(release);
+  require('../tools/deploy-bootstrap').stateRoot(root);
   const policy = releasePolicy(root, release);
   const lock = await require('./locks').tryLock('deploy_operation', root, {}, path.join(root, 'state'));
   if (!lock.ok) throw Error('Идёт создание операции установки.');
@@ -63,9 +78,9 @@ async function start({ root, release, configs, restartClaude, cleanup = true }, 
     id = randomUUID(); file = path.join(policy.root, 'state/deploy-ops', id + '.json');
     // reason успешный старый execute сохраняет; старый team.js показывает его и после restart.
     atomic(file, JSON.stringify({ id, root: policy.root, release, status: 'запущена', ...(cleanup === false || policy.oldCode ? { noCleanup: true } : {}), ...(policy.oldCode ? { oldCode: true, reason: oldCodeLine } : {}), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
-    const args = ['--config-only', '--release', release, '--result', file, ...configs.flatMap(f => ['--config', f]), ...(restartClaude ? ['--restart-claude'] : [])];
+    const args = ['--root', root, '--config-only', '--release', release, '--result', file, ...configs.flatMap(f => ['--config', f]), ...(restartClaude ? ['--restart-claude'] : [])];
     try {
-      const pid = await (deps.launch || launch)(release, args);
+      const pid = await (deps.launch || launch)(release, args, root);
       // Отдельная квитанция PID не может затереть более поздний шаг исполнителя.
       atomic(file + '.pid', JSON.stringify(pid));
     } catch (e) { update(file, { status: 'отказ', reason: e.message }); throw e; }
@@ -84,6 +99,8 @@ async function start({ root, release, configs, restartClaude, cleanup = true }, 
 }
 async function execute(options, action, deps = {}) {
   const file = options.result;
+  // Отказ до первой записи, вне catch, чтобы не затереть чужой/завершённый результат.
+  if (deps.validateResult) deps.validateResult();
   update(file, { pid: process.pid, status: 'запущена' });
   try {
     update(file, { status: 'проба' });
@@ -121,4 +138,4 @@ function cleanupLine(c, now = Date.now()) {
   if (c.state === 'готово') return 'уборка: удалено ' + c.removed + ', не удалено ' + c.failed + (c.blocked?.length ? ' · релизы не удалялись: ' + c.blocked.join('; ') : '') + (c.uncheckedHiddenProcesses ? ' · не проверено процессов со скрытыми сведениями: ' + c.uncheckedHiddenProcesses : '');
   return 'уборка: состояние неизвестно';
 }
-module.exports = { WAIT_MS, terminal, list, start, execute, update, launch, alive, assertIdle, cleanupLine, oldCodeLine };
+module.exports = { WAIT_MS, terminal, list, start, execute, update, launch, commandLine, alive, assertIdle, cleanupLine, oldCodeLine };

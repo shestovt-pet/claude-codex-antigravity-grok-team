@@ -136,6 +136,7 @@ async function migrate(options = {}) {
       updated: previous.updated || 0, skipped: 0, conflicts: previous.conflicts || [], errors: previous.errors || [] };
     for (const [sourceIndex, source] of sources.entries()) {
       if (!fs.existsSync(source)) continue;
+      // Исторические имена хранилищ: перенос старых карточек, не перечень участников.
       for (const kind of ['jobs', 'codex-jobs']) {
         const dir = inside(source, kind);
         if (!fs.existsSync(dir)) continue;

@@ -36,7 +36,7 @@ function claudeDesktopProcesses() {
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command',
         "Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(claude|Claude)' } | Select-Object Name,ProcessId | ConvertTo-Json -Compress"],
-      { encoding: 'utf8', windowsHide: true, timeout: 8000, maxBuffer: 2e6 },
+      { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, maxBuffer: 2e6 },
     ).trim();
     if (!out) return [];
     const rows = JSON.parse(out);

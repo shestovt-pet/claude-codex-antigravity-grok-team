@@ -1,8 +1,13 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 // team-v19 «Claude отвалился» (К1–К12, Т1–Т9): запасной режим по слову пользователя в чате Codex или Antigravity.
 // Номера в названиях — «Опасные случаи» замысла team-v19 ред. 5. Каждый случай — отдельный процесс со своей временной папкой.
 // Предки процесса, проба Antigravity, запуск Claude Desktop и список процессов — только подменой (NODE_ENV=test).
 const fs = require('fs'), path = require('path'), os = require('os'), assert = require('assert'), crypto = require('crypto');
+const { serverReady } = require('./runner-support');
 const { spawnSync } = require('child_process');
 const CASE = process.env.MOST_V19_CASE, ROOT = path.resolve(__dirname, '..');
 const HOUR = 3600000, iso = ms => new Date(ms).toISOString();
@@ -11,7 +16,7 @@ const OWNER = 'fallback-codex-ab12', AGY_OWNER = 'fallback-antigravity-cd34';
 let RUN, REPO, STATE, PROJECT;
 if (CASE !== undefined) {
   RUN = fs.mkdtempSync(path.join(os.tmpdir(), 'most-v19-'));
-  REPO = path.join(RUN, 'repo'); STATE = path.join(REPO, 'state'); PROJECT = path.join(RUN, 'project');
+  REPO = path.join(RUN, 'repo'); STATE = path.join(REPO, 'state'); PROJECT = path.join(process.env.MOST_TEST_OUTSIDE || os.tmpdir(), 'v19-project-' + process.pid + '-' + Date.now()); // team-v46 п.5а: вне репозитория
   fs.mkdirSync(REPO, { recursive: true }); fs.mkdirSync(PROJECT, { recursive: true });
   for (const k of ['MOST_AUTHORITY', 'MOST_JOB_ID', 'MOST_FALLBACK_DIR', 'MOST_PROBE_ONLY', 'MOST_PROBE_GUEST', 'MOST_TEST_PROCESS_TREE', 'MOST_TEST_AGY_PROBE']) delete process.env[k];
   Object.assign(process.env, { NODE_ENV: 'test', MOST_REPO_ROOT: REPO, MOST_STATE_DIR: STATE, MOST_CODEX_JOBS_DIR: path.join(STATE, 'codex-jobs'), MOST_CODEX_ARCHIVE_DIR: '',
@@ -85,6 +90,8 @@ async function mcp(server, client, env = {}) {
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers', server, 'index.js')], stderr: 'pipe', env: e });
   const c = new Client({ name: 'v19', version: '1' });
   await c.connect(transport);
+  // Негостевой серверный набор (дирижёр claude) готовит снимок процессов асинхронно — ждём маркер своего pid.
+  if (server !== 'team' && client === 'claude') await serverReady(STATE, transport.pid);
   const call = async (name, args) => {
     try { const r = await c.callTool({ name, arguments: args }); return { error: !!r.isError, text: (r.content || []).map(x => x.text || '').join('\n') }; }
     catch (err) { return { error: true, text: err.message }; }
@@ -131,8 +138,8 @@ test('3, Р-ж: гость-поручение — слово, поручения
     await assert.rejects(team().word({ action: 'record', who_down: 'claude', quote: 'Claude отвалился', owner: 'fallback-codex-zz99' }),
       /Гостю это действие запрещено: поручение-сеанс этого не делает: слово, поручения и перенос — только из чата; не могу подтвердить, что это чат \(это поручение-сеанс, а не чат\), — скажи это в чате Codex\./, phase);
     assert.match(lib('fallback').chatProof('codex').reason, /это поручение-сеанс, а не чат/);
-    assert.throws(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't', owner: OWNER }), /Гостю это действие запрещено: поручение-сеанс этого не делает/, phase);
-    assert.throws(() => acc.guard('antigravity', 'antigravity_send', { owner: OWNER }), /Гостю это действие запрещено: поручение-сеанс этого не делает/, phase);
+    assert.throws(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't', owner: OWNER }), /Подпоручение своему же серверу.*запрещено/i, phase);
+    assert.throws(() => acc.guard('antigravity', 'antigravity_send', { owner: OWNER }), /поручение job-1 не найдено/, phase);
     assert.throws(() => acc.guard('team', 'team_work', { action: 'update', name: 'w', owner: OWNER }), /Гостю это действие запрещено/, phase);
     as('antigravity', { job: 'agy-1', agy: true });
     await assert.rejects(team().word({ action: 'record', who_down: 'claude', quote: 'Claude отвалился', owner: AGY_OWNER }), /Гостю это действие запрещено: поручение-сеанс этого не делает/, phase);
@@ -351,7 +358,7 @@ test('11, К2: сервер своей семьи — инструменты у 
     assert(!r.error, r.text); assert.match(r.text, /В ОЧЕРЕДИ/);
   } finally { await s.close(); }
   const team = await mcp('team', 'codex', guestEnv());
-  try { assert.deepEqual(await team.tools(), ['team_rules', 'team_status', 'team_word', 'team_work']); } finally { await team.close(); }
+  try { assert.deepEqual(await team.tools(), ['team_ask', 'team_ask_result', 'team_rules', 'team_status', 'team_word', 'team_work']); } finally { await team.close(); }
   const agy = await mcp('antigravity', 'antigravity', guestEnv());
   try { assert.deepEqual(await agy.tools(), ['antigravity_apply', 'antigravity_cancel', 'antigravity_result', 'antigravity_send', 'antigravity_status']);
     const r = await agy.call('antigravity_send', { folder: PROJECT, task: 'Проверка', mode: 'review' });
@@ -379,14 +386,14 @@ test('12, К2: codex_send write=true от дирижёра Antigravity — ос�
   } finally { await g.close(); }
   const card = path.join(STATE, 'codex-jobs', id + '.json');
   assert.equal(read(card).fallbackWord, entry); assert.equal(read(card).status, 'queued'); assert.equal(read(card).owner, null);
-  const locks = lib('locks'), held = await locks.tryLock('codex_folder', lib('paths').canon(PROJECT), { jobId: 'test' });
+  const held = lib('write-lock').acquire(PROJECT, { jobId: 'test' });
   assert(held.ok);
   const log = path.join(RUN, 'codex.log');
   const main = await mcp('codex', 'claude', { CODEX_PATH: path.join(__dirname, 'fake-codex.js'), FAKE_CODEX_LOG: log, MOST_QUEUE_TICK_MS: '100' });
   try {
     await sleep(1500);
     assert.equal(read(card).status, 'queued', 'папка занята — задание ждёт');
-    await held.release();
+    held.release();
     await until(() => read(card).status === 'done', 'запись по поручению дирижёра');
     const row = fs.readFileSync(log, 'utf8').trim().split('\n').map(l => JSON.parse(l)).find(e => e.env.MOST_JOB_ID === id);
     assert(row.args.includes('workspace-write'));
@@ -518,11 +525,15 @@ test('17, Р-а, К8: host-fallback enter и roles-propose — указател�
 
 test('18, К1: журнал с записями team-v18 читается по их правилам; прежний read() на журнале с новыми записями не падает', async () => {
   ready();
-  as('claude'); await team().word({ action: 'record', who_down: 'grok', quote: 'Грок отвалился' });
+  as('claude');
+  await assert.rejects(team().word({ action: 'record', who_down: 'grok', quote: 'Грок отвалился' }), /who_down/);
+  // Историческое слово из журнала v18: новый API больше не пишет слова о Grok.
+  await lib('user-word').append({ who_down: 'grok', quote: 'Грок отвалился', source: 'chat-claude', recorded_by: 'claude' });
   await word('codex');
   as('codex'); await team().word({ action: 'record', who_down: 'antigravity', quote: 'Гемини отвалился', owner: OWNER });
   const W = lib('user-word');
   assert.deepEqual(W.read().map(r => r.who_down), ['grok', 'antigravity']);
+  assert.match(W.listText(), /„Грок отвалился“/);
   assert(W.active('grok') && W.active('antigravity'));
   assert.match(W.listText(), /Запасной режим: действует, дирижёр Codex/);
   // read() из main 0371855d (team-v18) — дословно.
@@ -693,10 +704,10 @@ test('23, К2: сеанс дирижёра — второй чат Codex с др
   assert.deepEqual(f.chatProof('codex'), { ok: false, job: true, reason: 'это поручение-сеанс, а не чат' });
   await assert.rejects(t.word({ action: 'rebind', quote: 'x', owner: 'fallback-codex-o1o2' }), /Гостю это действие запрещено: поручение-сеанс/);
   as('codex', { tree: orphan }); assert(f.chatProof('codex').ok, 'третье условие сироту не ловит — его ловит первое');
-  // Поручения гостя — тоже только из доказанного чата (Codex 1c35bf39 п. 2): предки, неудавшееся опознание, другой релиз.
+  // Без номера родителя подпоручение запрещено (team-v36); недоказанный чат и другой релиз.
   const acc = lib('access'), send = () => acc.guard('antigravity', 'antigravity_send', { task: 't' });
-  as('codex', { tree: anc(READY_AT) }); assert.throws(send, /^Error: Гостю это действие запрещено: поручение-сеанс этого не делает.*среди предков — основной сервер team/);
-  assert.throws(() => acc.guard('grok', 'grok_send', { task: 't' }), /среди предков — основной сервер team/);
+  as('codex', { tree: anc(READY_AT) }); assert.throws(send, /нет номера поручения-родителя/);
+  assert.throws(() => acc.guard('grok', 'grok_send', { task: 't' }), /нет номера поручения-родителя/);
   as('codex', { tree: '[]' }); assert.throws(send, /не удалось снять отпечаток процесса/);
   as('codex', { tree: orphan }); send();
   ready({ release: path.join(RUN, 'other-release') }); as('codex', { parent: 4200 });
@@ -742,15 +753,15 @@ test('25, К2: разрешения Antigravity и config.toml — team_word и 
   const agy = cc.jsonConfig({}, 'agy', rel, REPO, STATE, 'node');
   assert.deepEqual(Object.keys(agy.mcpServers).sort(), ['antigravity', 'codex', 'team']);
   const acc = lib('access');
-  assert.deepEqual(acc.guestTools('team', 'codex'), ['team_status', 'team_rules', 'team_work', 'team_word']);
-  assert.deepEqual(acc.guestTools('team', 'grok'), ['team_status', 'team_rules', 'team_work']);
+  assert.deepEqual(acc.guestTools('team', 'codex'), ['team_status', 'team_rules', 'team_work', 'team_ask', 'team_ask_result', 'team_word']);
+  assert.deepEqual(acc.guestTools('team', 'grok'), ['team_status', 'team_rules', 'team_work', 'team_ask', 'team_ask_result']);
   assert.deepEqual(acc.guestTools('codex', 'codex'), ['codex_status', 'codex_send', 'codex_result', 'codex_cancel']);
   assert.deepEqual(acc.guestTools('antigravity', 'codex'), ['antigravity_status', 'antigravity_send', 'antigravity_result', 'antigravity_apply']);
   assert.deepEqual(acc.guestTools('codex', 'claude'), []);
   const probe = lib('probe').probe, file = path.join(ROOT, 'servers', 'team', 'index.js');
   const base = { ...process.env, MOST_CLIENT: 'codex', MOST_PROBE_ONLY: '1' };
   const full = (await probe(file, { ...base, MOST_PROBE_GUEST: 'full' })).tools.map(t => t.name).sort();
-  assert.deepEqual(full, ['team_rules', 'team_status', 'team_word', 'team_work']);
+  assert.deepEqual(full, ['team_ask', 'team_ask_result', 'team_rules', 'team_status', 'team_word', 'team_work']);
   const legacy = (await probe(file, base)).tools.map(t => t.name).sort();
   assert.deepEqual(legacy, ['team_rules', 'team_status', 'team_work'], 'установщик прежнего релиза проверяет прежним списком');
   const own = (await probe(path.join(ROOT, 'servers', 'codex', 'index.js'), { ...base, MOST_PROBE_GUEST: 'full' })).tools.map(t => t.name).sort();
@@ -978,7 +989,8 @@ test('Т1–Т9: тексты правил запасного режима', asy
     common.includes('в запасном режиме этап «высокий» ждёт Claude: помощника с чистой памятью без Claude нет.') && !common.includes('запасным ведущим с подтверждением человека'));
   const claude = text('rules/claude.md');
   for (const s of ['напоминание только смотрит статус и ничего не меняет', 'team_word return quote=<его реплика дословно>', 'сверки с текстом правил этого хода', 'сверка sha256 с исходником; расхождение — повторить запись']) assert(claude.includes(s), s);
-  assert(text('rules/roles.md').includes('В запасном режиме дирижёр — Codex или Antigravity'));
+  assert(text('rules/roles.md').includes('В запасном режиме дирижёр — запасной дирижёр из team_status'));
+  assert.deepEqual([...require('../common/members').fallbackIds], ['codex', 'antigravity']);
   assert(text('rules/antigravity.md').includes('В запасном режиме перенос решает дирижёр, разрешение — то же поручение пользователя по работе'));
   for (const f of ['docs/HOWTO-fallback.md', 'docs/CLAUDE-HANDOFF-fallback.md']) { const d = text(f).replace(/^\uFEFF/, ''); assert.equal(d.trimEnd().split('\n').length, 5, f); assert(d.includes('Запасной режим с токеном выведен из работы в team-v19; порядок — rules/fallback.md.')); }
   const lessons = text('lessons.md');

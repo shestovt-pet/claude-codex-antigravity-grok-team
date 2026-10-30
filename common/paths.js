@@ -49,6 +49,15 @@ function samePath(a, b) {
   }
 }
 
+// На Windows tar должен быть встроенным bsdtar из System32: он понимает ZIP и пути с буквой диска.
+// GNU tar из PATH (например, из состава Git) трактует «E:\…» как удалённый хост и срывает распаковку
+// релиза/выгрузки. Поэтому tar вызывается явным путём, а при его отсутствии — понятная ошибка до запуска.
+function systemTar() {
+  if (!isWindows) return 'tar';
+  const tar = path.join(process.env.SystemRoot || process.env.windir || 'C:\\Windows', 'System32', 'tar.exe');
+  if (!fs.existsSync(tar)) throw Error('Нет системного tar Windows (bsdtar): не найден ' + tar + ' — проверьте систему или PATH.');
+  return tar;
+}
 // Правила написаны для корня по умолчанию C:\most; при другой папке установки подставляется фактический корень (team-v11 Р1).
 function withRoot(text, root = repoRoot) {
   const actual = /^[a-z]:[\\/]/i.test(String(root)) ? path.win32.normalize(String(root)).replace(/[\\]+$/, '') : path.resolve(root);
@@ -56,4 +65,4 @@ function withRoot(text, root = repoRoot) {
   return text.replace(/C:\\most(?![\w-])/gi, () => actual).replace(/C:\/most(?![\w-])/gi, () => actual.replace(/\\/g, '/'));
 }
 module.exports = {
-  withRoot, canon, canonMaybe, isInsideReal, isSameOrInsideReal, samePath, stateDir, repoRoot };
+  withRoot, canon, canonMaybe, isInsideReal, isSameOrInsideReal, samePath, systemTar, stateDir, repoRoot };

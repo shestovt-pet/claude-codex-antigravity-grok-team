@@ -10,12 +10,15 @@ const path = require("path");
 const { spawn, spawnSync, execFileSync } = require("child_process");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { StdioClientTransport } = require("@modelcontextprotocol/sdk/client/stdio.js");
+const { serverReady } = require("./runner-support");
 
 const isWindows = process.platform === "win32";
 const ROOT = path.resolve(__dirname, "..");
 const INDEX = path.join(ROOT, "servers/antigravity/index.js");
 const FAKE = path.join(__dirname, "fake-agy.js");
-const RUN = path.join(__dirname, ".tmp-run-" + Date.now().toString(36));
+const TEST_BASE = process.env.MOST_TEST_OUTSIDE || os.tmpdir();
+fs.mkdirSync(TEST_BASE, { recursive: true });
+const RUN = fs.mkdtempSync(path.join(TEST_BASE, "antigravity-"));
 const STATE = path.join(RUN, "state");
 const JOURNAL = path.join(RUN, "zhurnal.txt");
 fs.mkdirSync(STATE, { recursive: true });
@@ -63,11 +66,12 @@ async function probeTreeKill() {
 
 async function startBridge(extraEnv) {
   const env = Object.assign({}, process.env, {
-    AGY_PATH: FAKE, MOST_STATE_DIR: STATE, MOST_JOURNAL: JOURNAL, MOST_HEARTBEAT_MS: "500",
+    NODE_ENV: "test", AGY_PATH: FAKE, MOST_STATE_DIR: STATE, MOST_JOURNAL: JOURNAL, MOST_HEARTBEAT_MS: "500",
   }, extraEnv || {});
   const transport = new StdioClientTransport({ command: process.execPath, args: [INDEX], env, stderr: "pipe" });
   const client = new Client({ name: "most-test", version: "1.0.0" });
   await client.connect(transport);
+  await serverReady(STATE, transport.pid);
   return { client, transport, pid: transport.pid };
 }
 async function call(b, name, args) {
@@ -643,14 +647,18 @@ test("перенос из другого экземпляра, пока влад
 });
 
 test("новый файл появился в последний момент — не перезаписывается", async () => {
-  const B7 = await startBridge({ MOST_TEST_PUBLISH_DELAY_MS: "1500" });
+  const B7 = await startBridge({ MOST_TEST_PUBLISH_DELAY_MS: "3000" });
   try {
     const dir = project({});
     const { id } = await poruchit(B7, { folder: dir, task: "[[FAKE:literal:" + b64("НАШ ТЕКСТ") + "]]" });
     await waitDone(B7, id);
     const target = path.join(dir, "gonka.txt");
     const pending = call(B7, "antigravity_apply", { id: id, to: target });
-    await sleep(600);
+    // Ждём, пока перенос войдёт в фазу публикации (карточка applying), и только тогда подкладываем чужой файл.
+    // Иначе на медленном ПК ранняя проверка существования (до задержки публикации) видит уже готовый файл
+    // и отказывает «файл уже есть», а не «появился, пока шло сохранение» (гонка теста, не ошибка сервера).
+    const cardFile = path.join(STATE, "jobs", id, "card.json");
+    for (let i = 0; i < 200; i++) { let s; try { s = JSON.parse(fs.readFileSync(cardFile, "utf8")).status; } catch (e) {} if (s === "applying") break; await sleep(25); }
     fs.writeFileSync(target, "ЧУЖОЕ");
     const p = await pending;
     ok(p.isError && /появился/.test(p.text), "отказ: файл появился", p.text);

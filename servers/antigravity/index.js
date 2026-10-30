@@ -379,6 +379,27 @@ function listJobs() {
   try { for (const d of fs.readdirSync(JOBS_DIR)) { const j = loadJob(d); if (j && !j.corrupt) out.push(j); } } catch (e) {}
   return out;
 }
+// team-v46: очередь читает только незавершённые карточки. Завершённые без ожидающего переноса
+// запоминаются по mtime и размеру card.json и не перечитываются (4351 карточка, 472 МБ — 4 с синхронного чтения
+// на каждый тик; поток был занят, и Claude Desktop не дожидался ответа initialize).
+const QUEUE_SKIP = new Map(), QUEUE_ACTIVE = ['queued', 'waiting_quota', 'running'];
+function queueJobs() {
+  const out = [], seen = new Set();
+  let dirs; try { dirs = fs.readdirSync(JOBS_DIR); } catch (e) { return out; }
+  for (const d of dirs) {
+    seen.add(d);
+    let st; try { st = fs.statSync(cardPath(d)); } catch (e) { continue; }
+    const k = QUEUE_SKIP.get(d);
+    if (k && k.mtimeMs === st.mtimeMs && k.size === st.size) continue;
+    const j = loadJob(d);
+    if (!j || j.corrupt) continue;
+    if (!QUEUE_ACTIVE.includes(j.status) && !(j.applyRequest && !j.applyRequest.done)) { QUEUE_SKIP.set(d, { mtimeMs: st.mtimeMs, size: st.size }); continue; }
+    QUEUE_SKIP.delete(d);
+    out.push(j);
+  }
+  for (const d of [...QUEUE_SKIP.keys()]) if (!seen.has(d)) QUEUE_SKIP.delete(d);
+  return out;
+}
 function readResult(job) {
   const p = resultPath(job.id);
   if (!fs.existsSync(p)) return { error: "файла результата нет: " + p };
@@ -658,7 +679,8 @@ function numberLines(text, offset) {
 function buildRules(rezhim, work, opora, markers) {
   const r = ["ПРАВИЛА ОТВЕТА:",
     "- Не вызывай инструменты изменения файлов (write_to_file, replace_file_content и любые подобные) и не запускай команды (run_command): это запрещено. Всё нужное уже есть в поручении."];
-  r.push("- Можно вызывать только team_status, team_rules, team_work (get/list), codex_status, codex_result, codex_send, если поручение этого просит.");
+  r.push(require('../../common/members').rules());
+  r.push(require('../../common/agy-tools').instruction());
   if (rezhim === "zamechaniya") {
     r.push("- Дай только замечания по ТЕКСТУ ДЛЯ РАБОТЫ. Не переписывай текст и не возвращай исправленную версию.");
     r.push("- Строки текста пронумерованы («12| …»); это номера строк исходного файла.");
@@ -773,6 +795,13 @@ function composeEdit(srcText, range, result) {
 
 // ---------- запуск agy ----------
 function runAgy(args, jobId, onSpawn, cwd, stdin) {
+  const card = loadJob(jobId), deadlines = require('../../common/chain-deadline');
+  const budget = deadlines.runtimeBudget(card, 'antigravity');
+  if (deadlines.parentTerminal(card)) return Promise.resolve({ exitCode: 124, error: 'Родитель завершился; запуск отменён.', cancelled: true, output: '' });
+  if (budget <= 0) return Promise.resolve({ exitCode: 124, error: 'Срок истёк до запуска.', timedOut: true, output: '' });
+  args = [...args];
+  const timeoutIndex = args.indexOf('--print-timeout');
+  if (timeoutIndex >= 0) args[timeoutIndex + 1] = Math.max(1, Math.ceil(budget / 60000)) + 'm';
   return new Promise((resolve) => {
     const outChunks = [], errChunks = [];
     let done = false, proc = null, timedOut = false, inputError = null;
@@ -783,13 +812,14 @@ function runAgy(args, jobId, onSpawn, cwd, stdin) {
       clearTimeout(timer);
       clearInterval(poll);
       RUNNING.delete(jobId);
-      if (timedOut) { exitCode = 124; errTextMsg = "задание не уложилось в " + Math.round(WATCHDOG_MS / 60000 * 10) / 10 + " мин и было остановлено"; }
+      if (timedOut) { exitCode = 124; errTextMsg = "задание не уложилось в " + Math.round(budget / 60000 * 10) / 10 + " мин и было остановлено"; }
       else if (entry.reason === "отмена") { errTextMsg = "задание отменено"; }
+      else if (entry.reason === 'родитель завершился') { errTextMsg = 'Родитель завершился; поручение остановлено.'; }
       const raw = Buffer.concat(outChunks).toString("utf8");
       const stderr = stripAnsi(Buffer.concat(errChunks).toString("utf8"));
       const parsed = stdin != null ? agyInput.parseResults(raw) : parseAgyJson(raw);
       const obj = parsed.obj;
-      const base = { stderr, diagnostics: parsed.diagnostics || [], exitCode, error: errTextMsg || inputError || (stdin != null && !obj ? 'Не получено завершающее событие result.' : null), cancelled: entry.reason === "отмена", timedOut, jsonCandidates: parsed.candidates, provenanceObservation: provenance.agyObservation(raw, obj) };
+      const base = { stderr, diagnostics: parsed.diagnostics || [], exitCode, error: errTextMsg || inputError || (stdin != null && !obj ? 'Не получено завершающее событие result.' : null), cancelled: entry.reason === 'отмена' || entry.reason === 'родитель завершился', timedOut, jsonCandidates: parsed.candidates, provenanceObservation: provenance.agyObservation(raw, obj) };
       if (obj) {
         const denied = parsed.denied?.length ? parsed.denied : obj.denied_actions || obj.deniedActions || null;
         resolve(Object.assign(base, {
@@ -802,9 +832,13 @@ function runAgy(args, jobId, onSpawn, cwd, stdin) {
         }));
       } else resolve(Object.assign(base, { output: stripAnsi(raw), json: false }));
     };
-    const timer = setTimeout(() => { timedOut = true; requestStop(jobId, "предел времени"); }, WATCHDOG_MS);
+    const timer = setTimeout(() => { if (!entry.stopping) { timedOut = true; requestStop(jobId, "предел времени"); } }, budget);
     // запрос отмены из любого экземпляра моста — файлом-флагом
-    const poll = setInterval(() => { if (!entry.stopping && fs.existsSync(cancelPath(jobId))) requestStop(jobId, "отмена"); }, CANCEL_POLL_MS);
+    const poll = setInterval(() => {
+      if (entry.stopping) return;
+      if (deadlines.parentTerminal(loadJob(jobId))) requestStop(jobId, 'родитель завершился');
+      else if (fs.existsSync(cancelPath(jobId))) requestStop(jobId, "отмена");
+    }, CANCEL_POLL_MS);
     try {
       proc = spawn(AGY.bin, AGY.pre.concat(args), { cwd, env: require('../../common/fallback').jobEnv(jobId), stdio: [stdin != null ? "pipe" : "ignore", "pipe", "pipe"], windowsHide: true, detached: !isWindows });
       entry.proc = proc;
@@ -865,12 +899,12 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
       await updateJob(job.id, c => { Object.assign(c, modelFields(selection), { modelSelectionPending: false }); c.retry.args = args; });
     }
     const run = async () => {
-      const result = await runAgy(args, job.id, pid => { updateJob(job.id, c => { c.agyPid = pid; }).catch(() => {}); }, job.papka, job.retry?.stdin);
+      const result = await runAgy(args, job.id, pid => { updateJob(job.id, c => { c.agyPid = pid; c.agyStartedAt = nowIso(); }).catch(() => {}); }, job.papka, job.retry?.stdin);
       await updateJob(job.id, c => { provenance.observe(c, 'antigravity', result.provenanceObservation); });
       return result;
     };
     let res = await run();
-    const protocolReason = !agyInput.outputLimit(res) && job.retry?.stdin != null && agyInput.protocolError(res);
+    const protocolReason = !res.timedOut && !res.cancelled && !require('../../common/chain-deadline').deadlinePassed(loadJob(job.id)) && !agyInput.outputLimit(res) && job.retry?.stdin != null && agyInput.protocolError(res);
     if (protocolReason && !job.protocolFallback && !shuttingDown && !fs.existsSync(cancelPath(job.id))) {
       const legacyArgs = args.filter((value, i) => value !== '--input-format' && args[i - 1] !== '--input-format');
       legacyArgs[legacyArgs.indexOf('--output-format') + 1] = 'json';
@@ -900,7 +934,7 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
       }
     }
     const denial = agyInput.permission(res);
-    if (denial?.retryable && !agyInput.outputLimit(res) && !job.materialReadRetry && !res.cancelled && !shuttingDown && !fs.existsSync(cancelPath(job.id))) {
+    if (denial?.retryable && !res.timedOut && !require('../../common/chain-deadline').deadlinePassed(loadJob(job.id)) && !agyInput.outputLimit(res) && !job.materialReadRetry && !res.cancelled && !shuttingDown && !fs.existsSync(cancelPath(job.id))) {
       await updateJob(job.id, c => { c.materialReadRetry = { at: nowIso(), reason: denial.reason, attempt: 1 }; });
       job.materialReadRetry = { attempt: 1 };
       res = await run();
@@ -908,7 +942,7 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
     if (shuttingDown) return; // карточку пометил shutdown
     const unsuccessful = res.exitCode !== 0 || res.agyStatus !== 'SUCCESS' ||
       res.agyError || res.error || !String(res.output || '').trim();
-    if (unsuccessful && !agyInput.outputLimit(res) && !agyInput.permission(res) && !res.cancelled && !fs.existsSync(cancelPath(job.id))) {
+    if (unsuccessful && !res.timedOut && !require('../../common/chain-deadline').deadlinePassed(loadJob(job.id)) && !agyInput.outputLimit(res) && !agyInput.permission(res) && !res.cancelled && !fs.existsSync(cancelPath(job.id))) {
       const classified=classifyAgy(res);
       if(classified.kind==='quota' || classified.kind==='transient') {
         const [snapshot, modelList] = classified.kind === 'quota'
@@ -944,9 +978,20 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
       cur.usage = res.usage || null;
       cur.provenance = provenance.observe(cur, 'antigravity', res.provenanceObservation);
       delete cur.stopUnconfirmed;
-      if (res.cancelled || fs.existsSync(cancelPath(job.id))) {
-        Object.assign(cur, { status: "cancelled", draftStatus: "not_attempted", problems: ["задание отменено"] });
-        committed = "cancelled"; return;
+      const deadlines = require('../../common/chain-deadline');
+      const parentEnded = deadlines.parentTerminal(cur);
+      const cancelled = res.cancelled || (!res.timedOut && (fs.existsSync(cancelPath(job.id)) || parentEnded));
+      const expired = res.timedOut || deadlines.deadlinePassed(cur);
+      if (cancelled || expired) {
+        if (res.output) {
+          cur.lateResultFile = path.join(jobDir(job.id), 'late-result.txt');
+          replaceFileAtomicSync(cur.lateResultFile, String(res.output));
+        }
+        const status = cancelled ? 'cancelled' : 'failed';
+        const reason = res.error || (parentEnded && cancelled ? 'Родитель завершился; поручение остановлено.'
+          : cancelled ? 'задание отменено' : 'Истёк предел времени поручения.');
+        Object.assign(cur, { status, draftStatus: 'not_attempted', problems: [reason] });
+        committed = status; return;
       }
       cur.problems = check.problems;
       cur.warnings = check.warnings;
@@ -1334,14 +1379,19 @@ register(
     }
     const args = STREAM_INPUT ? baseArgs : baseArgs.concat(fileMode ? ["--add-dir", inputDir] : [], ["--print", prompt]);
 
+    const chainFields = require('../../common/job-chain').fields(context.getStore()?.args);
+    const dl = require('../../common/chain-deadline').applyDeadline(chainFields, access.client(), 'antigravity');
+    if (dl.error) return fail(dl.error);
+
     const job = {
-      id, gateOrder: context.getStore()?.args.gateOrder, stageTitle: context.getStore()?.args.stageTitle, stageId: context.getStore()?.args.stageId, scopeTask: context.getStore()?.args.scopeTask, role: context.getStore()?.args.role, replaces: context.getStore()?.args.replaces, replacementEvidence: context.getStore()?.args.replacementEvidence, stage: context.getStore()?.args.stage, workName: context.getStore()?.args.work, textInput: !!context.getStore()?.textFile, retry: { args, inputDir, stdin, ...(STREAM_INPUT ? { refs: opList } : {}) }, version: VERSION, from: access.client(), status: access.guest() ? "queued" : "running", startedAt: nowIso(), rezhim,
-      papka, papkaCanon, draftPath,
+      id, gateOrder: context.getStore()?.args.gateOrder, stageTitle: context.getStore()?.args.stageTitle, stageId: context.getStore()?.args.stageId, scopeTask: context.getStore()?.args.scopeTask, role: context.getStore()?.args.role, replaces: context.getStore()?.args.replaces, replacementEvidence: context.getStore()?.args.replacementEvidence, stage: context.getStore()?.args.stage, workName: context.getStore()?.args.work, textInput: !!context.getStore()?.textFile, retry: { args, inputDir, stdin, ...(STREAM_INPUT ? { refs: opList } : {}) }, version: VERSION, from: require('../../common/job-identity').memberId(access.client()) || access.client(), ...chainFields, status: access.guest() ? "queued" : "running", startedAt: nowIso(), rezhim,
+      papka, papkaCanon, draftPath, ownerLabel: context.getStore()?.args?.owner,
       work: work ? { path: work.path, range: work.range, fileHash: work.fileHash, bom: work.bom, text: work.text } : null,
       ...modelFields(m), modelSelectionPending: access.guest(), requestedModel: model || null,
       fileMode, poruchenieFile, promptChars: prompt.length, markers,
       poruchenie, task: context.getStore()?.args.scopeTask ?? poruchenie,
       owner: { instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT },
+      ...(dl.deadline ? { deadline: dl.deadline } : {}),
     };
     try {
       const save = () => { fs.mkdirSync(jobDir(id), { recursive: true }); saveJob(job); };
@@ -1493,7 +1543,7 @@ register(
     kuda: z.string().optional().describe("Для нового текста и замечаний: полный путь файла внутри папки проекта."),
     perezapisat: z.boolean().optional().describe("Только для нового текста (text): разрешить заменить существующий файл to."),
   },
-  async ({ nomer, kuda, perezapisat, quote }, opts = {}) => {
+  async ({ nomer, kuda, perezapisat, quote, owner: ownerLabel }, opts = {}) => {
     if (!access.guest()) { const gate = restartHold.admit(STATE_DIR, restartServer, { early: true }); if (!gate.ok) return restartRefusal(gate); }
     if (shuttingDown) return fail("мост останавливается");
     let job = await loadNorm(nomer);
@@ -1536,6 +1586,19 @@ register(
     if (samePath(target, job.draftPath)) return fail("нельзя сохранять в сам общий черновик");
     if (rezhim === "zamechaniya" && job.work && samePath(target, job.work.path)) return fail("нельзя записать замечания в исходный файл");
 
+    const folderOptions = { client: 'claude', guest: !!opts.fallback, owner: ownerLabel ?? job.ownerLabel };
+    const checkFolders = () => {
+      // Для нового вложенного каталога сначала проверяем существующего предка, затем сам созданный каталог.
+      let targetFolder = path.dirname(target);
+      while (!fs.existsSync(targetFolder) && path.dirname(targetFolder) !== targetFolder) targetFolder = path.dirname(targetFolder);
+      const policy = require('../../common/write-folder');
+      return policy.refusal(job.papka, folderOptions) || policy.refusal(targetFolder, folderOptions);
+    };
+    const folderRefusal = checkFolders();
+    if (folderRefusal) return fail(folderRefusal);
+    const folderLock = await require('../../common/write-lock').acquire(job.papka, { jobId: nomer });
+    if (!folderLock.ok) return fail(folderLock.needsDecision ? 'Нужно решение: остановка прежнего исполнителя не подтверждена; замок записи сохранён.' : 'В этой папке (или вложенной) уже идёт поручение с записью.');
+    try {
     // один перенос в один физический файл за раз — замок по реальному пути цели
     let targetKey;
     try { targetKey = canonMaybe(target); } catch (e) { return fail("не удалось проверить путь: " + errText(e)); }
@@ -1578,6 +1641,8 @@ register(
 
       const stillFresh = () => {
         try {
+          const folderRefusal = checkFolders();
+          if (folderRefusal) return folderRefusal;
           if (!isInsideReal(target, job.papka)) return "путь теперь ведёт за пределы папки проекта";
           const h = hashFile(target);
           if (h.error) return h.error;
@@ -1586,8 +1651,12 @@ register(
         } catch (e) { return errText(e); }
       };
       try {
+        const folderRefusal = checkFolders();
+        if (folderRefusal) throw Error(folderRefusal);
         if (rezhim !== "pravka") fs.mkdirSync(path.dirname(target), { recursive: true });
         if (!isInsideReal(target, job.papka)) throw new Error("путь после создания папок ведёт за пределы проекта");
+        const targetRefusal = checkFolders();
+        if (targetRefusal) throw Error(targetRefusal);
         if (expectedHash == null) { if (TEST_PUBLISH_DELAY_MS) await sleep(TEST_PUBLISH_DELAY_MS); publishNewFile(target, bytes); }
         else await replaceFileAtomic(target, bytes, stillFresh);
       } catch (e) {
@@ -1611,6 +1680,7 @@ register(
       APPLYING.delete(nomer);
       await lock.release();
     }
+    } finally { await folderLock.release(); }
   }
 );
 
@@ -1729,9 +1799,9 @@ async function resumeQueue() {
   if (access.guest() || scanning || shuttingDown || !instancePipeOk) return;
   scanning = true;
   try {
-    await require('../../common/progress').longRunning('Antigravity', listJobs(), updateJob);
+    await require('../../common/progress').longRunning('Antigravity', queueJobs(), updateJob);
     // team-v19 К2: перенос дирижёра запасного режима — основной сервер, под замком задания и файла; без режима ждёт с причиной.
-    for (const j of listJobs().filter((j) => j.applyRequest && !j.applyRequest.done)) {
+    for (const j of queueJobs().filter((j) => j.applyRequest && !j.applyRequest.done)) {
       const r = j.applyRequest, m = require('../../common/user-word').mode();
       const hold = !m.active ? 'запасной режим снят — перенос ждёт Claude' : m.entry.id !== r.word ? 'дирижёр сменился — перенос ждёт нового запроса' : '';
       if (hold) { if (r.hold !== hold) await updateJob(j.id, (c) => { if (c.applyRequest) c.applyRequest.hold = hold; }).catch(() => {}); continue; }
@@ -1740,11 +1810,35 @@ async function resumeQueue() {
       const text = (out.content || []).map((c) => c.text).join('\n').slice(0, 2000);
       await updateJob(j.id, (c) => { if (c.applyRequest) { Object.assign(c.applyRequest, { done: nowIso(), ok: !out.isError, result: text }); delete c.applyRequest.hold; } }).catch(() => {});
     }
-    for (const j of listJobs()) {
+    for (const j of queueJobs()) {
+      // team-v46 fix: проверка родителя — только для идущих и ожидающих (иначе квадратично по всем карточкам).
+      if (['queued', 'waiting_quota', 'running'].includes(j.status) && j.parentJob && require('../../common/chain-deadline').parentTerminal(j)) {
+        if (j.status === 'running' && RUNNING.has(j.id)) await requestStop(j.id, 'родитель завершился');
+        else if (['queued', 'waiting_quota'].includes(j.status)) await updateJob(j.id, c => { if (['queued', 'waiting_quota'].includes(c.status)) Object.assign(c, { status: 'cancelled', error: 'Родитель завершился; запуск отменён.', finishedAt: nowIso() }); });
+        continue;
+      }
       if (!['waiting_quota', 'queued'].includes(j.status) || Date.parse(j.nextAttemptAt) > Date.now() || !j.retry)
         continue;
       const st = await ownerState(j.owner);
       if (j.status !== 'queued' && !['self', 'dead'].includes(st)) continue;
+      // Цикл отвергается до замка gen: тот же каталог может быть занят предком.
+      if (require('../../common/job-chain').queuedRefusal(j, undefined, 'antigravity')) {
+        await updateJob(j.id, (c) => {
+          if (!['queued', 'waiting_quota'].includes(c.status)) return false;
+          const reason = require('../../common/job-chain').queuedRefusal(c, undefined, 'antigravity');
+          if (!reason) return false;
+          Object.assign(c, { status: 'failed', draftStatus: 'not_attempted', error: reason, finishedAt: nowIso() });
+        });
+        continue;
+      }
+      // team-v46 п.5а: срок родителя истёк в очереди — отмена без запуска.
+      if (require('../../common/chain-deadline').deadlinePassed(j)) {
+        await updateJob(j.id, (c) => {
+          if (!['queued', 'waiting_quota'].includes(c.status)) return false;
+          Object.assign(c, { status: 'cancelled', draftStatus: 'not_attempted', error: 'Срок родителя истёк, пока поручение ждало очереди; запуск отменён.', finishedAt: nowIso() });
+        });
+        continue;
+      }
       const lock = await tryLock('gen', j.papkaCanon, { jobId: j.id, papka: j.papka });
       if (!lock.ok) continue;
       let claimed = false,
@@ -1757,6 +1851,8 @@ async function resumeQueue() {
             (c.status !== 'queued' && !['self', 'dead'].includes(await ownerState(c.owner)))
           )
             return false;
+          const chain = require('../../common/job-chain').queuedRefusal(c, undefined, 'antigravity');
+          if (chain) { Object.assign(c, { status: 'failed', draftStatus: 'not_attempted', error: chain, finishedAt: nowIso() }); return; }
           restartHold.assertAdmitted(STATE_DIR, restartServer);
           c.status = 'running';
           c.owner = { instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT };
@@ -1777,11 +1873,12 @@ async function resumeQueue() {
 // ---------- запуск ----------
 (async () => {
   await require('../../common/state-migration').start(require('../../common/paths'));
-  restartServer = access.guest() ? null : restartHold.server(STATE_DIR, 'antigravity');
+  restartServer = access.guest() ? null : restartHold.serverAsync(STATE_DIR, 'antigravity');
   process.stdin.on('end', () => { if (restartServer) restartServer.closed = true; });
   process.stdin.on('close', () => { if (restartServer) restartServer.closed = true; });
   rotateJournal();
-  if (!access.guest() && !process.env.MOST_TEST_KEEP) pruneOld();
+  // team-v46: уборка старых заданий (обход всех каталогов, ~10 с) — не до подключения к Claude, а через 2 мин после старта.
+  if (!access.guest() && !process.env.MOST_TEST_KEEP) setTimeout(() => { try { pruneOld(); } catch (e) { log(errText(e)); } }, 120000).unref();
   // канал экземпляра: по нему другие экземпляры моста узнают, жив ли этот
   const ip = await startOwner(() => ({ version: VERSION, file: __filename, running: [...RUNNING.keys()] }));
   if (ip.ok) { instanceServer = ip.srv; instancePipeOk = true; }
@@ -1793,7 +1890,7 @@ async function resumeQueue() {
       () => resumeQueue().catch((e) => log(errText(e))),
       Math.min(30000, Number(process.env.MOST_QUEUE_TICK_MS || 1000)),
     ).unref();
-    await resumeQueue();
+    // team-v46 fix: первый проход очереди — после подключения к Claude Desktop (ниже), не до.
   }
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -1806,4 +1903,5 @@ async function resumeQueue() {
   server.server.onclose = () => shutdown("связь MCP закрыта");
   await server.connect(transport);
   access.ready('antigravity');
+  if (!access.guest() && AGY && process.env.MOST_PROBE_ONLY !== '1') resumeQueue().catch((e) => log(errText(e)));
 })();

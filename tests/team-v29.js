@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 const fs = require('fs'), path = require('path'), assert = require('assert/strict'), cp = require('child_process'), Module = require('module');
 const ROOT = path.resolve(__dirname, '..'), RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v29-'));
 const write = (f, bytes) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)); };
@@ -74,7 +78,7 @@ test('Р9: снимок оболочки не перечитывается по�
       await transport.send({ id: m.id, result: { content: [{ type: 'text', text: require('../common/format').format('Команда', {}, 'тело') }] } });
       assert.equal(sent.at(-1).result.content[0].text, before);
     };
-    await transport.onmessage({ id: 1, method: 'tools/call', params: { arguments: { owner: 'тест' } } }); assert.equal(reads, 2);
+    await transport.onmessage({ id: 1, method: 'tools/call', params: { name: 'team_status', arguments: { owner: 'тест' } } }); assert.equal(reads, 2); // team-v44 П3
   } finally { owner.reminder = oldReminder; fallback.banner = oldBanner; }
 });
 async function mcp(root) {
@@ -97,7 +101,9 @@ function statusFixture(root, crowded) {
     stages: [{ title: 'Завершённый', state: 'выдан без принятия', weight: 100, gate: { files: ['file'], reasons: ['причина'] } }] }));
   if (crowded) for (let i = 0; i < 25; i++) json(path.join(root, 'works/open-' + i + '.json'), work('open-' + i, { updated_at: ago(25 - i),
     stages: [{ title: 'Этап ' + i, state: 'выдан без принятия', weight: 100, gate: { files: ['file'], reasons: ['причина'], ...(i === 0 ? { warning: 'ПРЕДУПРЕЖДЕНИЕ-ДАВНЕГО' } : {}) } }] }));
-  json(path.join(root, 'works/remind.json'), work('remind', { owner: 'status-owner', created_at: ago(1), status_sent_at: ago(1) }));
+  // remind — работа-напоминание владельца: не самая свежая активная работа (её updated старше open-24),
+  // чтобы при переполнении сохранялся именно блок самой свежей открытой работы (team-v47 О10).
+  json(path.join(root, 'works/remind.json'), work('remind', { owner: 'status-owner', created_at: ago(2), updated_at: ago(2), status_sent_at: ago(1) }));
   for (let i = 0; i < 30; i++) json(path.join(root, 'state/codex-jobs/decision-' + i + '.json'), { id: 'decision-' + i, status: 'needs_decision', startedAt: ago(25) });
   json(path.join(root, 'state/codex-jobs/running.json'), { id: 'running-o10', status: 'running', startedAt: ago(1) });
   json(path.join(root, 'state/jobs/applying/card.json'), { id: 'applying', status: 'applying', startedAt: ago(30) });
@@ -121,7 +127,13 @@ test('О10: настоящий MCP, текущий состав квот, пер
         const shown = [...text.matchAll(/open-(\d+): принято/g)].map(m => Number(m[1]));
         assert(shown.length > 0, 'должен остаться блок самой свежей работы');
         assert.deepEqual(shown.sort((a,b) => a-b), Array.from({ length: 25 - Math.min(...shown) }, (_, i) => Math.min(...shown) + i));
-      } else assert(!text.includes('Ещё не показано'), text);
+      } else {
+        // team-v47 (решение пользователя по О10): обязательные предупреждения restart-hold (team-v46) могут чуть превысить
+        // бюджет и в «без лишнего» — вытесняются только НЕработы (из них работ: 0), блок самой свежей работы сохраняется.
+        const hidden = text.match(/Ещё не показано: \d+ строк \(из них работ: (\d+)\)/);
+        assert(!hidden || Number(hidden[1]) === 0, text);
+        assert(text.includes('remind: принято'), 'блок самой свежей работы remind сохранён\n' + text);
+      }
       const full = await server.call(true); assert(full.includes('Завершённый')); assert(full.includes('decision-29'));
     } finally { await server.close(); }
   }
@@ -139,14 +151,13 @@ test('Р10: успешная уборка сокращена только в к�
   json(file, { ...op, cleanup: { state: 'ошибка', reason: 'сбой уборки' } });
   assert((await summary.compact(t, 'квоты', undefined, { budget: 1 })).includes('сбой уборки'));
 });
-test('Р13: нет источника по умолчанию — пропуск; неверный явный источник — ошибка', async () => {
+test('Р13: полная оболочка на фиксированной фикстуре — предел 3000, чистое окружение, без внешней копии', () => {
   const source = fs.readFileSync(path.join(__dirname, 'trio-v5.js')).toString('utf8');
   const body = source.slice(source.indexOf("test('Р4: полная оболочка"), source.indexOf("test('Р5: настоящие ворота merge"));
-  let check; const env = { ...process.env }; delete env.MOST_TEST_STATUS_SOURCE;
-  new Function('test', 'process', 'fs', 'path', 'RUN', 'assert', body)((_name, fn) => { check = fn; }, { env }, { existsSync: () => false }, path, RUN, assert);
-  assert.equal(await check(), 'нет копии текущих данных');
-  env.MOST_TEST_STATUS_SOURCE = path.join(RUN, 'missing-source');
-  await assert.rejects(check(), /MOST_TEST_STATUS_SOURCE: папка не существует/);
+  assert(!body.includes("'C:/most'") && !body.includes('нет копии текущих данных'), 'Р4 больше не зависит от внешней копии текущих данных');
+  assert.match(body, /fixtures\/team-v43\/status-child\.js/);
+  assert.match(body, /assert\.equal\(run\(dirty\),text\)/);
+  assert.match(body, /text\.trimEnd\(\)\.length <= 3000/);
 });
 test('О11: oldModule читает фикстуры без git, current читает текущий файл', () => {
   const source = fs.readFileSync(path.join(__dirname, 'team-v21-paths.js')).toString('utf8');
@@ -184,11 +195,14 @@ test('О1–О2: прямое хранилище, живой/мёртвый/не
   for (const status of ['running', 'cancelling', 'cancel_requested', 'stop_unconfirmed', 'cancelled']) {
     const file = path.join(state, 'codex-jobs/a.json'); json(file, { id: 'abcdefgh-more', status, stopUnconfirmed: status === 'cancelled', owner: mine, folder: 'чужая-папка', from: 'claude', work: 'другая-работа', startedAt: ago(1) });
     const rows = await live.running({ stateDir: state }); assert.equal(rows.length, 1); assert.match(live.describe(rows), /abcdefgh.*чужая-папка.*идёт.*claude.*другая-работа/);
-    json(file, { id: 'a', status, stopUnconfirmed: status === 'cancelled', owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 0);
+    json(file, { id: 'a', status, stopUnconfirmed: status === 'cancelled', owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 1, 'мёртвый владелец не снимает блокировку: дочерний процесс мог остаться');
   }
+  json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status: 'cancelled', owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 0, 'мёртвый владелец без stopUnconfirmed не блокирует');
+  json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status: 'cancelled', stopUnconfirmed: { pid: 999999 }, owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 1, 'неподтверждённая остановка блокирует и без владельца');
+  json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status: 'stop_unconfirmed', owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 1);
   for (const status of ['queued', 'waiting_quota', 'needs_decision', 'done']) { json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status, owner: mine }); assert.equal((await live.running({ stateDir: state })).length, 0); }
   json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'applying', owner: gone, apply: { owner: mine } }); assert.equal((await live.running({ stateDir: state })).length, 1);
-  json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'applying', owner: mine, apply: { owner: gone } }); assert.equal((await live.running({ stateDir: state })).length, 0);
+  json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'applying', owner: mine, apply: { owner: gone } }); assert.equal((await live.running({ stateDir: state })).length, 1);
   for (const owner of [mine, null]) { json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'running', owner }); assert.equal((await live.running({ stateDir: state })).length, 1); }
   write(path.join(state, 'jobs/b/card.json'), '{'); await assert.rejects(live.running({ stateDir: state }), /Не удалось проверить поручения/);
 });
@@ -244,7 +258,7 @@ test('О2б, О6к,м: причины отказа, нечитаемые дан�
   const state = fresh('admit'), s = serverInfo(ago(1)); pause(state, 'run');
   const active = hold.admit(state, s, alive); assert.equal(active.kind, 'pause'); assert.match(active.reason, /операция run/);
   const newer = serverInfo(new Date(Date.now() + 1000).toISOString()); assert.equal(hold.admit(state, newer, alive).ok, false);
-  closing(state, 'run'); json(hold.claimFile(state, 'run', true), { closedAt: new Date().toISOString() });
+  closing(state, 'run'); json(hold.claimFile(state, 'run', true), { closedAt: new Date(Date.parse(newer.startedAt) - 1).toISOString() });
   assert.equal(hold.admit(state, s, alive).kind, 'old'); assert.equal(hold.admit(state, newer, alive).ok, true);
   assert.equal(hold.resolved(state, alive), false); assert.equal(hold.resolved(state, dead), true);
   await hold.cleanup(state, dead); assert(!fs.existsSync(hold.holdFile(state))); assert.equal(hold.admit(state, s, dead).kind, 'old');
@@ -496,7 +510,8 @@ test('Р3: прежние отказы аргументов и карточки 
 test('О3: Codex send и продолжение — обе стороны гонки с задержкой более трёх секунд', async () => {
   const h = executorHarness('codex'), state = path.join(RUN, 'state'), gate = require('../common/stage-gate'), originalPrepare = gate.prepareJob, originalLocked = hold.locked;
   try { for (const continuation of [false, true]) {
-    const folder = fresh('codex-send-' + continuation), prior = 'prior-' + continuation;
+    // team-v46 п.5а: папка записи — в MOST_TEST_OUTSIDE (вне репозитория; TEMP раннера лежит внутри клона).
+    const folder = (fs.mkdirSync(process.env.MOST_TEST_OUTSIDE || require('os').tmpdir(), { recursive: true }), fs.mkdtempSync(path.join(process.env.MOST_TEST_OUTSIDE || require('os').tmpdir(), 'v29-codex-send-'))), prior = 'prior-' + continuation;
     if (continuation) json(path.join(state, 'codex-jobs', prior + '.json'), { id: prior, status: 'done', threadId: 'thread', folder, write: true, from: 'claude' });
     const args = { folder, task: 'тест', write: true, ...(continuation ? { continue_id: prior } : {}) };
     const entered = signal(), release = signal(); gate.prepareJob = async () => { entered.resolve(); await release.promise; };
@@ -531,7 +546,7 @@ test('О5: Antigravity send и перенос отказывают после р
     assert(out.isError); assert.match(out.content[0].text, /Идёт перезапуск/); assert(!h.list().some(j => j.papka === folder && j.status === 'running'));
     await hold.abort(state, p); const gen = await locks.tryLock('gen', require('../common/paths').canon(folder), {}, state); assert(gen.ok); await gen.release();
   } finally { gate.prepareJob = originalPrepare; }
-  const folder = fresh('agy-apply'), target = path.join(folder, 'output.txt'), id = 'apply-test', file = path.join(state, 'jobs', id, 'card.json');
+  const folder = (fs.mkdirSync(process.env.MOST_TEST_OUTSIDE || require('os').tmpdir(), { recursive: true }), fs.mkdtempSync(path.join(process.env.MOST_TEST_OUTSIDE || require('os').tmpdir(), 'v29-agy-apply-'))), target = path.join(folder, 'output.txt'), id = 'apply-test', file = path.join(state, 'jobs', id, 'card.json');
   json(file, { id, status: 'done', papka: folder, draftPath: path.join(folder, '_draft.txt'), rezhim: 'tekst', from: 'claude', startedAt: ago(1) }); write(path.join(path.dirname(file), 'result.txt'), 'готовый результат');
   const targetLock = await locks.tryLock('apply', require('../common/paths').canonMaybe(target), {}, state);
   assert(targetLock.ok); const sending = h.apply({ nomer: id, kuda: target }); await sleep(100);
@@ -556,8 +571,11 @@ test('О6т: все входы закрытия проходят протоко�
   const deploy = require('../common/deploy'), saved = Object.fromEntries(['MOST_CODEX_CONFIG', 'MOST_AGY_MCP_CONFIG', 'MOST_AGY_CONFIG'].map(k => [k, process.env[k]]));
   try { for (const route of ['configure', 'configureClients', 'cli-config', 'cli-clients', 'deploy']) for (const late of [false, true]) {
     const root = fresh('entry-' + route + '-' + late), state = path.join(root, 'state'), id = 'a'.repeat(40), release = path.join(root, 'live', id), config = path.join(root, 'claude.json');
-    for (const name of require('../common/members').servers) write(path.join(release, 'servers', name, 'index.js'), '');
+    // Состав установки после forward-миграции team-v46 (claude — устанавливаемый сервер): deploy под замком
+    // мигрирует реестр корня и затем требует servers/claude/index.js в уже существующем релизе.
+    for (const name of require('../common/members').serversForInstall(require('../common/members-v46').forward(require('../common/members-store').create(state).read({ initialize: false })))) write(path.join(release, 'servers', name, 'index.js'), '');
     write(path.join(release, 'common/access.js'), fs.readFileSync(path.join(ROOT, 'common/access.js')));
+  for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(release, 'common', name), fs.readFileSync(path.join(ROOT, 'common', name))); /* реестр кандидата А */
     json(path.join(release, 'probe-ok.json'), { root, commit: id, at: new Date().toISOString(), servers: ['antigravity', 'codex', 'team'] }); json(config, {});
     process.env.MOST_CODEX_CONFIG = path.join(root, 'codex.toml'); write(process.env.MOST_CODEX_CONFIG, ''); process.env.MOST_AGY_MCP_CONFIG = path.join(root, 'agy.json'); json(process.env.MOST_AGY_MCP_CONFIG, {}); process.env.MOST_AGY_CONFIG = path.join(root, 'permissions.json'); json(process.env.MOST_AGY_CONFIG, {});
     const addJob = () => json(path.join(state, 'codex-jobs/a.json'), { id: 'foreign', status: 'running', owner: locks.owner(), folder: root });
@@ -566,7 +584,12 @@ test('О6т: все входы закрытия проходят протоко�
     let action;
     if (route === 'configure') action = () => deploy.configure({ release, configs: [config], restartClaude: true }, deps);
     if (route === 'configureClients') action = () => deploy.configureClients({ release, restartClaude: true }, deps);
-    if (route.startsWith('cli-')) action = () => require('../tools/deploy').main([route === 'cli-config' ? '--config-only' : '--clients-only', '--release', release, ...(route === 'cli-config' ? ['--config', config] : []), '--restart-claude'], { configure: o => deploy.configure(o, deps), configureClients: o => deploy.configureClients(o, deps), print() {} });
+    if (route.startsWith('cli-')) {
+      require('./fixtures/team-v43/fixture').release(root, id);
+      action = async () => require('child_process').execFileSync(process.execPath,
+        [path.join(__dirname, 'fixtures/team-v43/restart-entry.js'), root, release, route, String(late)],
+        { env: { ...process.env, MOST_REPO_ROOT: root, MOST_STATE_DIR: state }, encoding: 'utf8', windowsHide: true, stdio: 'pipe' });
+    }
     if (route === 'deploy') {
       const filename = path.join(ROOT, 'common/deploy.js'), m = new Module(filename, module); m.filename = filename; m.paths = Module._nodeModulePaths(path.dirname(filename));
       m.require = name => name === './team-git' ? { ...require('../common/team-git'), repository() {}, hash: () => id } : Module.createRequire(filename)(name);
@@ -785,7 +808,9 @@ test('О6у: настоящий родитель закрыт между про�
 });
 (async () => {
   let passed = 0, failed = 0, skipped = 0;
-  for (const [name, fn] of tests) try { const reason = await fn(); if (reason) { skipped++; console.log('ПРОПУЩЕНО: ' + name + ' — ' + reason); } else { passed++; console.log('ПРОЙДЕНО: ' + name); } }
+  const selected = process.argv[2], cases = selected ? tests.filter(([name]) => name.startsWith(selected)) : tests;
+  if (selected && cases.length !== 1) throw Error('Укажите однозначный префикс имени проверки.');
+  for (const [name, fn] of cases) try { const reason = await fn(); if (reason) { skipped++; console.log('ПРОПУЩЕНО: ' + name + ' — ' + reason); } else { passed++; console.log('ПРОЙДЕНО: ' + name); } }
   catch (e) { failed++; console.error('ПРОВАЛЕНО: ' + name + '\n' + e.stack); }
   console.log('Итого: пройдено ' + passed + ', провалено ' + failed + ', пропущено ' + skipped); process.exitCode = failed ? 1 : 0;
 })();

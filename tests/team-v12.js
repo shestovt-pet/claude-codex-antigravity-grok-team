@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 // team-v12: хвосты публикации — проверка npm без оболочки (Р1), своя запись (Р2), голоса по текущему замыслу (Р3),
 // отпечаток без записи в клон (Р4), правила и порядок публикации (Р5–Р6).
 const fs = require('fs'), path = require('path'), assert = require('assert'), os = require('os'), cp = require('child_process');

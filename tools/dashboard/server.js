@@ -159,6 +159,7 @@ async function handleApiGet(req, res, url) {
     h.network = { host: HOST, lan: isLanBind(HOST) };
     return sendJson(res, 200, h);
   }
+  if (p === '/api/members') return sendJson(res, 200, require('../../common/members').active().map(m => ({ id: m.id, title: m.title, receives: require('../../common/members').effective(m).roles.receives })));
   if (p === '/api/ready') return sendJson(res, 200, data.getReady());
   if (p === '/api/quotas') return sendJson(res, 200, await data.getQuotas());
   if (p === '/api/board') {
@@ -384,7 +385,7 @@ function feedSignature() {
   for (const f of [
     path.join(stateDir, 'notify.log'),
     path.join(repoRoot, 'live', 'deployed.json'),
-    ...['antigravity', 'codex', 'grok', 'team'].map((n) => path.join(stateDir, 'ready', n + '.json')),
+    ...require('../../common/members').servers.map((n) => path.join(stateDir, 'ready', n + '.json')),
   ]) {
     try {
       const st = fs.statSync(f);

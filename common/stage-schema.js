@@ -1,13 +1,13 @@
 'use strict';
 const { z } = require('zod');
-const family = z.enum(['anthropic', 'google', 'openai', 'xai']);
+const family = z.string().refine(v => require('./members').families.includes(v), 'Неизвестная семья');
 const author = { family, model: z.string().min(1) };
 const mixedAuthor = z.union([z.object(author), z.object({ authors: z.array(z.object(author)).min(1) })]);
 const paths = z.union([z.string(), z.array(z.string())]);
-const replaces = z.object({ who: z.enum(['codex', 'antigravity', 'grok', 'fresh', 'claude']), reason: z.string().min(1), after_job: paths.optional(), after_file: paths.optional() });
-const decision = z.object({ kind: z.enum(['dismiss', 'reconsider', 'replace']), version: z.string().min(1),
+const replaces = z.object({ who: z.string().refine(v => [...require('./members').ids, 'grok', 'fresh'].includes(v), 'Неизвестный участник'), reason: z.string().min(1), after_job: paths.optional(), after_file: paths.optional() });
+const decision = z.object({ kind: z.enum(['dismiss', 'reconsider', 'reconsider_by_other', 'replace']), version: z.string().min(1),
   job_id: z.string().optional(), reason: z.string().min(1), at: z.string().optional(),
-  review_job_id: z.string().optional(), replacement: z.enum(['codex', 'antigravity', 'grok', 'mixed']).optional(),
+  review_job_id: z.string().optional(), replacement: z.string().refine(v => [...require('./members').helpers, 'grok', 'mixed'].includes(v), 'Неизвестный участник').optional(),
   outcome: z.enum(['пересмотрено и принято', 'повторный блокирующий отказ']).optional(),
   evidence: z.string().optional(), word_id: z.string().optional(), family: family.optional(), model: z.string().optional(), file: z.string().optional(), file_hash: z.string().optional() });
 // team-v18 К8: частичный результат выпавшего исполнителя (отменённое поручение «текст») с обязательным словом пользователя.

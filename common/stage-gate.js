@@ -5,8 +5,9 @@ const stores = require('./team-store');
 const { isInsideReal, samePath, repoRoot } = require('./paths');
 const { atomic, name } = require('./team-git');
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');
-const families = ['anthropic', 'google', 'openai', 'xai'];
-const table = { anthropic: ['openai', 'google'], google: ['openai'], openai: ['google'], xai: ['openai', 'google'] };
+const families = require('./members').families;
+// Версия 14 сохраняет прежнее правило: все внешние семьи, кроме автора.
+const table = require('./members').dynamic(() => Object.fromEntries(families.map(f => [f, [...new Set(Object.values(require('./members').seats))].filter(v => v !== f)])));
 const list = x => x == null ? [] : Array.isArray(x) ? x : [x];
 const task = j => j.scopeTask ?? ((j.task || j.poruchenie || '') + '\n' + (j.text || ''));
 const at = j => Date.parse(j.startedAt || j.created_at || j.createdAt || j.at);
@@ -36,7 +37,9 @@ const resolves = (next, j) => !next.count && compare(next, j) > 0 && slot(next) 
 const nextOrder = s => (s.gate.order = (s.gate.order || 0) + 1);
 function readFailure(message) { return Object.assign(Error(message), { code: 'STAGE_READ_FAILED' }); }
 function allJobs(snapshot) {
-  return require('./members').helpers.flatMap(who => {
+  // Получатели с адаптером, кроме удалённых: приостановленные остаются (их блокирующие отказы не исчезают),
+  // удалённые — история, их отзывы не блокируют текущий этап.
+  return require('./members').scanIds.flatMap(who => {
     const result = stores.list(who, false, snapshot);
     if (result.errors.length) throw readFailure('Нельзя прочитать поручения: ' + result.errors.join('; '));
     return result.jobs.map(j => ({ ...j, who }));
@@ -101,11 +104,19 @@ function version(w, s) {
 function normalize(w, old, planChange = '') {
   const seen = new Set();
   w.stages = w.stages.map(raw => {
+    raw = { ...raw };
+    delete raw.acceptance; delete raw.acceptance_history; delete raw.acceptance_restore;
     let prev = raw.id ? old?.stages.find(s => s.id === raw.id) : old?.stages.find(s => s.title === raw.title);
     if (raw.id && !prev) throw Error('Неизвестный id этапа: ' + raw.id);
     if (seen.has(prev?.id || raw.title)) throw Error('Повтор этапа.');
     seen.add(prev?.id || raw.title);
-    const s = { ...prev, ...raw, id: prev?.id || crypto.randomUUID(), rules_version: prev ? (prev.rules_version || 13) : 15 };
+    const phaseVersion = require('./members').phase() === 'B' ? 16 : 15;
+    const s = { ...prev, ...raw, id: prev?.id || crypto.randomUUID(), rules_version: prev ? (prev.rules_version || 13) :
+      (raw.rules_version != null
+        ? (require('./members').phase() === 'B' && Number(raw.rules_version) < 16
+            ? (() => { throw Error('Новый этап не может заявить правила ниже версии фазы (16).'); })()
+            : Number(raw.rules_version))
+        : phaseVersion) };
     if (prev?.state === 'принят' && raw.state !== 'принят' && raw.evidence === undefined) delete s.evidence;
     s.gate = structuredClone(prev?.gate || { files: [], reasons: [] });
     if (s.rules_version >= 15) {
@@ -174,7 +185,7 @@ function registerFile(w, s, file, v) {
 function freshRows(s) { return s.gate.files.map(f => ({ ...f, id: f.hash, who: 'fresh', family: 'anthropic', at: Date.parse(f.at), readyAt: Date.parse(f.at) })); }
 function required(p, s) { return [...new Set([...table[p.family], ...(s.level === 'высокий' ? ['fresh'] : [])])]; }
 function whoSeat(who) {
-  return ({ codex: 'openai', antigravity: 'google', fresh: 'fresh', claude: 'fresh' })[who];
+  return ({ fresh: 'fresh', claude: 'fresh' })[who] || require('./members').seats[who];
 }
 async function unavailable(who, jobs) {
   if (who === 'fresh' || who === 'claude') return { note: 'нет инструмента Agent — заявлено Claude' };
@@ -280,9 +291,24 @@ function conductorLimits(s, old) {
     throw Error('Запасной режим: criterion_met — только если семьи дирижёра (' + family + ') нет среди авторов части.');
 }
 async function evaluate(w, s, old, jobs, snapshot) {
+  if (w.closed && s.override?.closed_by_word) return 'выдан без принятия (закрыто словом пользователя)';
+  jobs ??= allJobs(snapshot);
+  const acceptance = require('./acceptance');
+  const saved = acceptance.preserve(w, s, old, jobs, snapshot);
+  if (saved.handled) return saved.message;
+  const message = await evaluateCurrent(w, s, old, jobs, snapshot);
+  acceptance.finish(w, s, old);
+  return message;
+}
+// Прежний пересчёт: используется также отчётом «было → стало», без записи карточек.
+async function evaluateCurrent(w, s, old, jobs, snapshot) {
+  if (w.closed && s.override?.closed_by_word) return 'выдан без принятия (закрыто словом пользователя)';
+  require('./members').snapshot();
+  // Обязательные места проверяются только на пути принятия: создание этапа и «идёт» не блокируются (ревью DeepSeek, З-3).
+  if (s.state === 'принят' || s.criterion_met) require('./members').requiredVoters();
   jobs ??= allJobs(snapshot);
   jobs = jobs.filter(j => j.who !== 'grok');
-  if (s.rules_version > 15) throw Error('Неизвестная версия правил этапа.');
+  if (s.rules_version > 16) throw Error('Неизвестная версия правил этапа.');
   conductorLimits(s, old);
   if (s.rules_version >= 15) return require('./stage-gate-v15').evaluate(w, s, old, jobs, snapshot);
   if (s.artifact_manifest && (s.state === 'принят' || s.criterion_met)) s.artifact_verification = checkArtifacts(w, s);
@@ -322,9 +348,12 @@ async function evaluate(w, s, old, jobs, snapshot) {
     }
   }
   const missing = [], negatives = [], advisories = [], occupiedAll = [];
+  s.gate.quorum = [];
   for (const p of ps) {
     const applicable = rows.filter(j => covers(j, p, ps));
     const req = required(p, s);
+    s.gate.quorum.push({ part: p.part || '', needed: req.length, families: req });
+    if (!req.some(f => f !== 'fresh')) missing.push((p.part || 'этап') + ': нет допустимой внешней голосующей семьи');
     const normal = applicable.filter(j => j.replaces || (j.role !== 'совет' && req.includes(j.who === 'fresh' ? 'fresh' : j.family)));
     let mandatory = normal.filter(j => s.level !== 'мелочь' || j.who !== 'fresh');
 
@@ -431,6 +460,8 @@ async function prepareLocked(a, who, root) {
   if (a.role === 'проверка' && (s.rules_version >= 14 || s.level)) {
     const v = version(w, s);
     if (who === 'codex' && (a.continue_id || a.previous || a.write)) throw Error('Ревью Codex должно быть новым сеансом только для чтения.');
+    if (require('./members').adapterOf(who) === 'dsh-headless' && (a.continue_id || a.previous || a.write || a.profile !== 'most-review' || !require('./dsh-probe').ok()))
+      throw Error('Голос DeepSeek должен быть новым сеансом только для чтения в профиле most-review после успешной пробы.');
     if (!hasVersion(task(a), v)) throw Error('В поручении нужна текущая version: ' + v);
     s.version = v; s.gate.locked = true;
     if (a.replaces) {
@@ -450,5 +481,5 @@ async function prepareLocked(a, who, root) {
   atomic(file, JSON.stringify(w, null, 2) + '\n');
   return a;
 }
-module.exports = { checkArtifacts, reviewerFamily, normalize, evaluate, prepareJob, allJobs, parts, version, covers, verdict, registerFile, replacement, currentRows,
+module.exports = { checkArtifacts, reviewerFamily, normalize, evaluate, evaluateCurrent, prepareJob, allJobs, parts, version, covers, verdict, registerFile, replacement, currentRows,
   belongs, hasVersion, task, at, compare, named, reviewed, freshRows, sources, sameDecision };

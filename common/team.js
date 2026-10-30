@@ -6,7 +6,7 @@ const { name, inside, git, repository, hash, clean, atomic } = require('./team-g
 const stores = require('./team-store'),
   deployer = require('./deploy');
 const { format, duration } = require('./format');
-const participants = ['claude', 'codex', 'antigravity'];
+const participants = require('./members').ids;
 const sha = value => require('crypto').createHash('sha256').update(value).digest('hex');
 const requestText = c => c.request ? 'Запрос пользователя ' + c.requestMark + ':\n' + c.request + (c.fast ? '\nМалая правка, карточка sha256 ' + c.cardHash + ':\n' + c.note + '\nМалая ли правка — обязательный вопрос ревью.\n' : '\nЗамысел: ' + c.designFile + ', sha256 ' + c.designHash + '\n') : 'запрос не сохранён (изменение начато до ворот запроса)\n';
 function refreshDesign(c) {
@@ -25,9 +25,12 @@ function systemic(c, who, id, text) {
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
 const save = (file, value) => atomic(file, JSON.stringify(value, null, 2) + '\n');
 function stageFailure(s, before, previous, error) {
+  if (s.override?.closed_by_word) return 'выдан без принятия (закрыто словом пользователя)';
+  const history = s.acceptance || previous?.acceptance || (previous?.state === 'принят' ? require('./acceptance').legacy(previous) : null);
   const unreadable = error.code === 'STAGE_READ_FAILED' || ['EACCES', 'EPERM', 'ENOENT', 'EBUSY', 'EIO'].includes(error.code);
   for (const key of Object.keys(s)) delete s[key];
   Object.assign(s, unreadable && ['принят', 'выдан без принятия'].includes(previous?.state) ? structuredClone(previous) : before);
+  if (history) s.acceptance = history;
   s.state = unreadable ? (previous?.state || 'план') : previous?.state === 'выдан без принятия' ? previous.state : 'идёт';
   const message = 'Этап [' + s.id + '] ' + (unreadable ? 'не удалось проверить; прежнее состояние сохранено: ' : 'не принят: ') + error.message;
   s.gate ||= { files: [], reasons: [] };
@@ -37,25 +40,26 @@ function stageFailure(s, before, previous, error) {
   return message;
 }
 function percent(w) {
-  return Math.round(w.stages.filter((s) => s.state === 'принят').reduce((n, s) => n + s.weight, 0) * 100) / 100;
+  return require('./acceptance').presentation(w).current;
 }
 
 // Краткий ответ на create/update (team-v9 Р3): полный вид — team_work get.
 function workBrief(w) {
   const i = w.stages.findIndex((s) => s.state !== 'принят');
   return require('./summary').label(w) + ' · редакция ' + w.revision +
-    '\nПринято ' + percent(w) + ' % плана · этап ' + (i < 0 ? w.stages.length : i + 1) + ' из ' + w.stages.length +
+    '\n' + require('./acceptance').presentation(w).line + ' · этап ' + (i < 0 ? w.stages.length : i + 1) + ' из ' + w.stages.length +
     ' — ' + (i < 0 ? 'все приняты' : w.stages[i].title) +
     '\nСледующий шаг: ' + w.next_step +
+    require('./acceptance').presentation(w).details.map(t => '\n' + t).join('') +
     '\nДля следующего обновления: expected_revision ' + w.revision + '; полный вид — team_work get.';
 }
 // Одно сообщение на все этапы, принятые одним обновлением (team-v9 Р3).
 function acceptedMessage(w, accepted) {
   const n = w.stages.length,
     one = ({ s, i }) => 'этап ' + (i + 1) + ' из ' + n + ' — ' + s.title + ' · сделано: ' + s.evidence + ' · это закрывает: ' + (s.closes || s.accept_criteria);
-  return 'Принято ' + percent(w) + ' % плана · ' +
+  return require('./acceptance').presentation(w).line + ' · ' +
     (accepted.length === 1 ? one(accepted[0]) : 'приняты этапы: ' + accepted.map(one).join('; ')) +
-    ' · дальше: ' + w.next_step;
+    ' · дальше: ' + w.next_step + require('./acceptance').presentation(w).details.map(t => '\n' + t).join('');
 }
 
 function workText(w) {
@@ -65,15 +69,13 @@ function workText(w) {
     require('./summary').label(w) +
     ' · редакция ' +
     w.revision +
-    '\nПринято ' +
-    percent(w) +
-    ' % плана · этап ' +
+    '\n' + require('./acceptance').presentation(w).line + ' · этап ' +
     (i < 0 ? w.stages.length : i + 1) +
     ' из ' +
     w.stages.length +
     ' — ' +
     (i < 0 ? 'все приняты' : w.stages[i].title) +
-    '\nЭтапы: ' + w.stages.map(s => s.title + ' [' + (s.id || 'старый этап') + '] · ' + s.state + ' · version ' + (s.version || 'не задана') + '\n' + [s.gate?.message, s.gate?.warning].filter(Boolean).join('\n')).join('\n') +
+    '\nЭтапы: ' + w.stages.map(s => s.title + ' [' + (s.id || 'старый этап') + '] · ' + s.state + (s.override?.closed_by_word ? ' (закрыто словом пользователя)' : '') + ' · version ' + (s.version || 'не задана') + '\n' + [s.gate?.message, s.gate?.warning, require('./acceptance').stageText(w, s)].filter(Boolean).join('\n')).join('\n') +
     '\nЦель: ' +
     w.goal +
     '\nСделано: ' +
@@ -132,12 +134,15 @@ class Team {
     const w = this.readWork(file);
     if (w.error) return w;
     const before = JSON.stringify(w);
-    for (const s of w.stages.filter(s => s.level && ['принят', 'выдан без принятия'].includes(s.state))) {
+    for (const s of w.stages.filter(s => s.level && !s.override?.closed_by_word)) {
       const old = structuredClone(s);
-      try { s.gate.message = await require('./stage-gate').evaluate(w, s, old, undefined, snapshot); delete s.gate.warning; }
-      catch (e) { stageFailure(s, old, old, e); }
+      s.gate ||= { files: [], reasons: [] };
+      // team-v37: принятые и выданные — обычная проверка; план/идёт — только восстановление по журналу (без новой приёмки при чтении).
+      const accepted = ['принят', 'выдан без принятия'].includes(s.state);
+      try { s.gate.message = accepted ? await require('./stage-gate').evaluate(w, s, old, undefined, snapshot) : require('./acceptance').restoreOnly(w, s, old, undefined, snapshot); if (accepted) delete s.gate.warning; }
+      catch (e) { if (accepted) stageFailure(s, old, old, e); else { for (const k of Object.keys(s)) delete s[k]; Object.assign(s, old); } }
     }
-    if (w.closed && w.stages.some(s => !['принят', 'выдан без принятия'].includes(s.state))) w.closed = false;
+    if (w.closed && !w.closedByWord && w.stages.some(s => !['принят', 'выдан без принятия'].includes(s.state))) w.closed = false;
     if (!readOnly && JSON.stringify(w) !== before) {
       if (JSON.stringify(w.stages.map(s => s.state)) !== JSON.stringify(JSON.parse(before).stages.map(s => s.state))) w.revision++;
       save(file, w);
@@ -149,11 +154,11 @@ class Team {
     if (a.action === 'create' && !a.owner?.trim()) throw Error('Для новой работы нужна метка владельца owner.');
     if (a.action === 'list') return deployer.locked(this.root, async () => {
       const snapshot = require('./job-snapshot').create();
-      const works = await Promise.all(this.works().map(w => w.error ? w : this.refreshWork(this.workFile(w.name), { snapshot })));
+      const works = await Promise.all(this.works().map(w => w.error ? w : this.refreshWork(this.workFile(w.name), { readOnly: true, snapshot })));
       for (const w of works.filter(w => !w.error && w.previous_owners?.includes(a.owner))) {
         require('./work-owner').check(w, a.owner);
       }
-      for (const w of works.filter(w => !w.error && (!w.owner || w.owner === a.owner))) {
+      for (const w of works.filter(w => a.owner && !w.error && (!w.owner || w.owner === a.owner))) {
         require('./work-owner').touch(w.name, a.owner, this.root);
       }
       return works.map(workText).join('\n\n') || 'Работ нет.';
@@ -161,9 +166,10 @@ class Team {
     const file = this.workFile(a.name);
     if (a.action === 'get') return deployer.locked(this.root, async () => {
       const snapshot = require('./job-snapshot').create();
-      const current = await this.refreshWork(file, { snapshot });
+      const current = await this.refreshWork(file, { readOnly: true, snapshot });
       if (current.error) return workText(current);
-      return workText(require('./work-owner').touch(a.name, a.owner, this.root));
+      if (a.owner) require('./work-owner').touch(a.name, a.owner, this.root);
+      return workText(current);
     });
     return deployer.locked(this.root, async () => {
       const old = fs.existsSync(file) ? read(file) : null;
@@ -195,11 +201,37 @@ class Team {
       }
       if (a.action === 'create' && old) throw Error('Работа уже существует.\n' + workText(old));
       if (a.action === 'update' && !old) throw Error('Работа не найдена.');
+      // Обновление запрещено только для работы, закрытой словом пользователя (closedByWord); работу, закрытую
+      // обычным принятием этапов, правка material переоткрывает (team-v14; refreshWork:145). closedByWord не снимается.
+      if (a.action === 'update' && old?.closed && old?.closedByWord) throw Error('Закрытую работу не обновляют.');
       if (a.expected_revision !== (old?.revision || 0))
         throw Error(
           'Работу уже изменил другой чат. Текущее состояние:\n' +
             (old ? workText(old) : 'Редакция 0: работа не создана.'),
         );
+      if (a.action === 'close' && a.quote !== undefined) {
+        const access = require('./access');
+        if (process.env.MOST_JOB_ID || access.client() !== 'claude' || access.guest() || require('./user-word').mode().active)
+          throw Error('Закрытие словом разрешено только чату Claude в основном режиме; из гостя и поручения запрещено.');
+        if (typeof a.quote !== 'string' || !a.quote.trim()) throw Error('нужно слово пользователя дословно');
+        if (Object.keys(a).some(k => !['action', 'name', 'owner', 'expected_revision', 'quote'].includes(k) && a[k] !== undefined))
+          throw Error('закрытие словом не меняет план');
+        if (!old) throw Error('Работа не найдена.');
+        if (old.closed) return workText(old);
+        const w = structuredClone(old), ids = [], at = new Date().toISOString();
+        for (const s of w.stages) {
+          if (['принят', 'выдан без принятия'].includes(s.state)) continue;
+          s.state = 'выдан без принятия';
+          s.override = { by: 'user', quote: a.quote, closed_by_word: true };
+          if (s.gate) { delete s.gate.message; delete s.gate.warning; }
+          ids.push(s.id || s.title);
+        }
+        w.closed = true;
+        w.closedByWord = { quote: a.quote, at, stages: ids };
+        w.revision++; w.updated_at = w.heartbeat_at = at;
+        save(file, w);
+        return workText(w);
+      }
       const w = { ...old, stages: structuredClone(old?.stages), name: a.name, revision: (old?.revision || 0) + 1 };
       if (a.action === 'close') w.closed = true;
       if (!w.title && w.name === 'trio-v2') w.title = 'Связка четырёх: 8 пунктов запроса';
@@ -333,7 +365,7 @@ class Team {
     const commit = hash(this.root);
     // Зафиксированный хеш исключает смесь редакций, если main сменился между чтениями.
     return (
-      'Версия правил (main): ' +
+      require('./members').rules() + '\n\n' + 'Версия правил (main): ' +
       commit +
       '\n' +
       (part === 'all' ? ['common', 'claude', 'antigravity', 'grok', 'roles', 'fallback'] : [part])
@@ -405,6 +437,10 @@ class Team {
   }
   async changeInner(a) {
     require('./access').guard('team', 'team_change', a);
+    if (['design', 'verdict'].includes(a.action)) {
+      const target = ['claude', 'user'].includes(a.who) && a.replaces ? a.replaces : a.who;
+      if (!['grok', 'user'].includes(target)) require('./members').assertAvailable(target);
+    }
     if (a.name && ['commit', 'merge', 'deploy'].includes(a.action)) {
       const change = read(this.changeFile(a.name));
       if (change.work) require('./work-owner').check(read(this.workFile(change.work)), a.owner);
@@ -547,26 +583,16 @@ class Team {
       if (a.title !== undefined && ['design', 'verdict', 'commit'].includes(a.action)) c.title = a.title;
       if ((['design', 'commit', 'merge'].includes(a.action) || (a.action === 'grok_slot' && a.phase === 'design')) && c.request) { refreshDesign(c); save(this.changeFile(a.name), c); }
       if (a.action === 'grok_slot') return this.grokSlot(a, p);
-      // team-v18 К4: голос Grok на месте выпавшего — только по поручению grok_slot.
-      if (['design', 'verdict'].includes(a.action) && a.who === 'grok' && a.replaces) return this.grokSlotVote(a, p);
-      if (['design', 'verdict'].includes(a.action) && a.who === 'grok') {
-        if (a.action === 'verdict') {
-          this.checkPair(a, p);
-          if (!clean(folder)) throw Error('Рабочая копия грязная; сначала зафиксируйте изменения.');
-        }
-        const message = await require('./grok-gate').record(c, a.action, a);
-        save(this.changeFile(a.name), c);
-        return message;
-      }
+      if (['design', 'verdict'].includes(a.action) && a.who === 'grok') throw Error(require('./members').grokDisabled);
       if (a.action === 'design') {
         if (!c.request) throw Error('В старом изменении запрос и замысел не сохранены.');
         if (!['ПРИНЯТО', 'НЕ ПРИНЯТО'].includes(a.decision)) throw Error('Неизвестный вердикт замысла.');
         if (a.who === 'claude') {
-          if (a.decision !== 'ПРИНЯТО' || !['codex', 'antigravity'].includes(a.replaces) || !a.note?.trim() ||
+          if (a.decision !== 'ПРИНЯТО' || !require('./members').seatIds.includes(a.replaces) || !a.note?.trim() ||
               (c.designVotes || []).filter(v => v.who === a.replaces && v.decision === 'НЕ ПРИНЯТО').length < 2)
             throw Error('Замена голоса требует двух отрицательных ревью этого помощника и пояснения по фактам.');
         } else {
-          if (!require('./members').helpers.includes(a.who)) throw Error('Неверный участник.');
+          if (!require('./members').seatIds.includes(a.who)) throw Error('Неверный участник.');
           if ((c.designVotes || []).some(v => v.who === a.who && v.job_id === a.job_id)) throw Error('Это ревью замысла уже записано.');
           const j = stores.review(a.who, a.job_id, null, null, a.decision, c.requestMark, c.designHash);
           systemic(c, a.who, a.job_id, j.reviewText);
@@ -606,12 +632,13 @@ class Team {
         if (!['ПРИНЯТО', 'НЕ ПРИНЯТО', 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ'].includes(a.decision))
           throw Error('Неизвестный вердикт.');
         if (a.who === 'user') {
-          if (a.decision !== 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ' || !participants.includes(a.replaces) || !a.quote?.trim())
+          if (a.decision !== 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ' || ![...require('./members').seatIds, 'claude'].includes(a.replaces) || !a.quote?.trim())
             throw Error('Решение пользователя требует точной цитаты и одного заменяемого участника.');
         } else {
-          if (![...participants, 'grok'].includes(a.who) || a.decision === 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ')
+          if (!participants.includes(a.who) || a.decision === 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ')
             throw Error('Неверный участник или вид решения.');
           if (a.who !== 'claude') {
+            if (!require('./members').seatIds.includes(a.who)) throw Error('Участник не голосует в кандидате А.');
             const j = stores.review(a.who, a.job_id, a.base, a.candidate, a.decision, c.requestMark);
             if (c.fast && !(j.task || j.poruchenie || '').includes(c.cardHash)) throw Error('В поручении ревью нужен sha256 карточки малой правки.');
             systemic(c, a.who, a.job_id, j.reviewText);
@@ -634,11 +661,35 @@ class Team {
         if (a.who === 'user') return 'Решение пользователя записано в историю для ' + target + ': место им не закрывается — нужно ПРИНЯТО участника.';
         return 'Вердикт записан для ' + target + ': ' + a.decision;
       }
+      if (a.action === 'reconsider') {
+        // team-v31 К4: отказ участника на паузе отклоняется дирижёром с причиной и подтверждается
+        // ПРИНЯТО другой активной внешней семьи на ту же пару (reconsider_by_other); остальное проверяет team-seats.
+        const members = require('./members'), seats = require('./team-seats');
+        if (!a.who || !a.job_id || !a.review_job_id || !a.quote?.trim() || !a.base || !a.candidate)
+          throw Error('reconsider: нужны who (участник на паузе), job_id (его отказ), review_job_id (подтверждение), quote (причина), base и candidate.');
+        if (a.base !== c.base || a.candidate !== p.candidate) throw Error('reconsider: пара не совпадает с текущей парой изменения.');
+        if (!members.paused(a.who)) throw Error('reconsider: участник ' + a.who + ' не на паузе; его отказ снимает только его же ПРИНЯТО.');
+        const refusal = (c.verdicts || []).some(v => v.who === a.who && v.job_id === a.job_id && v.decision === 'НЕ ПРИНЯТО' && v.base === c.base && v.candidate === p.candidate)
+          || seats.storeRefusals(c, a.who, 'verdict', p.candidate).some(j => j.id === a.job_id);
+        if (!refusal) throw Error('reconsider: нет отказа ' + a.who + ' ' + a.job_id + ' на эту пару.');
+        if (!(c.verdicts || []).some(v => v.job_id === a.review_job_id && v.who !== a.who && v.decision === 'ПРИНЯТО' && v.base === c.base && v.candidate === p.candidate))
+          throw Error('reconsider: подтверждение ' + a.review_job_id + ' сначала запишите как verdict ПРИНЯТО другой семьи на эту пару.');
+        // Отказ из хранилища записывается ПЕРЕД подтверждением: team-seats требует, чтобы подтверждение шло после отказа (ревью Antigravity mvijc3e1).
+        if (!(c.verdicts || []).some(v => v.who === a.who && v.job_id === a.job_id)) {
+          const at = c.verdicts.findIndex(v => v.job_id === a.review_job_id);
+          c.verdicts.splice(at < 0 ? c.verdicts.length : at, 0, { who: a.who, base: c.base, candidate: p.candidate, decision: 'НЕ ПРИНЯТО', job_id: a.job_id, note: 'отказ из хранилища, записан при reconsider', at: new Date().toISOString() });
+        }
+        (c.decisions ||= []).push({ kind: 'reconsider_by_other', job_id: a.job_id, review_job_id: a.review_job_id, reason: a.quote.trim(), base: c.base, candidate: p.candidate, at: new Date().toISOString() });
+        const st = seats.seat(c, a.who, 'verdict', p.candidate);
+        if (!st.closed) { c.decisions.pop(); throw Error('reconsider не закрыл место ' + a.who + ': ' + (st.reason || 'подтверждение не прошло проверку (другая семья, позже отказа, номер отказа и причина в тексте поручения)') + '.'); }
+        save(this.changeFile(a.name), c);
+        return 'Отказ ' + a.who + ' ' + a.job_id + ' закрыт пересмотром другой семьёй (' + a.review_job_id + ').';
+      }
       if (a.action === 'merge') {
         const seats = require('./team-seats');
         if (c.fast) {
           require('./precheck').checkFast(folder, c.base, p.candidate);
-          for (const v of c.verdicts.filter(v => ['codex', 'antigravity'].includes(v.who) && v.base === c.base && v.candidate === p.candidate)) {
+          for (const v of c.verdicts.filter(v => require('./members').seatIds.includes(v.who) && v.base === c.base && v.candidate === p.candidate)) {
             const j = stores.review(v.who, v.job_id, c.base, p.candidate, v.decision, c.requestMark);
             if (/\[блокирующее\][^\r\n]*не малая/i.test(j.reviewText)) throw Error('не малая правка — нужен замысел; team_change start без fast.');
           }
@@ -670,10 +721,13 @@ class Team {
         if (!clean(folder) || !clean(this.root, true)) throw Error('Рабочая копия или корень репозитория грязные.');
         if (git(this.root, ['branch', '--show-current']).trim() !== 'main')
           throw Error('В корне должна быть выбрана main.');
-        // team-v18 К3: решение Claude и по каждому обязательному месту — ПРИНЯТО участника или Grok на месте выпавшего;
+        // team-v45: Claude может остановить слияние; по каждому обязательному месту требуется ПРИНЯТО;
         // «РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ» место не закрывает.
         const decision = c.verdicts.filter(v => v.who === 'claude' && v.base === c.base && v.candidate === p.candidate).at(-1);
-        if (decision?.decision !== 'ПРИНЯТО') throw Error('Нет действующего принятия: claude');
+        if (decision?.decision === 'НЕ ПРИНЯТО') throw Error('Claude: НЕ ПРИНЯТО на эту пару — слияние остановлено дирижёром');
+        const families = new Set(seats.SEATS.map(w => require('./members').familyOf(w)));
+        if (families.size < 2)
+          throw Error('Изменение ждёт: меньше двух уникальных активных внешних голосующих семей (' + (seats.SEATS.join(', ') || 'нет') + ').');
         for (const [phase, candidate] of [['verdict', p.candidate], ['design', c.candidate]]) {
           if (phase === 'design' && (!c.request || c.fast)) continue;
           for (const who of seats.SEATS) {
@@ -685,6 +739,18 @@ class Team {
               const late = seats.storeRefusal(c, who, phase, candidate);
               if (late) throw Error('Позднее «НЕ ПРИНЯТО» ' + who + ' (' + late.id + ') по этой редакции: слияние остановлено до разбора.');
             } else if (phase === 'verdict') stores.review(who, st.record.job_id, c.base, p.candidate, 'ПРИНЯТО', c.requestMark);
+          }
+          // team-v31: пауза не снимает отказ — незакрытый отказ приостановленного участника держит слияние.
+          const members = require('./members');
+          for (const m of members.all().filter(m => members.paused(m.id) && m.external && m.roles?.voter)) {
+            const st = seats.seat(c, m.id, phase, candidate);
+            // Незаписанный отказ из хранилища держит слияние и при закрытом месте (ревью Antigravity mvijc3e1);
+            // записанные отказы уже учтены в seat(), закрытые пересмотром — в c.decisions.
+            const b = seats.binding(c, phase, candidate), recorded = new Set([...(c.verdicts || []), ...(c.designVotes || [])].filter(v => v.who === m.id).map(v => v.job_id));
+            const reconsidered = new Set((c.decisions || []).filter(d => d.kind === 'reconsider_by_other').map(d => d.job_id));
+            const late = seats.storeRefusals(c, m.id, phase, candidate).find(j => !recorded.has(j.id) && !reconsidered.has(j.id));
+            if (st.closed && !late) continue;
+            if (st.blocked || late) throw Error('Отказ приостановленного участника ' + m.id + ' (' + (st.record?.job_id || late?.id) + ') не закрыт: нужен reconsider (отклонение с причиной + ПРИНЯТО другой семьи) или новая редакция.');
           }
         }
 
@@ -710,6 +776,8 @@ class Team {
     require('./access').guard('team', 'team_word', a);
     const words = require('./user-word'), fallback = require('./fallback');
     if (a.action === 'list') return words.listText();
+    if (a.action === 'stop_confirm') return require('./stop-confirm').run(a);
+    if (a.action === 'close') return require('./job-close').run(a);
     // team-v19: слово о Claude, возврат, остановка дирижёра и перепривязка — запасной режим (К1, К2).
     if (a.action !== 'record' || a.who_down === 'claude') return fallback.word(a, this.fallbackDeps || {});
     const guestWord = await fallback.helperWord(a);
@@ -895,7 +963,7 @@ class Team {
       if (!['calls', 'written', 'reread', 'window_h'].every(k => Number.isFinite(claudeUsage[k]) && claudeUsage[k] >= 0) || !claudeUsage.window_h || !claudeUsage.source?.trim() || !Number.isFinite(Date.parse(claudeUsage.taken_at))) throw Error('Некорректный замер сеанса Claude.');
       claudeQuota = claudeUsage;
     }
-    const rows = ['Хранилище состояния: ' + stateDir],
+    const rows = [require('./members').describe(true), 'Хранилище состояния: ' + stateDir],
       seenOwners = new Set();
     // team-v19 К12: гость показывает коммит своего релиза (расхождение с live\deployed.json — в баннере).
     if (require('./access').guest()) rows.push('Гость ' + require('./access').client() + ': релиз ' + path.basename(path.resolve(__dirname, '..')).slice(0, 8));
@@ -948,7 +1016,7 @@ class Team {
     await section('Расхождение версий', () => rows.push(...require('./release-drift').lines(this.root, stateDir)));
     if (warning) rows.unshift(warning);
     await section('Нагрузка', () => rows.push(require('./summary').loadLine(this.state, Object.fromEntries(require('./members').helpers.map(who => [who, stores.list(who, true, snapshot).jobs])))));
-    for (const who of ['codex', 'antigravity']) {
+    for (const who of require('./members').scanIds) {
       await section('Поручения ' + who, async () => {
         const { jobs, errors } = stores.list(who, true, snapshot),
           recent = jobs.filter((j) => !j.archived && Date.parse(j.startedAt) > Date.now() - 18000000);
@@ -990,11 +1058,14 @@ class Team {
             !j.stopUnconfirmed && !['running', 'queued', 'waiting_quota', 'needs_decision', 'cancelling', 'cancel_requested', 'delivery_unclear', 'applying', 'stop_unconfirmed'].includes(j.status)
           )
             continue;
+          const confirmed = require('./live-jobs').confirmed(j, who);
           const owner = await snapshot.ownerState(j.owner);
+          const status = j.archived ? 'lost' : require('./live-jobs').effectiveStatus(j, owner);
+          if (confirmed && status !== 'needs_decision' && !['running', 'queued', 'waiting_quota', 'cancelling', 'cancel_requested', 'delivery_unclear', 'migration_conflict', 'applying'].includes(status)) continue;
           rows.push(
             format(
               who === 'codex' ? 'Codex' : 'Antigravity',
-              { ...j, status: j.archived ? 'lost' : owner === 'dead' && ['running', 'cancelling', 'stop_unconfirmed'].includes(j.status) ? (who === 'codex' && j.write ? 'needs_decision' : 'lost') : j.status },
+              { ...j, stopUnconfirmed: confirmed ? null : j.stopUnconfirmed, status },
               'Владелец: ' +
                 { alive: 'отвечает', self: 'текущий процесс', dead: 'не отвечает', unknown: 'не подтверждён' }[owner] +
                 (j.nextAttemptAt ? '; следующая проба: ' + j.nextAttemptAt : ''),
@@ -1039,8 +1110,10 @@ class Team {
     });
     await section('Релизы', async () => {
       const marker = inside(this.root, 'live', 'deployed.json');
-      rows.push('Последнее развёртывание: ' + (fs.existsSync(marker) ? [read(marker).commit, read(marker).at, read(marker).method || 'способ не записан'].join(' · ') : 'не записано'));
-      const op = require('./deploy-ops').list(this.root, { reconcile: false }).at(-1);
+      try {
+        rows.push('Последнее развёртывание: ' + (fs.existsSync(marker) ? [read(marker).commit, read(marker).at, read(marker).method || 'способ не записан'].join(' · ') : 'не записано'));
+      } catch (e) { rows.push('Релизы: ошибка: ' + require('./errors').errorText(e)); }
+      const op = require('./deploy-status').visible(require('./deploy-ops').list(this.root, { reconcile: false }).at(-1), this.root);
       if (op) rows.push(['Установка ' + op.id + ': ' + op.status, op.reason || op.message, op.restart, op.oldCode && !(op.reason || op.message || '').includes(require('./deploy-ops').oldCodeLine) ? require('./deploy-ops').oldCodeLine : require('./deploy-ops').cleanupLine(op.cleanup)].filter(Boolean).join(' · '));
     });
     await section('Настройки', async () => {
@@ -1056,7 +1129,7 @@ class Team {
             'Файл настроек ' +
               config +
               ': ' +
-              require('./members').servers
+              require('./members').installedServers
                 .map((n) => n + ' → ' + (s.config.mcpServers?.[n]?.args?.join(' ') || 'не подключён'))
                 .join('; '),
           );

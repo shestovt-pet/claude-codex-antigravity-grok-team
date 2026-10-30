@@ -55,7 +55,7 @@ function connectionSources() {
   for (const file of [...new Set(files.flatMap(f => [f, f + '.prev']))]) {
     try {
       const text = fs.readFileSync(file, 'utf8');
-      const obj = /\.toml(?:\.prev)?$/i.test(file) ? require('./toml-records').document(text).root : JSON.parse(text);
+      const obj = /\.ya?ml(?:\.prev)?$/i.test(file) ? require('./dsh-config').connections(text) : /\.toml(?:\.prev)?$/i.test(file) ? require('./toml-records').document(text).root : JSON.parse(text);
       const walk = value => {
         if (!value || typeof value !== 'object') return;
         for (const [key, v] of Object.entries(value)) {

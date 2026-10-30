@@ -146,7 +146,7 @@ test('КР1 Н7: ненастроенный Grok не замораживает �
 });
 test('15: источник квот недоступен — данные не предоставлены без выдуманной семьи', async () => {
   const aq = require('../common/agy-quota'), old = aq.agySnapshot; aq.agySnapshot = async () => ({ text: 'нет источника' });
-  try { const line = await require('../common/quota-line').quotaLine({ state, codex: { source: 'данные не предоставлены' } }); assert.match(line, /данные не предоставлены/); assert(!line.includes('семья')); }
+  try { const line = await require('../common/quota-line').quotaLine({ state, codex: { source: 'данные не предоставлены' } }); assert.match(line, /данные не предоставлены/); assert(!/семья /.test(line)); }
   finally { aq.agySnapshot = old; }
 });
 (async () => {

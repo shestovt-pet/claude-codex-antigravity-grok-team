@@ -6,7 +6,7 @@ function need(ok, why) { if (!ok) throw Object.assign(Error(why), { workflowCode
 function author(s) {
   const a = s.author;
   const authors = Array.isArray(a) ? a.flatMap(p => p.authors || [p]) : a?.authors || [a];
-  need(authors.length && authors.every(a => a && ['anthropic', 'openai', 'google', 'xai'].includes(a.family) && a.model?.trim()), 'Нужна семья и модель автора этапа.');
+  need(authors.length && authors.every(a => a && require('./members').families.includes(a.family) && a.model?.trim()), 'Нужна семья и модель автора этапа.');
   need(!s.level || ['обычный', 'высокий'].includes(s.level), 'Неизвестный уровень этапа консилиума.');
   return [...new Set(authors.map(a => a.family))];
 }
@@ -21,7 +21,7 @@ function ordered(rows, ready = false) {
   });
 }
 async function check({ ctx, w, s, snapshot, adapter, usedJobs, files }) {
-  const api = cw(), families = author(s), family = families.includes('anthropic') ? 'anthropic' : families[0], candidates = Object.values(seats).filter(f => !families.includes(f));
+  const api = cw(), families = author(s), family = families.includes('anthropic') ? 'anthropic' : families[0], candidates = [...new Set(Object.values(seats))].filter(f => !families.includes(f));
   const observed = [], votes = [], opinions = [];
   for (const who of api.QUORUM) for (const card of await adapter.list(who)) {
     const text = api.taskText(card);

@@ -3,16 +3,11 @@ const fs = require('fs'), path = require('path'), os = require('os');
 const { samePath } = require('./paths');
 const begin = '# most:begin (правит team_change deploy)', end = '# most:end';
 function paths() {
-  const home = process.env.USERPROFILE || os.homedir();
-  return [
-    { file: process.env.MOST_CODEX_CONFIG || path.join(home, '.codex/config.toml'), kind: 'codex' },
-    { file: process.env.MOST_AGY_MCP_CONFIG || path.join(home, '.gemini/config/mcp_config.json'), kind: 'agy' },
-    { file: process.env.MOST_AGY_CONFIG || (process.env.MOST_AGY_MCP_CONFIG ? path.join(path.dirname(process.env.MOST_AGY_MCP_CONFIG), 'config.json') : path.join(home, '.gemini/config/config.json')), kind: 'permissions' },
-  ];
+  return require('./members').installedClients.flatMap(c => [{ file: c.file, kind: c.kind, client: c.id }, ...(c.kind === 'agy' ? [{ file: process.env.MOST_AGY_CONFIG || path.join(path.dirname(c.file), 'config.json'), kind: 'permissions', client: c.id }] : [])]);
 }
 // Серверы связки в приложениях (team-v19, К2): Codex получает и сервер codex, Antigravity — сервер antigravity (гостями;
 // пользоваться ими может только дирижёр запасного режима).
-const CODEX = require('./members').servers, AGY = require('./members').servers;
+const CODEX = require('./members').installedServers, AGY = require('./members').installedServers;
 function block(text) {
   const parsed = require('./toml-records').document(text), marks = [];
   let depth = 0;
@@ -43,19 +38,19 @@ function literal(value) {
   if (/[\r\n']/.test(value)) throw Error('Путь нельзя записать литеральной строкой TOML.');
   return "'" + value + "'";
 }
-function toml(text, release, root, state, node, file = 'конфиге Codex') {
+function toml(text, release, root, state, node, file = 'конфиге Codex', client = require('./members').all().filter(m => m.state !== 'removed').find(m => m.adapter === 'codex-cli')?.id) {
   state = path.join(root, 'state');
   const b = block(text), eol = text.includes('\r\n') ? '\r\n' : '\n';
   const current = b.parsed.root.mcp_servers || {};
   require('./ownership').assertOwn(b.exists ? current : {}, CODEX, root, file);
   const lines = [begin];
   // env_vars: гость поручения-сеанса получает MOST_JOB_ID от codex exec, гость чата — нет (Р-ж).
-  for (const n of CODEX) lines.push(`[mcp_servers.${n}]`, 'command = ' + literal(node), 'args = [' + literal(path.join(release, 'servers', n, 'index.js')) + ']', 'startup_timeout_sec = 30', "default_tools_approval_mode = 'approve'", 'env_vars = ["MOST_JOB_ID"]', `[mcp_servers.${n}.env]`, 'MOST_REPO_ROOT = ' + literal(root), 'MOST_STATE_DIR = ' + literal(state), "MOST_CLIENT = 'codex'");
+  for (const n of CODEX) lines.push(`[mcp_servers.${n}]`, 'command = ' + literal(node), 'args = [' + literal(path.join(release, 'servers', n, 'index.js')) + ']', 'startup_timeout_sec = 30', "default_tools_approval_mode = 'approve'", 'env_vars = ["MOST_JOB_ID"]', `[mcp_servers.${n}.env]`, 'MOST_REPO_ROOT = ' + literal(root), 'MOST_STATE_DIR = ' + literal(state), 'MOST_CLIENT = ' + literal(client));
   lines.push(end);
   return text.slice(0, b.from) + (!b.exists && text && !text.endsWith('\n') ? eol : '') + lines.join(eol) + eol + text.slice(b.to);
 }
-const grants = ['team/team_status', 'team/team_rules', 'team/team_work', 'team/team_word', 'codex/codex_status', 'codex/codex_result', 'codex/codex_send',
-  'antigravity/antigravity_send', 'antigravity/antigravity_status', 'antigravity/antigravity_result', 'antigravity/antigravity_apply', 'antigravity/antigravity_cancel'].map(n => 'mcp(' + n + ')');
+const grantsFor = (client = require('./members').all().filter(m => m.state !== 'removed').find(m => m.adapter === 'agy-cli')?.id) => [...require('./members').installedServers].flatMap(n => require('./access').guestTools(n, client).map(t => 'mcp(' + n + '/' + t + ')'));
+const grants = require('./members').dynamic(() => grantsFor(require('./members').all().filter(m => m.state !== 'removed').find(m => m.adapter === 'agy-cli')?.id), true);
 // К11: разрешение Antigravity читать корневой AGENTS.md старого релиза переводится на AGENTS.md текущего релиза.
 function relinkAgents(allow, root, release) {
   const current = 'read_file(' + path.join(release, 'AGENTS.md') + ')';
@@ -65,19 +60,19 @@ function relinkAgents(allow, root, release) {
   });
 }
 
-function jsonConfig(config, kind, release, root, state, node, file = 'конфиге Antigravity', foreignGrok = false) {
+function jsonConfig(config, kind, release, root, state, node, file = 'конфиге Antigravity', foreignGrok = false, client = require('./members').all().filter(m => m.state !== 'removed').find(m => m.adapter === 'agy-cli')?.id) {
   state = path.join(root, 'state');
   const out = structuredClone(config);
   if (kind === 'permissions') {
     out.userSettings ||= {}; out.userSettings.globalPermissionGrants ||= {};
     const old = out.userSettings.globalPermissionGrants.allow || [];
     if (!Array.isArray(old)) throw Error('Некорректный список разрешений Antigravity.');
-    out.userSettings.globalPermissionGrants.allow = [...new Set([...relinkAgents(old.filter(g => foreignGrok || !/^mcp\(grok\//.test(g)), root, release), ...grants])];
+    out.userSettings.globalPermissionGrants.allow = [...new Set([...relinkAgents(old.filter(g => foreignGrok || !/^mcp\(grok\//.test(g)), root, release), ...grantsFor(client)])];
   } else {
     out.mcpServers ||= {};
     if (out.mcpServers.grok && require('./ownership').own(out.mcpServers.grok, 'grok', root)) delete out.mcpServers.grok;
     require('./ownership').assertOwn(out.mcpServers, AGY, root, file);
-    for (const n of AGY) out.mcpServers[n] = { command: node, args: [path.join(release, 'servers', n, 'index.js')], env: { MOST_REPO_ROOT: root, MOST_STATE_DIR: state, MOST_CLIENT: 'antigravity' } };
+    for (const n of AGY) out.mcpServers[n] = { command: node, args: [path.join(release, 'servers', n, 'index.js')], env: { MOST_REPO_ROOT: root, MOST_STATE_DIR: state, MOST_CLIENT: client } };
   }
   return out;
 }
@@ -87,15 +82,19 @@ function plans(snapshots, release, root, state, node) {
   const agySameRelease = !!agy && AGY.every(n => agy.config.mcpServers?.[n]?.args?.[0] && samePath(agy.config.mcpServers?.[n]?.args?.[0], path.join(release, 'servers', n, 'index.js')));
   return snapshots.flatMap(s => {
     let next, same, sameRelease = false;
+    if (s.kind === 'dsh') {
+      next = require('./dsh-config').render(s.text, release, root, node, s.client, s.file);
+      return next === s.text ? [] : [{ ...s, next, backup: true, backupBefore: true }];
+    }
     if (s.kind === 'codex') {
-      next = toml(s.text, release, root, state, node, s.file);
+      next = toml(s.text, release, root, state, node, s.file, s.client);
       const old = block(s.text).parsed.root.mcp_servers || {}, wanted = block(next).parsed.root.mcp_servers;
       same = equal(Object.fromEntries([...CODEX, 'grok'].map(n => [n, old[n]])), Object.fromEntries([...CODEX, 'grok'].map(n => [n, wanted[n]])));
       sameRelease = CODEX.every(n => old[n]?.args?.[0] && samePath(old[n]?.args?.[0], path.join(release, 'servers', n, 'index.js')));
     } else {
-      const wanted = jsonConfig(s.config, s.kind, release, root, state, node, s.file, foreignGrok);
+      const wanted = jsonConfig(s.config, s.kind, release, root, state, node, s.file, foreignGrok, s.client);
       same = s.kind === 'permissions'
-        ? equal(grants.filter(g => s.config.userSettings?.globalPermissionGrants?.allow?.includes(g)), grants) &&
+        ? equal(grantsFor(s.client).filter(g => s.config.userSettings?.globalPermissionGrants?.allow?.includes(g)), grantsFor(s.client)) &&
           equal(s.config.userSettings?.globalPermissionGrants?.allow || [], wanted.userSettings.globalPermissionGrants.allow.filter(x => (s.config.userSettings?.globalPermissionGrants?.allow || []).includes(x)))
         : equal(entries(s.config, [...AGY, 'grok']), entries(wanted, [...AGY, 'grok']));
       sameRelease = s.kind === 'agy' && AGY.every(n => s.config.mcpServers?.[n]?.args?.[0] && samePath(s.config.mcpServers?.[n]?.args?.[0], path.join(release, 'servers', n, 'index.js')));
@@ -106,20 +105,23 @@ function plans(snapshots, release, root, state, node) {
   });
 }
 function status() {
-  return paths().filter(p => p.kind !== 'permissions').map(({file, kind}) => {
+  return paths().filter(p => p.kind !== 'permissions').map(({file, kind, client}) => {
+    const title = require('./members').get(client)?.title || client;
     if (!fs.existsSync(file)) return file + ': не подключён';
     try {
       const s = require('./deploy').snapshot(file);
+      if (kind === 'dsh') return title + ': ' + Object.entries(require('./dsh-config').connections(s.text).mcpServers).map(([n,c]) => n + ' → ' + c.args[0]).join('; ');
       if (kind === 'codex') {
         const managed = block(s.text).parsed.root.mcp_servers || {};
         const args = CODEX.map(n => managed[n]?.args?.[0]).filter(Boolean);
-        return 'Codex: ' + (args.join('; ') || 'не подключён');
+        return title + ': ' + (args.join('; ') || 'не подключён');
       }
-      return 'Antigravity: ' + AGY.map(n => n + ' → ' + (s.config.mcpServers?.[n]?.args?.[0] || 'не подключён')).join('; ');
+      return title + ': ' + AGY.map(n => n + ' → ' + (s.config.mcpServers?.[n]?.args?.[0] || 'не подключён')).join('; ');
     } catch { return file + ': ошибка чтения подключений'; }
   }).join('\n');
 }
 function restore(s, prev, kind) {
+  if (kind === 'dsh') return require('./dsh-config').restore(s.text, prev.text);
   if (kind === 'codex') {
     const b = block(s.text), old = block(prev.text);
     return s.text.slice(0, b.from) + prev.text.slice(old.from, old.to) + s.text.slice(b.to);
@@ -148,12 +150,11 @@ function staleGuests({ root, release }, deps = {}) {
     const names = [];
     for (let p = byPid.get(r.ppid), n = 0; p && n < 64; p = byPid.get(p.ppid), n++) names.push(String(p.name || '').toLowerCase());
     if (names.some(n => /^claude/.test(n))) continue;
-    if (names.some(n => /antigravity|language_server/.test(n))) apps.add('Antigravity');
-    else if (names.some(n => /codex|chatgpt/.test(n))) apps.add('Codex');
+    for (const c of require('./members').installedClients) if (names.some(n => ({ 'codex-cli': /codex|chatgpt/, 'agy-cli': /antigravity|language_server/, 'dsh-headless': /deepseek.harness|dsh/ })[require('./members').adapterOf(c.id)]?.test(n))) apps.add(c.title);
   }
-  const list = ['Codex', 'Antigravity'].filter(a => apps.has(a));
+  const list = require('./members').installedClients.map(c => c.title).filter(a => apps.has(a));
   if (!list.length) return '';
   return list.join(' и ') + (list.length > 1 ? ' работают' : ' работает') + ' со старыми серверами связки; слово о Claude заработает в ' +
     (list.length > 1 ? 'них' : 'нём') + ' после перезапуска приложения.';
 }
-module.exports = { paths, plans, toml, block, status, grants, restore, equal, entries, jsonConfig, relinkAgents, staleGuests, CODEX, AGY };
+module.exports = { paths, plans, toml, block, status, grants, grantsFor, restore, equal, entries, jsonConfig, relinkAgents, staleGuests, CODEX, AGY };

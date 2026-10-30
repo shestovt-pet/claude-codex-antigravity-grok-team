@@ -128,10 +128,14 @@ function designVoteWarnings(c) {
         ' — голоса по прежней редакции не считаются, отправьте новую обоим');
     } catch (e) { return ['файл замысла не прочитан (' + e.message.split('\n')[0] + ') — голоса по замыслу не проверены']; }
   }
-  const short = hash.slice(0, 8), names = { codex: 'Codex', antigravity: 'Antigravity' };
+  const short = hash.slice(0, 8), names = require('./members').names;
   // team-v18 К7 (а): места — той же функцией, что в commit и merge (common/team-seats.js).
   const seats = require('./team-seats'), current = { ...c, designHash: hash };
-  for (const who of ['codex', 'antigravity']) {
+  // Места — ровно обязательные голосующие: удалённое место не исчезает из проверки.
+  let required;
+  try { required = require('./members').requiredVoters().map(m => m.id); }
+  catch (e) { out.push(e.message); return out; }
+  for (const who of required) {
     const st = seats.seat(current, who, 'design');
     if (st.closed) continue;
     if (st.blocked) out.push(names[who] + ': по замыслу ' + short + ' — НЕ ПРИНЯТО; commit откажет');

@@ -1,4 +1,5 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
 const fs = require('fs'), path = require('path'), assert = require('assert'), crypto = require('crypto');
 const RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v14-'));
 const root = path.join(RUN, 'repo'), project = path.join(RUN, 'project');
@@ -195,7 +196,7 @@ test('12в: старая замена Grok не закрывает место; �
   const f = fixture(); job(f, 'antigravity');
   job(f, 'grok', 0, { replaces: { who: 'codex', reason: 'авария' }, replacementEvidence: { note: 'авария: f1, f2' } });
   await assert.rejects(accept(f), /openai/); job(f); await accept(f); const old = structuredClone(f.s); job(f, 'codex', 1);
-  await assert.rejects(gate.evaluate(f.w, f.s, old), /НЕ ПРИНЯТО codex/);
+  assert.match(await gate.evaluate(f.w, f.s, old), /НЕ ПРИНЯТО codex/); assert.equal(f.s.state, 'идёт');
   await assert.rejects(accept(f), /НЕ ПРИНЯТО/); job(f); await accept(f); assert.equal(f.s.state, 'принят');
 });
 test('12з: criterion_met после правки material ждёт новые вердикты всех семей', async () => {
@@ -265,7 +266,10 @@ test('закрытая принятая работа открывается вн
   let w = JSON.parse(fs.readFileSync(team.workFile(n), 'utf8')), s = w.stages[0]; const ids = [job({ w, s }), job({ w, s }, 'antigravity')];
   await team.work({ action: 'update', owner: 'test', name: n, expected_revision: 1, stages: [{ ...s, state: 'принят', reviews: ids, evidence: 'проверено' }] });
   await team.work({ action: 'close', owner: 'test', name: n, expected_revision: 2 }); write(material, 'second');
-  await team.work({ action: 'get', owner: 'test', name: n }); w = JSON.parse(fs.readFileSync(team.workFile(n), 'utf8'));
+  const shown = await team.work({ action: 'get', owner: 'test', name: n });
+  assert.match(shown, /Принято 0 %/); assert.equal(JSON.parse(fs.readFileSync(team.workFile(n))).closed, true);
+  await team.work({ action: 'update', owner: 'test', name: n, expected_revision: 3, next_step: 'повторная приёмка' });
+  w = JSON.parse(fs.readFileSync(team.workFile(n), 'utf8'));
   assert.equal(w.closed, false); assert.equal(w.stages[0].state, 'идёт'); assert.equal(require('../common/team').percent(w), 0);
 });
 test('12д до v14: source_jobs без role — текст, reviews без role требует вердикт', async () => {

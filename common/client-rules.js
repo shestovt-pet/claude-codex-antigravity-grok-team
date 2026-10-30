@@ -1,10 +1,10 @@
 'use strict';
 const fs = require('fs'), path = require('path'), os = require('os');
 const begin = '<!-- most:begin -->', end = '<!-- most:end -->';
-const sectionFiles = { codex: 'codex-section.md', antigravity: 'antigravity-section.md' };
+const sectionFiles = require('./members').dynamic(() => Object.fromEntries(require('./members').all().filter(m => m.state !== 'removed').map(m => [m.id, require('./member-clients').formats[m.adapter]?.section || 'member-section.md'])));
 function body(kind) {
   if (!Object.hasOwn(sectionFiles, kind)) throw Error('Неизвестный помощник.');
-  return require('./paths').withRoot(fs.readFileSync(path.join(__dirname, '../rules/helpers', sectionFiles[kind]), 'utf8').replace(/\r\n/g, '\n').trimEnd() + '\n', process.env.MOST_REPO_ROOT || require('./paths').repoRoot);
+  return require('./members').rules() + '\n' + require('./paths').withRoot(fs.readFileSync(path.join(__dirname, '../rules/helpers', sectionFiles[kind]), 'utf8').replace(/\r\n/g, '\n').trimEnd() + '\n', process.env.MOST_REPO_ROOT || require('./paths').repoRoot);
 }
 // Явная роль имеет приоритет; обычные пути сверяются с настройками, а не с порядком списка.
 function target(value) {
@@ -12,10 +12,7 @@ function target(value) {
   const role = typeof value === 'object' ? value.role : null;
   if (role) { if (!Object.hasOwn(sectionFiles, role)) throw Error('Неизвестный помощник.'); return { file, role }; }
   const home = process.env.USERPROFILE || os.homedir();
-  const known = {
-    codex: process.env.MOST_CODEX_RULES || path.join(home, '.codex/AGENTS.md'),
-    antigravity: process.env.MOST_AGY_RULES || path.join(home, '.gemini/config/AGENTS.md'),
-  };
+  const known = Object.fromEntries(require('./members').installedClients.filter(c => c.rulesFile).map(c => [c.id, c.rulesFile]));
   const matches = Object.entries(known).filter(([, p]) => require('./paths').samePath(p, file));
   if (matches.length !== 1) throw Error('Роль файла правил не определена однозначно: ' + file + '. Укажите role.');
   return { file, role: matches[0][0] };
@@ -26,7 +23,7 @@ function section(text) {
     if (starts.length !== 1 || ends.length !== 1 || starts[0].index >= ends[0].index) throw Error('Структура меток правил не распознана.');
     return { from: starts[0].index, to: ends[0].index + end.length };
   }
-  const headings = [...text.matchAll(/^(#{1,6}) (?:Связка (?:трёх|четырёх) ИИ[^\r\n]*|Постоянный контекст: связка Claude, Codex и Antigravity)[ \t]*\r?$/gm)];
+  const headings = [...text.matchAll(/^(#{1,6}) (?:Связка (?:(?:трёх|четырёх) )?ИИ[^\r\n]*|Постоянный контекст: связка Claude, Codex и Antigravity)[ \t]*\r?$/gm)];
   if (headings.length !== 1) throw Error('Не найден единственный прежний раздел правил связки.');
   const h = headings[0], tail = text.slice(h.index + h[0].length);
   const next = new RegExp('^(?:#{1,' + h[1].length + '} |[ \\t]*</)', 'm').exec(tail);
@@ -59,14 +56,20 @@ function replace(text, kind = 'codex') {
 }
 function paths() {
   const home = process.env.USERPROFILE || os.homedir();
-  return [process.env.MOST_CODEX_RULES || path.join(home, '.codex/AGENTS.md'),
-    process.env.MOST_AGY_RULES || path.join(home, '.gemini/config/AGENTS.md')];
+  return require('./members').installedClients.map(c => c.rulesFile).filter(Boolean);
 }
 async function configure({ files = paths(), hook, rollback = false } = {}) {
   const d = require('./deploy'), result = [];
   for (const value of files) {
     const file = typeof value === 'string' ? value : value.file;
     try {
+      if (!rollback && !fs.existsSync(file)) {
+        const plan = plans([value]);
+        if (!plan.length) { result.push(file + ': пропущено — папки помощника нет'); continue; }
+        await d.switchConfigs(plan, hook);
+        result.push(file + ': создан с разделом связки');
+        continue;
+      }
       const s = d.snapshot(file);
       if (!fs.readFileSync(file).equals(Buffer.from(s.text))) throw Error('Кодировка правил не UTF-8; отказ без записи.');
       let next;
@@ -83,9 +86,16 @@ async function configure({ files = paths(), hook, rollback = false } = {}) {
   return result;
 }
 function plans(files = paths()) {
-  return files.filter(value => fs.existsSync(typeof value === 'string' ? value : value.file)).map(value => {
+  // team-v39: отсутствующий файл правил создаётся, только если приложение помощника установлено — существует его файл
+  // настроек (у DSH — ~/.dsh/profiles/desktop/cordis.patch.yml) или файл передан явно с role; иначе пропуск, как до team-v37.
+  const installed = file => require('./members').installedClients.some(c => c.rulesFile && require('./paths').samePath(c.rulesFile, file) && c.file && fs.existsSync(c.file));
+  return files.filter(value => {
+    const file = typeof value === 'string' ? value : value.file;
+    return fs.existsSync(file) || (fs.existsSync(path.dirname(file)) && (typeof value === 'object' && !!value.role || installed(file)));
+  }).map(value => {
     const { file, role } = target(value);
-    const s = require('./deploy').snapshot(file);
+    const s = require('./deploy').snapshot(file, true);
+    if (s.exists === false) return { ...s, next: begin + '\n' + body(role) + end + '\n', backup: false };
     if (!fs.readFileSync(file).equals(Buffer.from(s.text))) throw Error('Кодировка правил не UTF-8: ' + file);
     return { ...s, next: replace(s.text, role), backup: true };
   });

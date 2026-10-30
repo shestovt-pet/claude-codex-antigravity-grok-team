@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 // team-v13: хвосты team-v12. Подпись Grok (Р1) проверяется в tests/trio-v4.js, отпечаток (Р2) — в tests/team-v12.js;
 // здесь — порядок публикации (Р3–Р4), уроки и версия (Р5).
 const fs = require('fs'), path = require('path'), assert = require('assert');
@@ -29,9 +33,9 @@ test('Р3–Р5: порядок публикации, уроки, версия',
   const i4 = p.indexOf("$env:MOST_AFTER_DEPLOY='off'"), iClear = p.indexOf('Get-ChildItem Env:MOST_* | ForEach-Object'), iCheck = p.indexOf('проверка `Get-ChildItem Env:MOST_*`');
   assert(i4 >= 0 && i4 < iClear && iClear < iCheck, 'порядок: п. 4 ставит, п. 5 сначала убирает всё, потом проверяет');
   // Codex c4b6bc98: все переопределения путей названы (их убирает общая очистка).
-  for (const v of ['MOST_CLAUDE_CONFIGS', 'MOST_CODEX_CONFIG', 'MOST_AGY_MCP_CONFIG', 'MOST_AGY_CONFIG', 'MOST_CODEX_RULES', 'MOST_AGY_RULES', 'MOST_REPO_ROOT', 'MOST_STATE_DIR'])
+  for (const v of ['MOST_CLAUDE_CONFIGS', 'MOST_CODEX_CONFIG', 'MOST_AGY_MCP_CONFIG', 'MOST_AGY_CONFIG', 'MOST_CODEX_RULES', 'MOST_AGY_RULES', 'MOST_AGY_CLI_SETTINGS', 'MOST_DSH_CONFIG', 'MOST_DSH_RULES', 'MOST_REPO_ROOT', 'MOST_STATE_DIR'])
     assert(p.includes('Env:' + v), v);
-  for (const [file, re] of [['common/deploy.js', /MOST_CLAUDE_CONFIGS/], ['common/client-configs.js', /MOST_CODEX_CONFIG[\s\S]*MOST_AGY_MCP_CONFIG[\s\S]*MOST_AGY_CONFIG/], ['common/client-rules.js', /MOST_CODEX_RULES[\s\S]*MOST_AGY_RULES/]])
+  for (const [file, re] of [['common/deploy.js', /MOST_CLAUDE_CONFIGS/], ['common/client-configs.js', /MOST_AGY_CONFIG/], ['common/member-clients.js', /MOST_CODEX_CONFIG[\s\S]*MOST_CODEX_RULES[\s\S]*MOST_AGY_MCP_CONFIG[\s\S]*MOST_AGY_RULES[\s\S]*MOST_DSH_CONFIG[\s\S]*MOST_DSH_RULES/], ['common/agy-mcp-permissions.js', /MOST_AGY_CLI_SETTINGS/]])
     assert.match(read(file), re, 'список переменных в publish.md совпадает с кодом: ' + file);
   const l = read('lessons.md');
   assert.match(l, /## 58\. Верный ответ Grok отвергнут из-за регистра слова/);

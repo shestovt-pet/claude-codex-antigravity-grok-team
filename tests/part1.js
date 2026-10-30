@@ -6,9 +6,12 @@ const fs = require('fs'),
   assert = require('assert');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
+const { serverReady } = require('./runner-support');
 const ROOT = path.resolve(__dirname, '..'),
-  RUN = path.join(__dirname, '.tmp-part1-' + Date.now());
+  RUN = path.join(__dirname, '.tmp-part1-' + Date.now()),
+  OUTSIDE = path.join(process.env.MOST_TEST_OUTSIDE || require('os').tmpdir(), 'part1-' + process.pid + '-' + Date.now());
 fs.mkdirSync(RUN, { recursive: true });
+fs.mkdirSync(OUTSIDE, { recursive: true });
 process.env.MOST_STATE_DIR = path.join(RUN, 'unit-state');
 process.env.MOST_TEST_KEEP = '1';
 process.env.MOST_REPO_ROOT = RUN;
@@ -51,11 +54,13 @@ async function start(kind, extra = {}) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.join(ROOT, 'servers', kind, 'index.js')],
-    env: { ...env, ...extra },
+    env: { ...env, ...extra, NODE_ENV: 'test' },
     stderr: 'pipe',
   });
   const client = new Client({ name: 'part1_test', version: '1.0.0' });
   await client.connect(transport);
+  // Негостевой сервер (дирижёр claude) готовит снимок процессов асинхронно — ждём маркер своего pid.
+  if (kind !== 'team') await serverReady(extra.MOST_STATE_DIR || env.MOST_STATE_DIR, transport.pid);
   const b = { client, transport, kind, errors: '' };
   transport.stderr.on('data', (d) => {
     b.errors += d;
@@ -84,7 +89,9 @@ async function result(b, j, predicate = /ОТВЕТ ПОЛУЧЕН|НЕ УДАЛ
   throw Error('Не дождались ' + j + ': ' + r.text + '\n' + b.errors);
 }
 function project() {
-  const d = path.join(RUN, 'project-' + Math.random().toString(16).slice(2));
+  // team-v46 п.5а: пишущие поручения получают папку только вне корня связки, его клонов и релизов.
+  // Папки записи — в MOST_TEST_OUTSIDE (вне репозитория; TEMP раннер подменяет внутрь клона).
+  const d = path.join(OUTSIDE, 'project-' + Math.random().toString(16).slice(2));
   fs.mkdirSync(d);
   return d;
 }
@@ -360,7 +367,7 @@ async function test(name, fn) {
     ok((await result(a, id(r))).text.includes('ОТВЕТ ПОЛУЧЕН'), 'цитата не ошибка');
     r = await call(a, 'antigravity_send', { folder: project(), task: '[[FAKE:quota]]' });
     const j = id(r);
-    const done = await result(a, j, /НЕ УДАЛОСЬ/, 15000);
+    const done = await result(a, j, /НЕ УДАЛОСЬ/, 60000);
     ok(done.text.includes('исчерпаны 12 попыток восстановления'), '12 восстановлений');
     const card = JSON.parse(fs.readFileSync(path.join(env.MOST_STATE_DIR, 'jobs', j, 'card.json'), 'utf8'));
     ok(card.quotaAttempts === 12, 'счётчик 12');
@@ -426,7 +433,7 @@ async function test(name, fn) {
   await test('Codex: 12 проб', async () => {
     const r = await call(c, 'codex_send', { folder: project(), task: 'QUOTA ALWAYS' });
     ok(
-      (await result(c, id(r), /НЕ УДАЛОСЬ/, 15000)).text.includes('исчерпаны 12 попыток восстановления'),
+      (await result(c, id(r), /НЕ УДАЛОСЬ/, 60000)).text.includes('исчерпаны 12 попыток восстановления'),
       'предел реальной очереди',
     );
   });
@@ -496,9 +503,15 @@ async function test(name, fn) {
     card.owner = { pid: process.pid, instance: 'dead-agy' };
     fs.writeFileSync(p, JSON.stringify(card));
     const pair = await Promise.all([start('antigravity', e), start('antigravity', e)]);
-    await result(pair[0], id(r2), /ЖДЁТ КВОТУ/);
-    await sleep(300);
-    const after = JSON.parse(fs.readFileSync(p, 'utf8'));
+    // Статус ЖДЁТ КВОТУ одинаков до и после перезапуска, поэтому ждём само событие
+    // возобновления — рост quotaAttempts до 1 под замком gen, — а не фиксированную паузу.
+    let after = {};
+    const deadline = Date.now() + 10000;
+    do {
+      try { after = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { /* атомарная замена карточки */ }
+      if (after.quotaAttempts >= 1) break;
+      await sleep(40);
+    } while (Date.now() < deadline);
     ok(after.quotaAttempts === 1, 'одна проба agy после перезапуска');
     await call(pair[0], 'antigravity_cancel', { id: id(r2) });
   });

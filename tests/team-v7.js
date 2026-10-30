@@ -1,5 +1,6 @@
 'use strict';
 const fs = require('fs'), path = require('path'), assert = require('assert'), crypto = require('crypto');
+const { serverReady } = require('./runner-support');
 const ROOT = path.resolve(__dirname, '..'), RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v7-'));
 Object.assign(process.env, { MOST_REPO_ROOT: RUN, MOST_STATE_DIR: path.join(RUN, 'state'), MOST_TEST_KEEP: '1', MOST_NOTIFY: 'off', MOST_CLIENT: 'claude', MOST_CLAUDE_CONFIGS: '[]',
   MOST_CODEX_CONFIG: path.join(RUN, 'missing.toml'), MOST_AGY_MCP_CONFIG: path.join(RUN, 'missing.json'), MOST_AGY_CONFIG: path.join(RUN, 'missing-permissions.json'), CODEX_PATH: path.join(__dirname, 'fake-codex.js') });
@@ -16,7 +17,7 @@ test('Р1/Р4: правила распределения и проверки т�
     for (const phrase of phrases) assert(text.includes(phrase), file + ': отсутствует положение «' + phrase + '»');
   };
   contains('rules/roles.md', [
-    'Оба помощника участвуют в обсуждении замысла и итоговом ревью',
+    'Помощники из team_status участвуют в обсуждении замысла и итоговом ревью',
     'Codex — критик логики и проверяемости замысла и итога; код и автотесты. Рутины не получает.',
     'Antigravity — автор литературного текста',
     'Колонка таблицы называется «вариант по подсчёту»',
@@ -112,7 +113,7 @@ test('Р7: общий транспорт — одновременно, обра�
     await new Promise(resolve => setTimeout(resolve, message.id === 1 ? 30 : 1));
     await transport.send({ id: message.id, result: { isError: message.id === 2, content: [{ type: 'text', text: require('../common/format').format('Команда', {}, 'Ответ') }] } });
   };
-  await Promise.all([transport.onmessage({ id: 1, method: 'tools/call', params: { arguments: { owner: 'alice' } } }), transport.onmessage({ id: 2, method: 'tools/call', params: { arguments: { owner: 'bob' } } })]);
+  await Promise.all([transport.onmessage({ id: 1, method: 'tools/call', params: { name: 'team_status', arguments: { owner: 'alice' } } }), transport.onmessage({ id: 2, method: 'tools/call', params: { name: 'team_status', arguments: { owner: 'bob' } } })]); // team-v44 П3: напоминание только в team_status/team_work
   assert.equal(sent[0].id, 2);
   for (const m of sent) { const text = m.result.content[0].text; assert.equal((text.match(/⚠/g) || []).length, 1); assert(text.includes(m.id === 1 ? 'alice' : 'bob')); assert(!text.includes(m.id === 1 ? 'bob' : 'alice')); }
   await transport.onmessage({ id: 3, method: 'tools/call' }); assert(!sent.at(-1).result.content[0].text.includes('⚠'));
@@ -147,8 +148,9 @@ test('Р8/Р9: дочерний процесс — предел без ожид�
   for (const [n, mode, directive, long] of [[0, '', 'OUTPUT_LIMIT', false], [1, 'legacy', 'OUTPUT_LIMIT', false], [2, '', '', true], [3, 'legacy', '', true], [4, '', 'PROTOCOL_ERROR', true], [5, '', 'PROTOCOL_ERROR', false]]) {
     const log = path.join(RUN, 'agy-' + n + '.log'), folder = path.join(RUN, 'material-' + n), file = path.join(folder, 'source.txt');
     write(file, 'Строка материала\n'.repeat(long ? 10000 : 94));
-    const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')], env: { ...process.env, AGY_PATH: path.join(__dirname, 'fake-agy-stream.js'), MOST_AGY_INPUT_FORMAT: mode, FAKE_STREAM_LOG: log }, stderr: 'pipe' });
+    const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')], env: { ...process.env, NODE_ENV: 'test', AGY_PATH: path.join(__dirname, 'fake-agy-stream.js'), MOST_AGY_INPUT_FORMAT: mode, FAKE_STREAM_LOG: log }, stderr: 'pipe' });
     const client = new Client({ name: 'v7', version: '1' }); await client.connect(transport);
+    await serverReady(path.join(RUN, 'state'), transport.pid);
     try {
       const reply = await client.callTool({ name: 'antigravity_send', arguments: { folder, file, task: 'Проверь текст. ' + directive, mode: 'review' } });
       const id = /Задание (\S+) запущено/.exec(reply.content[0].text)?.[1]; assert(id, reply.content[0].text);

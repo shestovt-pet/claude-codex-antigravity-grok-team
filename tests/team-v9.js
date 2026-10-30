@@ -1,6 +1,7 @@
 'use strict';
 // team-v9: самопроверка Claude (Р2), краткий ответ работы (Р3), уборка (Р4), чтение результата без этапа (Р7).
 const fs = require('fs'), path = require('path'), assert = require('assert');
+const { serverReady } = require('./runner-support');
 const ROOT = path.resolve(__dirname, '..'), RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v9-'));
 const write = (f, s) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, s); };
 const json = (f, s) => write(f, JSON.stringify(s, null, 2));
@@ -111,7 +112,8 @@ test('Р1/Р2: правила прогона, самопроверки и убо
     assert.match(claude, re);
   assert.match(text('rules/brief.md'), /`precheck` \(самопроверка\) → затронутые тесты — Codex, отпечаток → `commit fingerprint=…`/);
   assert.match(text('tests/run.js'), /'team-v8\.js', 'team-v9\.js'/);
-  assert.match(text('tests/run.js'), /'windows-test-output-' \+ path\.basename\(path\.resolve\(__dirname, '\.\.'\)\)/);
+  assert.match(text('tests/run.js'), /root = path\.resolve\(__dirname, '\.\.'\)/);
+  assert.match(text('tests/run.js'), /'windows-test-output-' \+ path\.basename\(root\)/);
 });
 test('Р3: краткий ответ team_work и одно сообщение на несколько принятых этапов', async () => {
   const team = new Team(RUN, path.join(RUN, 'state/team'));
@@ -302,8 +304,9 @@ test('Р8: вердикт в парном выделении Markdown засчи
 test('Р7: результат Antigravity читается без этапа, постановка без этапа по-прежнему отказывает', async () => {
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js'), { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')],
-    env: { ...process.env, AGY_PATH: path.join(__dirname, 'fake-agy.js'), MOST_AGY_INPUT_FORMAT: 'legacy' }, stderr: 'pipe' });
+    env: { ...process.env, NODE_ENV: 'test', AGY_PATH: path.join(__dirname, 'fake-agy.js'), MOST_AGY_INPUT_FORMAT: 'legacy' }, stderr: 'pipe' });
   const client = new Client({ name: 'team-v9', version: '1' }); await client.connect(transport);
+  await serverReady(path.join(RUN, 'state'), transport.pid);
   const text = r => r.content.map(c => c.text || '').join('\n');
   try {
     const folder = path.join(RUN, 'agy'); fs.mkdirSync(folder);

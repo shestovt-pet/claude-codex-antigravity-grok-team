@@ -21,6 +21,10 @@ function checks(root, deps = {}) {
       try { if (fs.statSync(cli).isFile()) return true; } catch {}
       if (platform === 'win32') return false;
     }
+    // На Windows распаковка релиза идёт системным bsdtar из System32 (common/paths.systemTar), а не любым tar из PATH:
+    // проверяем именно его. GNU tar из PATH (например, из Git) не годится — он срывает распаковку путей с буквой диска.
+    if (cmd === 'tar' && platform === 'win32')
+      return fs.existsSync(path.join(process.env.SystemRoot || process.env.windir || 'C:\\Windows', 'System32', 'tar.exe'));
     try { run(cmd, ['--version'], root); return true; } catch { return false; }
   });
   const git = deps.git || ((args) => run('git', args, root));
@@ -29,7 +33,7 @@ function checks(root, deps = {}) {
   out.push({ ok: platform === 'win32', name: 'Windows', text: platform === 'win32' ? 'Windows' : 'нужен Windows 10 или 11: перезапуск Claude и подключения рассчитаны только на него' });
   const major = Number(node.split('.')[0]);
   out.push({ ok: major >= 18, name: 'Node.js', text: 'Node.js ' + node + (major >= 18 ? '' : ' — нужна версия 18 или новее: https://nodejs.org') });
-  const hint = { git: ' — поставьте Git for Windows: https://git-scm.com', tar: ' — в Windows 10/11 tar встроен, проверьте PATH', npm: ' — рядом с Node.js нет npm: переустановите Node.js вместе с npm (https://nodejs.org)' };
+  const hint = { git: ' — поставьте Git for Windows: https://git-scm.com', tar: ' — в Windows 10/11 встроен System32\\tar.exe (bsdtar): проверьте систему и PATH', npm: ' — рядом с Node.js нет npm: переустановите Node.js вместе с npm (https://nodejs.org)' };
   for (const cmd of ['git', 'tar', 'npm']) { const ok = has(cmd); out.push({ ok, name: cmd, text: ok ? cmd + ' найден' : cmd + (cmd === 'npm' ? ' не найден' : ' не найден в PATH') + hint[cmd] }); }
   if (!exists(path.join(root, '.git'))) {
     out.push({ ok: true, name: 'клон', zip: true, text: 'папка без .git (скачана архивом ZIP): будет создан локальный репозиторий с одним коммитом' });
@@ -63,6 +67,7 @@ function conflicts(root, f, deps = {}) {
   for (const file of f.claude) attempt(() => d.configFor(d.snapshot(file).config, release, root, state, file));
   for (const file of f.codex) attempt(() => cc.toml(d.snapshot(file).text, release, root, state, 'node', file));
   for (const file of f.agy) attempt(() => cc.jsonConfig(d.snapshot(file).config, 'agy', release, root, state, 'node', file));
+  for (const c of f.extra || []) attempt(() => require('../common/dsh-config').render(d.snapshot(c.file, 'yaml').text, release, root, 'node', c.id, c.file));
   return out;
 }
 
@@ -73,6 +78,7 @@ function found(deps = {}) {
   const clients = require('../common/client-configs').paths().filter((p) => p.kind !== 'permissions');
   return {
     claude,
+    extra: require('../common/member-clients').all().filter(c => c.kind === 'dsh' && exists(c.file)),
     codex: clients.filter((p) => p.kind === 'codex' && exists(p.file)).map((p) => p.file),
     agy: clients.filter((p) => p.kind === 'agy' && exists(p.file)).map((p) => p.file),
   };
@@ -83,7 +89,7 @@ async function setup(argv = process.argv.slice(2), deps = {}) {
   const root = path.resolve(deps.root || path.join(__dirname, '..'));
   const print = deps.print || console.log, lines = [];
   const say = (s) => { lines.push(s); print(s); };
-  say('Установка связки Claude · Codex · Antigravity · Grok' + (dryRun ? ' — проверочный режим, ничего не меняется' : ''));
+  say('Установка связки ИИ' + (dryRun ? ' — проверочный режим, ничего не меняется' : ''));
   say('Папка: ' + root);
   const c = checks(root, deps);
   for (const x of c) say((x.ok ? '✓ ' : '✗ ') + x.text);
@@ -92,10 +98,11 @@ async function setup(argv = process.argv.slice(2), deps = {}) {
   say(f.claude.length ? '✓ Claude Desktop: ' + f.claude.join('; ') : '— Claude Desktop не найден: установите его и запустите один раз, затем повторите установку (без него серверы некому подключать).');
   say(f.codex.length ? '✓ Codex: ' + f.codex.join('; ') : '— Codex не найден (~\\.codex\\config.toml): его подключение пропущено; связка работает без Codex, но его голоса в ревью будут недоступны.');
   say(f.agy.length ? '✓ Antigravity: ' + f.agy.join('; ') : '— Antigravity не найден (~\\.gemini\\config\\mcp_config.json): подключение пропущено.');
+  for (const c of f.extra || []) say('✓ ' + c.title + ': ' + c.file);
   const bad = (deps.conflicts || conflicts)(root, f, deps);
   // Правила помощникам проверяются до любой записи: повреждённые метки или кодировка — отказ до сборки.
-  const rules = require('../common/client-rules'), rp = rules.paths();
-  const helperRules = [[rp[0], f.codex.length], [rp[1], f.agy.length]].filter(([, on]) => on && f.claude.length).map(([file]) => file);
+  const rules = require('../common/client-rules');
+  const helperRules = require('../common/member-clients').all().filter(c => f.claude.length && (c.kind === 'codex' ? f.codex.length : c.kind === 'agy' ? f.agy.length : (deps.exists || fs.existsSync)(c.file))).map(c => ({ file: c.rulesFile, role: c.id }));
   for (const file of helperRules) try { await (deps.ensureRules || rules.ensure)(file, { dryRun: true }); } catch (e) { bad.push(e.message); }
   if (bad.length) { for (const b of bad) say('✗ ' + b); say('Установка остановлена: ничего не изменено.'); return { ok: false, lines }; }
   const zip = c.some((x) => x.zip), zipUpdate = c.some((x) => x.zipUpdate);
@@ -116,9 +123,9 @@ async function setup(argv = process.argv.slice(2), deps = {}) {
   for (const file of helperRules) say('Правила: ' + await (deps.ensureRules || rules.ensure)(file, { dryRun }));
   say(dryRun ? 'Проверочный режим завершён. Для установки: setup.cmd (или node tools/setup.js).' : [
     'Готово. Дальше:',
-    '1. Перезапустите Claude Desktop — в нём появятся серверы team, codex, antigravity, grok.',
+    '1. Перезапустите Claude Desktop — в нём появятся серверы ' + [...require('../common/members').servers].join(', ') + '.',
     '2. В новом чате вызовите team_status: он покажет квоты, помощников и версию.',
-    '3. Grok — по желанию: раздел «Grok» в README (нужна своя рутина с вебхуком и файл state\\grok-webhook.json).',
+    '3. Участники и специализации — из team_status.',
   ].join('\n'));
   return { ok: true, lines };
 }

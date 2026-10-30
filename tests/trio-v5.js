@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 const fs = require('fs'), path = require('path'), assert = require('assert'), crypto = require('crypto');
 const RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v5-'));
 process.env.MOST_REPO_ROOT = RUN; process.env.MOST_STATE_DIR = path.join(RUN, 'state');
@@ -15,6 +19,11 @@ const write = (f, s) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs
 const json = (f, v) => write(f, JSON.stringify(v)), read = f => JSON.parse(fs.readFileSync(f, 'utf8'));
 write(path.join(RUN, 'common/path-compat.js'), '// team-v21 fixture');
 const tests = [], test = (label, fn) => tests.push({ label, fn });
+async function operationStart(options, deps) {
+  const state = process.env.MOST_STATE_DIR;
+  try { delete process.env.MOST_STATE_DIR; return await ops.start(options, deps); }
+  finally { if (state !== undefined) process.env.MOST_STATE_DIR = state; }
+}
 function plan(name) { const file = path.join(RUN, name + '.json'); json(file, { old: true }); return { ...d.snapshot(file), next: '{"new":true}', backup: true }; }
 test('Р1: равный текст двух разных файлов записывается дважды', async () => {
   const a = plan('equal-a'), b = plan('equal-b'); let writes = 0;
@@ -76,9 +85,9 @@ test('Р1 Д1: 300 с, поздний итог, запрет параллель�
   const root = path.join(RUN, 'operation'); let now = Date.now(), file;
   const deps = { now: () => now, sleep: async ms => { now += ms; }, alive: () => true, launch: async (_, args) => { file = args[args.indexOf('--result') + 1]; return process.pid; } };
   assert.equal(ops.WAIT_MS, 300000);
-  const start = now, text = await ops.start({ root, release: RUN, configs: ['one'], restartClaude: true }, deps);
+  const start = now, text = await operationStart({ root, release: RUN, configs: ['one'], restartClaude: true }, deps);
   assert.equal(now - start, 300000); assert.match(text, /не подтверждён/); assert(!text.includes('не тронуты'));
-  await assert.rejects(ops.start({ root, release: RUN, configs: ['one'] }, deps), /Идёт установка/);
+  await assert.rejects(operationStart({ root, release: RUN, configs: ['one'] }, deps), /Идёт установка/);
   ops.update(file, { status: 'завершено' });
   assert.equal(ops.list(root).at(-1).status, 'завершено');
   // Новый экземпляр читателя не зависит от прежнего ожидающего вызова.
@@ -86,13 +95,13 @@ test('Р1 Д1: 300 с, поздний итог, запрет параллель�
 });
 test('Р1: отказ CIM сохраняется до записи настроек', async () => {
   const root = path.join(RUN, 'cim-failure');
-  await assert.rejects(ops.start({ root, release: RUN, configs: ['untouched'] }, { launch: async () => { throw Error('CIM отказ'); } }), /CIM отказ/);
+  await assert.rejects(operationStart({ root, release: RUN, configs: ['untouched'] }, { launch: async () => { throw Error('CIM отказ'); } }), /CIM отказ/);
   assert.equal(ops.list(root).at(-1).status, 'отказ');
 });
 test('Р1: запуск действительно строит Win32_Process Create и разбирает PID', async () => {
   const cp = require('child_process'), original = cp.execFile; let command;
   cp.execFile = (exe, args, opts, callback) => { assert.equal(exe, 'powershell.exe'); assert(opts.windowsHide); command = args.at(-1); callback(null, '1234\r\n'); };
-  try { assert.equal(await ops.launch(RUN, ['--config-only', '--config', 'C:\\путь с пробелом\\a.json']), 1234); assert.match(command, /Invoke-CimMethod -ClassName Win32_Process -MethodName Create/); assert(command.includes('--config-only')); }
+  try { assert.equal(await ops.launch(RUN, ['--config-only', '--config', 'C:\\путь с пробелом\\a.json'], RUN), 1234); assert.match(command, /Invoke-CimMethod -ClassName Win32_Process -MethodName Create/); assert(command.includes('--config-only')); assert(command.includes('MOST_REPO_ROOT=')); }
   finally { cp.execFile = original; }
 });
 test('Р1 Д2: мёртвый PID немедленно, неизвестный только через 30 минут; живой не прерывается', () => {
@@ -115,8 +124,9 @@ test('Р1: исполнитель сохраняет переключение р
   assert.equal(restart, 1); assert.equal(read(file).status, 'отказ');
 });
 test('Р1: CLI --result ведёт шаги операции и сохраняет успешный итог', async () => {
-  const result = path.join(RUN, 'cli-result.json'); json(result, { root: RUN });
-  await require('../tools/deploy').main(['--config-only', '--release', RUN, '--config', 'a.json', '--result', result], { configure: async () => 'настроено', print: () => {} });
+  const fixture = require('./fixtures/team-v43/fixture'), release = fixture.release(RUN);
+  const result = fixture.operation(RUN, release, 'cli-result');
+  await require(path.join(release, 'tools/deploy.js')).main(['--root', RUN, '--config-only', '--release', release, '--config', 'a.json', '--result', result], { configure: async () => 'настроено', print: () => {} });
   assert.equal(read(result).status, 'завершено');
   assert.throws(() => require('../tools/deploy').parseArgs(['--result', result]), /требует --config-only/);
 });
@@ -133,7 +143,7 @@ test('Codex-1: незавершённый restart блокирует втору�
     await enteredRestart;
     assert.equal(read(file).status, 'перезапуск идёт');
     assert.throws(() => ops.assertIdle(root), /Идёт установка first/);
-    await assert.rejects(ops.start({ root, release: RUN, configs: ['second'] }, { launch: async () => { throw Error('Запуск второй запрещён'); } }), /Идёт установка first/);
+    await assert.rejects(operationStart({ root, release: RUN, configs: ['second'] }, { launch: async () => { throw Error('Запуск второй запрещён'); } }), /Идёт установка first/);
     assert.equal(fs.readdirSync(path.dirname(file)).filter(n => n.endsWith('.json')).length, 1);
   } finally { releaseRestart(); await execution; }
   assert.equal(read(file).status, 'завершено');
@@ -154,14 +164,15 @@ test('Codex-1: отказ запуска перезапуска сохранён
 function release(name, complete = true) {
   const root = path.join(RUN, name), id = 'a'.repeat(40), dir = path.join(root, 'live', id);
   for (const n of ['team', 'codex', ...(complete ? ['antigravity'] : [])]) write(path.join(dir, 'servers', n, 'index.js'), '');
-  write(path.join(dir, 'common', 'access.js'), fs.readFileSync(path.join(__dirname, '..', 'common', 'access.js'))); // team-v28 Р1
+  write(path.join(dir, 'common', 'access.js'), fs.readFileSync(path.join(__dirname, '..', 'common', 'access.js')));
+  for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(dir, 'common', name), fs.readFileSync(path.join(path.join(__dirname, '..'), 'common', name))); /* реестр кандидата А */ // team-v28 Р1
   json(path.join(dir, 'probe-ok.json'), { root, commit: id, at: new Date().toISOString(), servers: ['antigravity', 'codex', 'team'] });
   return { root, dir };
 }
-test('Р2 Р3: config-only повторяет десять проб и сохраняет deployed.json', async () => {
+test('Р2 Р3: config-only повторяет все пробы реестра и сохраняет deployed.json', async () => {
   const r = release('legacy'), p = plan('legacy-config'); let probes = 0;
   await d.configure({ release: r.dir, configs: [p.file] }, { probe: async () => { probes++; } });
-  assert.equal(probes, 9); assert.equal(read(path.join(r.root, 'live/deployed.json')).method, 'внешним сценарием'); // team-v19 К2: + сервер своей семьи у гостей
+  assert.equal(probes, require('../common/members').servers.length * (1 + require('../common/member-clients').all().length)); assert.equal(read(path.join(r.root, 'live/deployed.json')).method, 'внешним сценарием'); // team-v19 К2: + сервер своей семьи у гостей
   assert.equal(read(path.join(r.dir, 'probe-ok.json')).servers.length, 3);
 });
 test('Р2: неполный релиз не меняет конфиги и метку', async () => {
@@ -175,7 +186,7 @@ test('Р2 Р3 Д4: clients-only пробует релиз, сохраняет о
   write(good, '# Личное\nНе менять\n## Связка четырёх ИИ\nСтарое\n## Мой раздел\nТочное содержимое\n'); write(bad, '# Личное\n');
   let probes = 0;
   const out = await d.configureClients({ release: r.dir }, { probe: async () => { probes++; }, rules: { files: [{ file: bad, role: 'codex' }, { file: good, role: 'antigravity' }] } });
-  assert.equal(probes, 9); assert.match(out, /отказ/); assert.match(fs.readFileSync(good, 'utf8'), /Связка трёх ИИ/);
+  assert.equal(probes, require('../common/members').servers.length * (1 + require('../common/member-clients').all().length)); assert.match(out, /отказ/); assert.match(fs.readFileSync(good, 'utf8'), /Связка ИИ/);
   assert.equal(read(path.join(r.root, 'live/deployed.json')).commit, path.basename(r.dir));
   assert(fs.existsSync(good + '.prev')); assert(fs.readFileSync(good, 'utf8').endsWith('## Мой раздел\nТочное содержимое\n'));
   assert.match((await require('../common/client-rules').configure({ files: [good], rollback: true })).join(''), /восстановлен/);
@@ -368,7 +379,7 @@ test('AG-1 AG-3 AG-5: настройка Grok остаётся пользова�
     assert(!text.includes('исправляет дирижёр'));
   }
   const brief = fs.readFileSync(path.join(root, 'rules/brief.md'), 'utf8');
-  assert(!brief.includes('verdict ×3')); assert.match(brief, /вердикты Codex и Antigravity \(обязательные\), Claude/);
+  assert(!brief.includes('verdict ×3')); assert.match(brief, /вердикты голосующих помощников из team_status \(обязательные\); Claude — необязательно, его НЕ ПРИНЯТО — стоп\./); // team-v45 П3
   const claude = fs.readFileSync(path.join(root, 'rules/claude.md'), 'utf8');
   assert.equal((claude.match(/restart_claude=true/g) || []).length, 1);
   assert.equal((claude.match(/claude_usage/g) || []).length, 1);
@@ -381,40 +392,12 @@ test('Grok ab708007: решение из lessons.md соответствует �
   assert(gate.paragraph(lessons, 'ab708007', ['closed']));
   assert.match(lessons, /Где закрыто: tz-v5\.md Д1, common\/deploy-ops\.js \(300 с\)/);
 });
-test('Р4: полная оболочка ответа на копии текущих карточек — не более 3000 символов', async () => {
-  const source = process.env.MOST_TEST_STATUS_SOURCE || 'C:/most', root = path.join(RUN, 'current-copy');
-  if (!process.env.MOST_TEST_STATUS_SOURCE && !fs.existsSync(source)) return 'нет копии текущих данных';
-  assert(fs.existsSync(source), 'MOST_TEST_STATUS_SOURCE: папка не существует');
-  const { Team } = require('../common/team'), t = new Team(rootForCopy(), path.join(root, 'state/team'));
-  function rootForCopy() { fs.mkdirSync(root, { recursive: true }); return root; }
-  for (const [from, to] of [['state/team/changes', 'state/team/changes'], ['works', 'works']]) {
-    const dir = path.join(source, from);
-    assert(fs.existsSync(dir), 'Для проверки нужна копия текущих данных: MOST_TEST_STATUS_SOURCE');
-    for (const name of fs.readdirSync(dir).filter(n => n.endsWith('.json'))) write(path.join(root, to, name), fs.readFileSync(path.join(dir, name)));
-  }
-  const marker = path.join(source, 'live/deployed.json'); if (fs.existsSync(marker)) write(path.join(root, 'live/deployed.json'), fs.readFileSync(marker));
-  const usage = path.join(source, 'state/team/claude-quota.json');
-  if (fs.existsSync(usage)) write(path.join(t.state, 'claude-quota.json'), fs.readFileSync(usage));
-  const stores = require('../common/team-store'), oldList = stores.list, grok = require('../common/grok').Grok.prototype, oldRefresh = grok.refresh;
-  const locks = require('../common/locks'), oldOwner = locks.ownerState, snapshots = {};
-  for (const [who, folder] of [['codex', 'codex-jobs'], ['antigravity', 'jobs'], ['grok', 'grok-jobs']]) {
-    const dir = path.join(source, 'state', folder), jobs = [];
-    if (fs.existsSync(dir)) for (const n of fs.readdirSync(dir)) {
-      if (n.startsWith('.') || n.includes('.conflict-')) continue;
-      const f = path.join(dir, n), card = fs.statSync(f).isDirectory() ? path.join(f, 'card.json') : n.endsWith('.json') ? f : null;
-      if (card && fs.existsSync(card)) jobs.push(read(card));
-    }
-    snapshots[who] = { jobs, errors: [] };
-  }
-  // Снимок карточек не должен обращаться к живым владельцам и изменять настоящий Grok.
-  stores.list = who => snapshots[who]; grok.refresh = async id => snapshots.grok.jobs.find(j => j.id === id); locks.ownerState = async () => 'unknown';
-  const oldBinary = process.env.CODEX_PATH; process.env.CODEX_PATH = path.join(__dirname, 'fake-codex.js');
-  const oldQuota = require('../common/quota').codexQuota;
-  require('../common/quota').codexQuota = async () => ({ source: 'снимок app-server (подделка источника)', rateLimits: { primary: { usedPercent: 10, windowDurationMins: 10080 } } });
-  try {
-    const text = require('../common/format').format('Команда', { status: 'done' }, await t.status(), 'Проверьте результат и выберите следующий шаг.');
-    console.log('Размер сводки копии текущих карточек: ' + text.length); assert(text.length <= 3000, text);
-  } finally { stores.list = oldList; grok.refresh = oldRefresh; locks.ownerState = oldOwner; require('../common/quota').codexQuota = oldQuota; if (oldBinary === undefined) delete process.env.CODEX_PATH; else process.env.CODEX_PATH = oldBinary; }
+test('Р4: полная оболочка фиксированных карточек всех хранилищ — не более 3000 символов', () => {
+  const cp=require('child_process'), fixture=require('./fixtures/team-v43/fixture');
+  const root=path.join(RUN,'status-fixture'), script=path.join(__dirname,'fixtures/team-v43/status-child.js');
+  const run=env=>cp.execFileSync(process.execPath,[script,root],{env,encoding:'utf8',windowsHide:true,stdio:'pipe'});
+  const clean=fixture.env(root), dirty={...clean,MOST_CLIENT:'dirty',MOST_REPO_ROOT:'dirty',MOST_STATE_DIR:'dirty',MOST_JOB_ID:'dirty',MOST_AUTHORITY:'dirty',MOST_FALLBACK_DIR:'dirty',MOST_TEST_STATUS_SOURCE:'dirty',MOST_UNKNOWN:'dirty'};
+  const text=run(clean);assert.equal(run(dirty),text);assert(text.trimEnd().length <= 3000, 'Сводка длиннее 3000: '+text.trimEnd().length);console.log('Размер фиксированной сводки: '+text.trimEnd().length);
 });
 test('Р5: настоящие ворота merge без запроса Grok и без абзаца о недоступности', async () => {
   const g = require('../common/team-git'), { Team } = require('../common/team'), root = path.join(RUN, 'merge-gate'); fs.mkdirSync(root);

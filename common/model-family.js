@@ -2,6 +2,7 @@
 // Имена из источника запуска; неизвестные модели не угадываем.
 function family(model) {
   if (typeof model !== 'string') return null;
+  if (/^deepseek(?:[- .]|$)/i.test(model)) return 'deepseek';
   if (/^(gemini)(?:[- .]|$)/i.test(model)) return 'google';
   if (/^(claude|opus|sonnet|haiku)(?:[- .]|$)/i.test(model)) return 'anthropic';
   if (/^(gpt|o[134])(?:[- .]|$)/i.test(model)) return 'openai';

@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 // team-v11: установщик на чужом компьютере (Р1), пути без личного (Р2), публичная копия (Р3), тесты без истории (Р6).
 // Все частные значения здесь вымышленные: «Иннокентий Пупкин», папка Innokenty (случай 55).
 const fs = require('fs'), path = require('path'), assert = require('assert'), crypto = require('crypto');

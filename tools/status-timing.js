@@ -110,7 +110,7 @@ wrap(req('locks'),'ownerState','ownerState');
     emit({ event: 'verdicts-equal', works: newVerdicts.length });
   }
   const roots = store.roots();
-  const cardReads = () => Object.fromEntries(['codex', 'antigravity', 'archive'].map(who => {
+  const cardReads = () => Object.fromEntries([...require('../common/members').helpers, 'archive'].map(who => {
     const dir = roots[who];
     return [who, [...reads].filter(([file]) => dir && file.startsWith(dir + path.sep) &&
       (path.basename(file) === 'card.json' || (path.dirname(file) === dir && file.endsWith('.json'))))

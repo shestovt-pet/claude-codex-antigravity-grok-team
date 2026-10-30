@@ -5,13 +5,17 @@ const fs = require('fs'),
   os = require('os'),
   crypto = require('crypto');
 const { stateDir, isInsideReal } = require('./paths');
-const roots = () => ({
+// jobs/codex-jobs и архив Grok — явная совместимость исторических карточек.
+const legacyRoots = () => ({
   codex: process.env.MOST_CODEX_JOBS_DIR || path.join(stateDir, 'codex-jobs'),
   antigravity: path.join(stateDir, 'jobs'),
   grok: path.join(stateDir, 'grok-jobs'),
   // Архив старых заданий Codex — только если задан явно (team-v11: без личных путей по умолчанию).
   archive: process.env.MOST_CODEX_ARCHIVE_DIR || null,
 });
+function roots() {
+  return { ...Object.fromEntries(require('./members').all().filter(m => require('./members').adapters[m.adapter]).map(m => [m.id, path.join(stateDir, m.id + '-jobs')])), ...legacyRoots() };
+}
 function read(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
@@ -26,7 +30,7 @@ function scan(who, includeArchive = true) {
         if (name.includes('.conflict-') || name.startsWith('.')) continue;
         let file = path.join(dir, name);
         try {
-          const bundle = who === 'antigravity' || fs.statSync(file).isDirectory();
+          const bundle = (who === 'antigravity' || require('./members').adapterOf(who) === 'agy-cli') || fs.statSync(file).isDirectory();
           file = bundle ? path.join(dir, name, 'card.json') : file;
           if (!bundle && !name.endsWith('.json')) continue;
           if (!bundle && fs.existsSync(path.join(dir, name.slice(0, -5), 'card.json'))) continue;
@@ -60,9 +64,22 @@ function review(who, id, base, candidate, decision = 'ПРИНЯТО', requestMa
   const j = snapshot ? snapshot.get(who, id) : listed.jobs.find((j) => j.id === id);
   if (!j || j.status !== 'done' || j.archived)
     throw Error('Нужно завершённое задание ревью из действующего хранилища.');
-  if (who === 'codex' && (j.write || j.previous) && (!workReview || j.role !== 'совет'))
+  if (j.parentJob) throw Error('Подпоручение из поручения голосом не засчитывается: ревью выдаёт дирижёр из чата.');
+  if ((who === 'codex' || require('./members').adapterOf(who) === 'codex-cli') && (j.write || j.previous) && (!workReview || j.role !== 'совет'))
     throw Error('Ревью Codex должно быть новым сеансом только для чтения.');
-  if (!workReview && who === 'antigravity' && !['review', 'zamechaniya'].includes(j.mode || j.rezhim))
+  if (who === 'deepseek' || require('./members').adapterOf(who) === 'dsh-headless') {
+    if (j.write || j.previous || j.role !== 'проверка')
+      throw Error('Голос DeepSeek должен быть новым сеансом проверки только для чтения.');
+    if (j.profile !== 'most-review')
+      throw Error('Голос DeepSeek засчитывается только из профиля most-review.');
+    if (!j.modelConfirmed || require('./model-family').family(j.reportedModel) !== 'deepseek')
+      throw Error('Голос DeepSeek не засчитан: фактическая модель сеанса не подтверждена.');
+    if (!require('./dsh-probe').ok())
+      throw Error('Голос DeepSeek не засчитывается: нет успешной пробы отказа записи установленной версии dsh.');
+    if (!j.dshVersion || j.dshVersion !== require('./dsh-probe').version())
+      throw Error('Голос DeepSeek не засчитывается: версия dsh карточки не совпадает с версией пробы.');
+  }
+  if (!workReview && (who === 'antigravity' || require('./members').adapterOf(who) === 'agy-cli') && !['review', 'zamechaniya'].includes(j.mode || j.rezhim))
     throw Error('Нужно задание Antigravity в режиме ревью.');
   const task = (j.task || j.poruchenie || '') + (who === 'grok' ? '\n' + (j.text || '') : '');
   if (requestMark && !task.includes(requestMark)) throw Error('В поручении ревью нет метки запроса ' + requestMark + '.');
@@ -72,7 +89,7 @@ function review(who, id, base, candidate, decision = 'ПРИНЯТО', requestMa
     if (!new RegExp('(^|[^a-fA-F0-9])' + hash + '([^a-fA-F0-9]|$)').test(task))
       throw Error('В поручении нет точной пары базы и кандидата.');
   const dir = roots()[who],
-    file = who === 'antigravity' ? path.join(path.dirname(j.cardFile), 'result.txt')
+    file = (who === 'antigravity' || require('./members').adapterOf(who) === 'agy-cli') ? path.join(path.dirname(j.cardFile), 'result.txt')
       : who === 'grok' ? path.join(dir, id + '.result.txt') : resultPath(j, dir);
   if (!file || !isInsideReal(file, dir)) throw Error('Результат вне хранилища.');
   const text = fs.readFileSync(file, 'utf8');
@@ -80,7 +97,7 @@ function review(who, id, base, candidate, decision = 'ПРИНЯТО', requestMa
       crypto.createHash('sha256').update(text).digest('hex')) {
     throw Error('Хеш перенесённого результата ревью не совпадает.');
   }
-  if (who === 'antigravity') {
+  if ((who === 'antigravity' || require('./members').adapterOf(who) === 'agy-cli')) {
     const meta = read(path.join(path.dirname(j.cardFile), 'meta.json'));
     if (meta.hash !== crypto.createHash('sha256').update(text).digest('hex'))
       throw Error('Хеш результата ревью не совпадает.');
@@ -117,11 +134,11 @@ function source(who, id, snapshot) {
   const j = snapshot ? snapshot.get(who, id) : listed.jobs.find(j => j.id === id);
   if (!j || !['done', 'applied'].includes(j.status) || j.cancelled || j.lateHash) throw Error(id + ': нет принятого сервером результата текста.');
   const dir = roots()[who];
-  const file = who === 'antigravity' ? path.join(path.dirname(j.cardFile), 'result.txt') : who === 'grok' ? path.join(dir, id + '.result.txt') : resultPath(j, dir);
+  const file = (who === 'antigravity' || require('./members').adapterOf(who) === 'agy-cli') ? path.join(path.dirname(j.cardFile), 'result.txt') : who === 'grok' ? path.join(dir, id + '.result.txt') : resultPath(j, dir);
   if (!isInsideReal(file, dir)) throw Error('Результат вне хранилища.');
   const text = fs.readFileSync(file, 'utf8'), hash = crypto.createHash('sha256').update(text).digest('hex');
   if ((j.migration?.resultHash && j.migration.resultHash !== hash) ||
-      (who === 'antigravity' && read(path.join(path.dirname(j.cardFile), 'meta.json')).hash !== hash) ||
+      ((who === 'antigravity' || require('./members').adapterOf(who) === 'agy-cli') && read(path.join(path.dirname(j.cardFile), 'meta.json')).hash !== hash) ||
       (who === 'grok' && (j.resultHash !== hash || !require('./grok').parseReply(Buffer.from(text)))))
     throw Error(id + ': хеш результата текста не совпадает.');
   return text;

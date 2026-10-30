@@ -1,5 +1,6 @@
 'use strict';
 const fs = require('fs'), path = require('path'), assert = require('assert');
+const { serverReady } = require('./runner-support');
 const ROOT = path.resolve(__dirname, '..'), RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v8-'));
 const write = (f, s) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, s); };
 const json = (f, s) => write(f, JSON.stringify(s)), read = f => JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -110,7 +111,7 @@ test('Р4/Р5: проверки правил из замысла, без изм�
   } else console.log('Личный скилл хроник отсутствует (публичная копия): проверка его формулировок пропущена.');
   assert.match(text('rules/brief.md').split('\n')[0], /roles/);
   const antigravity = text('rules/antigravity.md');
-  assert.match(antigravity, /У пользователя два помощника:[^\n]*Antigravity[^\n]*Codex/);
+  assert.match(antigravity, /Участники и специализации — из team_status/);
   assert(antigravity.includes('исполнителя выбирает связка сама — по таблице «Кого звать» скилла helpers и rules/roles.md; не спрашивать.'));
   assert(antigravity.includes('Вопрос — только если неясен смысл нужного результата.'));
   const grokLines = text('rules/claude.md').split('\n').filter(line => /Grok/.test(line) && line.trim());
@@ -125,8 +126,10 @@ test('Р2/Р3: сервер — --model, карточка, ответ, повт�
   const log = path.join(RUN, 'calls.jsonl');
   async function open(guest = false) {
     const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')], env: { ...process.env,
-      MOST_CLIENT: guest ? 'codex' : 'claude', AGY_PATH: path.join(__dirname, 'fake-agy.js'), MOST_AGY_INPUT_FORMAT: 'legacy', FAKE_AGY_LOG: log }, stderr: 'pipe' });
-    const client = new Client({ name: 'team-v8', version: '1' }); await client.connect(transport); return { client, transport };
+      NODE_ENV: 'test', MOST_CLIENT: guest ? 'codex' : 'claude', AGY_PATH: path.join(__dirname, 'fake-agy.js'), MOST_AGY_INPUT_FORMAT: 'legacy', FAKE_AGY_LOG: log }, stderr: 'pipe' });
+    const client = new Client({ name: 'team-v8', version: '1' }); await client.connect(transport);
+    if (!guest) await serverReady(path.join(RUN, 'state'), transport.pid);
+    return { client, transport };
   }
   const text = r => r.content.map(c => c.text || '').join('\n');
   async function send(client, name, model) {

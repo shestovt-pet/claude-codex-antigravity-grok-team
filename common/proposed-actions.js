@@ -56,7 +56,7 @@ function validateAction(action, idx) {
     throw new Error(label + ': forbidden target (team_change/deploy/live/MOST_CLIENT=claude)');
   }
   if (action.type === 'jobs.stop') {
-    if (!action.who || !['codex', 'antigravity', 'grok'].includes(action.who)) {
+    if (!action.who || ![...require('./members').helpers, 'grok'].includes(action.who)) {
       throw new Error(label + ': jobs.stop needs who=codex|antigravity|grok');
     }
     if (!action.id || !/^[a-zA-Z0-9_-]{1,80}$/.test(action.id)) {

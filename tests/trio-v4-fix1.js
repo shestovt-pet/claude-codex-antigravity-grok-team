@@ -1,4 +1,5 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
 const fs = require('fs'), path = require('path'), assert = require('assert'), crypto = require('crypto');
 const RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-fix1-'));
 process.env.MOST_REPO_ROOT = RUN;
@@ -81,13 +82,15 @@ test('Старый релиз: три сервера и старое храни�
   write(path.join(root, 'README.md'), 'Проверка');
   git.git(root, ['add', 'README.md']); git.git(root, ['commit', '-m', 'Проверка']);
   const commit = git.hash(root), release = path.join(root, 'live', commit), oldState = path.join(root, 'live/.deploy-state');
-  const names = ['team', 'codex', 'antigravity'];
+  const oldNames = ['team', 'codex', 'antigravity'];
+  // team-v46: после миграции реестра серверов четыре (добавлен claude); старый релиз проверял только три.
+  const names = ['team', 'claude', 'codex', 'antigravity'];
   // Релиз содержит настоящий код кандидата; старый deploy проверял только три сервера.
   for (const dir of ['servers', 'common']) fs.cpSync(path.join(__dirname, '..', dir), path.join(release, dir), { recursive: true });
   fs.copyFileSync(path.join(__dirname, '../package.json'), path.join(release, 'package.json'));
-  json(path.join(release, 'probe-ok.json'), { commit, root, servers: names.slice(0, 3), at: new Date().toISOString() });
+  json(path.join(release, 'probe-ok.json'), { commit, root, servers: oldNames, at: new Date().toISOString() });
   const config = path.join(root, 'claude.json');
-  json(config, { mcpServers: Object.fromEntries(names.slice(0, 3).map(n => [n, { command: process.execPath,
+  json(config, { mcpServers: Object.fromEntries(oldNames.map(n => [n, { command: process.execPath,
     args: [path.join(release, 'servers', n, 'index.js')], env: { MOST_REPO_ROOT: root, MOST_STATE_DIR: oldState } }])) });
   process.env.MOST_CODEX_CONFIG = path.join(root, 'codex.toml'); write(process.env.MOST_CODEX_CONFIG, '');
   process.env.MOST_AGY_MCP_CONFIG = path.join(root, 'agy.json'); json(process.env.MOST_AGY_MCP_CONFIG, {});
@@ -95,12 +98,12 @@ test('Старый релиз: три сервера и старое храни�
   json(path.join(oldState, 'codex-jobs/old.json'), { id: 'old', status: 'running' });
   // Промежуточный запуск новых серверов с MOST_STATE_DIR старого формата.
   const probe = require('../common/probe').probe;
-  for (const n of names.slice(0, 3)) await probe(path.join(release, 'servers', n, 'index.js'), {
+  for (const n of oldNames) await probe(path.join(release, 'servers', n, 'index.js'), {
     ...process.env, MOST_REPO_ROOT: root, MOST_STATE_DIR: oldState, MOST_PROBE_ONLY: '0', MOST_CLIENT: 'claude',
     MOST_CODEX_JOBS_DIR: path.join(oldState, 'codex-jobs'), MOST_INPUT_DIR: path.join(oldState, 'input'), MOST_JOURNAL: path.join(oldState, 'antigravity.log'),
   });
   assert(!fs.existsSync(migration.marker(path.join(root, 'state'))));
-  for (const n of names.slice(0, 3)) assert(fs.existsSync(path.join(oldState, 'ready', n + '.json')));
+  for (const n of oldNames) assert(fs.existsSync(path.join(oldState, 'ready', n + '.json')));
   const probes = [];
   let restarted = false;
   await deploy.deploy({ root, commit, configs: [config], restartClaude: true }, {
@@ -111,7 +114,7 @@ test('Старый релиз: три сервера и старое храни�
       restarted = true; write(log, 'запущен ' + runId);
     } },
   });
-  assert.equal(probes.length, 0); // team-v19 К2: гости codex и antigravity получают и сервер своей семьи
+  assert.equal(probes.length, names.length * (1 + require('../common/member-clients').all().length)); // team-v46: четыре сервера перепроверяются заново
   assert.deepEqual(read(path.join(release, 'probe-ok.json')).servers, names);
   for (const n of names) assert.equal(read(config).mcpServers[n].env.MOST_STATE_DIR, path.join(root, 'state'));
   assert(!fs.readFileSync(process.env.MOST_CODEX_CONFIG, 'utf8').includes('[mcp_servers.grok]'));

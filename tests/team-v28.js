@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 // team-v28 (перенос team-v26 на main 3a81c227), замысел ред. 2. О1–О6, только временные данные вне клона.
 const fs = require('fs'), path = require('path'), os = require('os'), cp = require('child_process'), assert = require('assert');
 const ROOT = path.resolve(__dirname, '..');
@@ -50,7 +54,9 @@ test('О1: ожидаемый список гостя берётся из рел
   assert.equal(marker.commit, id); assert.deepEqual(marker.servers, servers);
   // Проверены все гости из client-configs (CODEX и AGY), а не только codex.
   const guests = calls.filter(c => c[2] === 'full').map(c => c[1] + ':' + c[0]).sort();
-  assert.deepEqual(guests, [...configs.CODEX.map(s => 'codex:' + s), ...configs.AGY.map(s => 'antigravity:' + s)].sort());
+  // Независимый эталон: три гостевых клиента (Codex, Antigravity, DeepSeek) по три сервера связки.
+  assert.deepEqual(guests, ['antigravity:antigravity', 'antigravity:codex', 'antigravity:team', 'codex:antigravity', 'codex:codex', 'codex:team',
+    'deepseek:antigravity', 'deepseek:codex', 'deepseek:team'].sort());
 });
 
 test('О2: лишний или недостающий инструмент гостя — отказ, метки нет', async () => {
@@ -131,7 +137,8 @@ test('О5: чужая отметка готовности (grok) — справ�
 });
 
 test('О6: путь к Codex после обновления приложения ищется заново (Р4)', async () => {
-  const bin = path.join(RUN, 'local', 'OpenAI', 'Codex', 'bin'), exe = d => path.join(bin, d, 'codex.exe');
+  const bin = path.join(RUN, 'local', 'OpenAI', 'Codex', 'bin'), exe = d => path.join(bin, d, 'codex.exe'),
+    host = d => path.join(bin, d, 'codex-code-mode-host.exe');
   const keep = { PATH: process.env.PATH, LOCALAPPDATA: process.env.LOCALAPPDATA, CODEX_PATH: process.env.CODEX_PATH }, now = Date.now;
   // Отдельная копия модуля сервера на каждый вызов: свой запомненный путь, как у нового процесса сервера.
   const codexApi = () => {
@@ -148,21 +155,21 @@ test('О6: путь к Codex после обновления приложени�
     // where.exe/which не находятся — поиск идёт по LOCALAPPDATA\OpenAI\Codex\bin, как у установленного приложения.
     delete process.env.CODEX_PATH; process.env.PATH = path.join(RUN, 'empty'); process.env.LOCALAPPDATA = path.join(RUN, 'local');
     Object.assign(process.env, { MOST_CLIENT: 'claude', MOST_CODEX_JOBS_DIR: path.join(RUN, 'codex-jobs'), MOST_CODEX_ARCHIVE_DIR: path.join(RUN, 'archive') });
-    write(exe('aaaa'), '');
+    write(exe('aaaa'), ''); write(host('aaaa'), '');
     const api = codexApi();
     assert.strictEqual(api.currentBinary(), exe('aaaa'));
     fs.renameSync(path.join(bin, 'aaaa'), path.join(bin, 'bbbb')); // обновление приложения: новая папка bin\<хеш>
     assert.strictEqual(api.currentBinary(), exe('bbbb'));
     fs.rmSync(path.join(bin, 'bbbb'), { recursive: true, force: true }); // пустой bin
     assert.strictEqual(api.currentBinary(), null);
-    write(exe('cccc'), ''); // без найденного пути повторный поиск — не чаще раза в минуту
+    write(exe('cccc'), ''); write(host('cccc'), ''); // без найденного пути повторный поиск — не чаще раза в минуту
     assert.strictEqual(api.currentBinary(), null);
     later(61000);
     assert.strictEqual(api.currentBinary(), exe('cccc'));
     fs.rmSync(bin, { recursive: true, force: true }); // bin нет вовсе
     assert.strictEqual(api.currentBinary(), null);
     // Явный CODEX_PATH: пропавший файл не подменяется найденным в bin; вернулся — найден не раньше чем через минуту.
-    write(exe('dddd'), ''); const own = path.join(RUN, 'own', 'codex.exe'); process.env.CODEX_PATH = own;
+    write(exe('dddd'), ''); write(host('dddd'), ''); const own = path.join(RUN, 'own', 'codex.exe'); process.env.CODEX_PATH = own;
     const explicit = codexApi();
     assert.strictEqual(explicit.currentBinary(), null);
     write(own, ''); assert.strictEqual(explicit.currentBinary(), null);

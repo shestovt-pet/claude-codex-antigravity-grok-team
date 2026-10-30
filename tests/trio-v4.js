@@ -1,4 +1,5 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
 // Этот набор проверяет запасной путь и прежний тестовый agy.
 process.env.MOST_AGY_INPUT_FORMAT = 'legacy';
 const fs = require('fs'), path = require('path'), assert = require('assert');
@@ -404,8 +405,10 @@ test('Статус: 15 минут, первая строка всех ответ
     const format = () => require('../common/format').format(who, { status: 'failed' }, 'Проверка');
     assert(!format().startsWith('⚠ Статус пользователю'));
     const context = require('../common/request-context').context;
-    assert(context.run({ owner: work.owner }, format).startsWith('⚠ Статус пользователю не отправлялся 16 мин'));
-    assert(!context.run({ owner: 'foreign-owner' }, format).startsWith('⚠ Статус пользователю'));
+    // team-v44 П3: напоминание только в team_status/team_work.
+    assert(context.run({ owner: work.owner, tool: 'team_status' }, format).startsWith('⚠ Статус пользователю не отправлялся 16 мин'));
+    assert(!context.run({ owner: work.owner, tool: 'codex_result' }, format).startsWith('⚠ Статус пользователю'));
+    assert(!context.run({ owner: 'foreign-owner', tool: 'team_status' }, format).startsWith('⚠ Статус пользователю'));
   }
   await team.work({ action: 'update', name: 'owned', owner: work.owner,
     expected_revision: work.revision, status_sent: true });

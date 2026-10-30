@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 // C:/E: моделируются как ссылка/цель в изолированной папке на E:, буквы дисков не подменяются.
 // Junction обязательна: невозможность mklink /J означает провал, а не пропуск.
 const fs = require('fs'), path = require('path'), cp = require('child_process'), assert = require('assert');
@@ -79,7 +83,8 @@ test('О1, О3: старые deploy/start → новый configure, повтор
       repoLocked: true, archive: async (_root, _id, temp) => {
         for (const n of ['team', 'codex', 'antigravity', 'grok']) write(path.join(temp, 'servers', n, 'index.js'));
         write(path.join(temp, 'common/path-compat.js'), '// new code');
-        write(path.join(temp, 'common/access.js'), fs.readFileSync(path.join(ROOT, 'common/access.js'))); // team-v28 Р1: есть в каждом релизе
+        write(path.join(temp, 'common/access.js'), fs.readFileSync(path.join(ROOT, 'common/access.js')));
+  for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(temp, 'common', name), fs.readFileSync(path.join(ROOT, 'common', name))); /* реестр кандидата А */ // team-v28 Р1: есть в каждом релизе
       }, install: async () => {}, probe: async () => ({}), operation: { launch: async (rel, args) => {
         const file = args[args.indexOf('--result') + 1];
         assert(file.startsWith(real));
@@ -114,7 +119,10 @@ test('О2: старый релиз — точный marker.root, noCleanup, ст
   release(hashes[2], real);
   await patched(fs.realpathSync, 'native', () => { throw Object.assign(Error('нет доступа'), { code: 'EACCES' }); }, async () => {
     assert.equal(compat.strictSamePath(real, real), 'unknown');
-    await assert.rejects(ops.start({ root: real, release: at('live/' + hashes[2]), configs: [] }), /нужен релиз/);
+    // deploy-ops.start теперь сначала проверяет MOST_STATE_DIR (stateRoot) и при недоступном realpath
+    // отказывает по причине доступа до проверки маркера; маркер root проверяется releasePolicy тем же strictSamePath.
+    assert.throws(() => compat.releasePolicy(real, at('live/' + hashes[2])), /нужен релиз/);
+    await assert.rejects(ops.start({ root: real, release: at('live/' + hashes[2]), configs: [] }), /нет доступа|нужен релиз/);
   });
   // Новая метка, записанная новым установщиком, не меняет содержимое старого релиза.
   assert.equal(compat.releasePolicy(real, at('live/' + hashes[2])).oldCode, true);
@@ -124,7 +132,8 @@ test('О2: новый установщик впервые собирает и п
   const builder = oldModule('deploy', { './team-git': { ...git, repository: () => {}, hash: () => h } }, true);
   const deps = { repoLocked: true, archive: async (_root, _id, temp) => {
     for (const n of ['team', 'codex', 'antigravity', 'grok']) write(path.join(temp, 'servers', n, 'index.js'));
-    write(path.join(temp, 'common/access.js'), fs.readFileSync(path.join(ROOT, 'common/access.js'))); // team-v28 Р1: есть в каждом релизе
+    write(path.join(temp, 'common/access.js'), fs.readFileSync(path.join(ROOT, 'common/access.js')));
+  for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(temp, 'common', name), fs.readFileSync(path.join(ROOT, 'common', name))); /* реестр кандидата А */ // team-v28 Р1: есть в каждом релизе
   }, install: async () => {}, probe: async () => ({}) };
   await builder.deploy({ root: link, releaseOnly: true }, deps);
   const rel = at('live/' + h), marker = read(path.join(rel, 'probe-ok.json'));

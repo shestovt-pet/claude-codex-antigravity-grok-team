@@ -28,21 +28,22 @@ function write(file, text) {
 
 // Отмена ждущего поручения codex или antigravity из другого процесса: замок и формат карточки — как у адаптера.
 async function cancel(who, id) {
-  if (!['codex', 'antigravity'].includes(who) || !/^[a-zA-Z0-9_-]{1,80}$/.test(id || '')) throw Error('Некорректное поручение для отмены.');
+  if (!require('./members').helpers.includes(who) || !/^[a-zA-Z0-9_-]{1,80}$/.test(id || '')) throw Error('Некорректное поручение для отмены.');
+  const adapter = require('./members').adapterFor(who)?.adapter;
   const dir = require('./team-store').roots()[who];
-  const l = await locks.waitLock(who === 'codex' ? 'codex_job' : 'job', id, { jobId: id }, 8000);
+  const l = await locks.waitLock(adapter === 'codex-cli' ? 'codex_job' : 'job', id, { jobId: id }, 8000);
   if (!l.ok) throw Error('Карточка ' + id + ' занята.');
   try {
     const bundle = path.join(dir, id, 'card.json');
-    const file = who === 'antigravity' || fs.existsSync(bundle) ? bundle : path.join(dir, id + '.json');
+    const file = adapter === 'agy-cli' || fs.existsSync(bundle) ? bundle : path.join(dir, id + '.json');
     const j = require('./cards').readCard(file), before = { ...j };
     if (!cancelWaiting(j)) return j;
-    if (who === 'antigravity') {
-      j.provenance = require('./provenance').forJob(j, 'antigravity');
+    if (adapter === 'agy-cli') {
+      j.provenance = require('./provenance').forJob(j, who);
       j.cancellation = { parent_stop: j.stopUnconfirmed ? 'stop_unconfirmed' : 'unknown', parent_local_status: j.status, delegated_stop: 'unknown' };
       write(file, JSON.stringify(j, null, 1));
     } else write(file, JSON.stringify(j, null, 2));
-    require('./notify').transition(who === 'codex' ? 'Codex' : 'Antigravity', before, j);
+    require('./notify').transition(require('./members').names[who] || who, before, j);
     return j;
   } finally { await l.release(); }
 }

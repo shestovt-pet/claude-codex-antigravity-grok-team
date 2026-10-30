@@ -24,6 +24,15 @@ const HOUR = 3600000, WHO = ['codex', 'antigravity', 'grok'], NAMES = { codex: '
 const two = n => String(n).padStart(2, '0');
 const local = ms => { const d = new Date(ms); return two(d.getHours()) + ':' + two(d.getMinutes()) + ' ' + two(d.getDate()) + '.' + two(d.getMonth() + 1); };
 
+// Старый журнал Grok остаётся читаемым; новые слова о нём через API запрещены.
+function historicalGrok(quote) {
+  const words = lib('user-word');
+  const record = { id: 'word-' + crypto.randomUUID(), at: new Date().toISOString(), who_down: 'grok', quote, source: 'chat-claude', recorded_by: 'claude' };
+  fs.mkdirSync(path.dirname(words.file()), { recursive: true });
+  fs.appendFileSync(words.file(), JSON.stringify(record) + '\n');
+  return { record, text: words.line(record) };
+}
+
 // Успешное поручение участника: завершено с проверенным ответом (Grok — подписанным).
 function success(who, finishedAt, patch = {}) {
   const roots = lib('team-store').roots(), id = who + '-ok-' + crypto.randomUUID().slice(0, 8);
@@ -86,35 +95,47 @@ test('22: поля team_word проходят MCP-схему; запись ви�
     const tool = (await s.client.listTools()).tools.find(t => t.name === 'team_word');
     assert(tool, 'инструмент есть у клиента claude');
     // team-v19 К2: схема расширена словом о Claude (who_down=claude; return, handover, rebind); слово о себе Claude отклоняет сервер.
-    assert.deepEqual(tool.inputSchema.properties.action.enum, ['record', 'list', 'return', 'handover', 'rebind']);
-    assert.deepEqual(tool.inputSchema.properties.who_down.enum, ['codex', 'antigravity', 'grok', 'claude']);
+    assert.deepEqual(tool.inputSchema.properties.action.enum, ['record', 'list', 'return', 'handover', 'rebind', 'stop_confirm', 'close']);
+    assert.equal(tool.inputSchema.properties.job_ids.type, 'array');
+    assert.equal(tool.inputSchema.properties.job_ids.minItems, 1);
+    assert.equal(tool.inputSchema.properties.job_ids.items.minLength, 8);
+    // Схема перечисляет ровно действующих голосующих и запасных дирижёров; Grok — только история.
+    const wordWho = [...new Set([...require('../common/members').seatIds, ...require('../common/members').fallbackIds]), 'grok', 'claude'];
+    assert.deepEqual(tool.inputSchema.properties.who_down.enum, wordWho);
+    const unknown = await s.call('team_word', { action: 'record', who_down: 'nonexistent', quote: 'x' }).catch(e => ({ error: true, text: e.message }));
+    assert(unknown.error, 'неизвестный участник отклонён схемой'); assert.match(unknown.text, /who_down|Invalid enum|Invalid option/);
     assert(tool.inputSchema.properties.quote);
     const change = (await s.client.listTools()).tools.find(t => t.name === 'team_change').inputSchema.properties;
-    assert(change.action.enum.includes('grok_slot')); assert.deepEqual(change.slot.enum, ['codex', 'antigravity']); assert.deepEqual(change.phase.enum, ['design', 'verdict']);
+    assert(change.action.enum.includes('grok_slot')); assert.deepEqual(change.slot.enum, [...require('../common/members').seatIds]);
+    const badSlot = await s.call('team_change', { action: 'grok_slot', slot: 'nonexistent', phase: 'design' }).catch(e => ({ error: true, text: e.message }));
+    assert(badSlot.error, 'неизвестное место отклонено схемой'); assert.match(badSlot.text, /slot|Invalid enum|Invalid option/);
+    assert.deepEqual(change.phase.enum, ['design', 'verdict']);
     const bad = await s.call('team_word', { action: 'record', who_down: 'claude', quote: 'x' }).catch(e => ({ error: true, text: e.message }));
     assert(bad.error, 'слово о Claude из чата Claude — отказ'); assert.match(bad.text, /О себе Claude слово не записывает/);
     const r = await s.call('team_word', { action: 'record', who_down: 'codex', quote: 'кодекс лёг, работаем без него' });
     assert(!r.error, r.text); assert.match(r.text, /Записал: „кодекс лёг, работаем без него“ — недоступен Codex/);
     const both = await Promise.all([s.call('team_word', { action: 'record', who_down: 'antigravity', quote: 'гемини отвалился' }),
-      s.call('team_word', { action: 'record', who_down: 'grok', quote: 'грок не отвечает' })]);
+      s.call('team_word', { action: 'record', who_down: 'codex', quote: 'кодекс не отвечает' })]);
     assert(both.every(x => !x.error), both.map(x => x.text).join('\n'));
   } finally { await s.close(); }
-  await Promise.all([lib('user-word').record({ who_down: 'codex', quote: 'одновременно 1' }), lib('user-word').record({ who_down: 'codex', quote: 'одновременно 2' })]);
+  await Promise.all([lib('user-word').record({ who_down: 'codex', quote: 'одновременно 1' }), lib('user-word').record({ who_down: 'antigravity', quote: 'одновременно 2' })]);
   const lines = fs.readFileSync(lib('user-word').file(), 'utf8').trim().split('\n');
   assert.equal(lines.length, 5); lines.forEach(l => JSON.parse(l));
   assert.equal(new Set(lines.map(l => JSON.parse(l).id)).size, 5);
   s = await mcp('claude');
   try {
     const list = await s.call('team_word', { action: 'list' });
-    for (const q of ['кодекс лёг, работаем без него', 'гемини отвалился', 'грок не отвечает', 'одновременно 1', 'одновременно 2']) assert(list.text.includes('„' + q + '“'), q);
+    for (const q of ['кодекс лёг, работаем без него', 'гемини отвалился', 'кодекс не отвечает', 'одновременно 1', 'одновременно 2']) assert(list.text.includes('„' + q + '“'), q);
   } finally { await s.close(); }
 });
 
 for (const who of WHO) test('23, К1, В5 ' + NAMES[who] + ': строка записи называет выпавшего и местное время; слово действует до успешного ответа, но не дольше суток', async () => {
   const words = lib('user-word');
-  const { record, text } = await words.record({ who_down: who, quote: 'ну всё, ' + who + ' умер' });
+  if (who === 'grok') await assert.rejects(words.record({ who_down: who, quote: 'ну всё, grok умер' }), /who_down/);
+  const { record, text } = who === 'grok' ? historicalGrok('ну всё, grok умер') : await words.record({ who_down: who, quote: 'ну всё, ' + who + ' умер' });
   assert.equal(text, 'Записал: „ну всё, ' + who + ' умер“ — недоступен ' + NAMES[who] + ' до первого его успешного ответа, но не дольше суток (до ' + local(Date.parse(record.at) + 24 * HOUR) + ')');
-  assert.equal(record.source, 'chat-claude'); assert.equal(record.recorded_by, 'claude'); assert(/^word-/.test(record.id));
+  if (who === 'grok') assert(words.read().some(r => r.id === record.id), 'историческая запись Grok читается');
+  else { assert.equal(record.source, 'chat-claude'); assert.equal(record.recorded_by, 'claude'); assert(/^word-/.test(record.id)); }
   assert.equal(words.active(who, Date.now()).id, record.id);
   for (const other of WHO.filter(w => w !== who)) assert.equal(words.active(other, Date.now()), null);
   // Не дольше суток (до успешных ответов, чтобы проверить именно срок).
@@ -133,11 +154,11 @@ for (const who of WHO) test('23, К1, В5 ' + NAMES[who] + ': строка за�
   assert.equal(words.active(who, after + 600), null);
   assert.equal(words.success(who, Date.parse(record.at), after + 600).id, ok);
   // Повтор слова — новая запись.
-  const again = (await words.record({ who_down: who, quote: 'снова лёг' })).record;
+  const again = (who === 'grok' ? historicalGrok('снова лёг') : await words.record({ who_down: who, quote: 'снова лёг' })).record;
   assert.notEqual(again.id, record.id); assert.equal(words.read().length, 2);
   assert.equal(words.active(who, Date.now() + 10).id, again.id);
   assert(!Object.keys(words).some(k => /update|delete|remove|edit/i.test(k)), 'правки и удаления записей нет');
-  await assert.rejects(words.record({ who_down: who, quote: '   ' }), /дословно/);
+  await assert.rejects(words.record({ who_down: who, quote: '   ' }), who === 'grok' ? /who_down/ : /дословно/);
   await assert.rejects(words.record({ who_down: 'claude', quote: 'Claude отвалился' }), /who_down/);
 });
 
@@ -153,11 +174,11 @@ test('Antigravity mv5y4jpo п. 1: один журнал слов — запис�
 });
 
 test('Antigravity mv5y4jpo п. 2: время для holds/active — число, ISO-строка или Date', async () => {
-  const words = lib('user-word'), r = (await words.record({ who_down: 'grok', quote: 'грок отвалился' })).record;
+  const words = lib('user-word'), r = (await words.record({ who_down: 'codex', quote: 'кодекс отвалился' })).record;
   const later = Date.parse(r.at) + 1000;
   for (const at of [later, new Date(later).toISOString(), new Date(later)]) {
     assert.equal(words.holds(r, at), true, String(at));
-    assert.equal(words.active('grok', at).id, r.id, String(at));
+    assert.equal(words.active('codex', at).id, r.id, String(at));
   }
   assert.equal(words.holds(r, 'не время'), false);
 });
@@ -167,7 +188,7 @@ test('22: повреждённая строка журнала пропуска�
   await words.record({ who_down: 'codex', quote: 'первое' });
   fs.appendFileSync(words.file(), '{"id":"обрыв');
   fs.appendFileSync(words.file(), '\n');
-  await words.record({ who_down: 'grok', quote: 'второе' });
+  await words.record({ who_down: 'antigravity', quote: 'второе' });
   assert.deepEqual(words.read().map(r => r.quote), ['первое', 'второе']);
 });
 
@@ -178,7 +199,7 @@ test('18: Grok выпал при настроенном мосте — unavailab
   await assert.rejects(gate.record(c, 'design', { unavailable: true }), /Мост настроен/);
   await lib('user-word').record({ who_down: 'codex', quote: 'Codex отвалился' });
   await assert.rejects(gate.record(c, 'design', { unavailable: true }), /Мост настроен/, 'слово о другом участнике не годится');
-  const w = (await lib('user-word').record({ who_down: 'grok', quote: 'Грок отвалился' })).record;
+  const w = historicalGrok('Грок отвалился').record;
   assert.match(await gate.record(c, 'verdict', { unavailable: true }), /недоступен/);
   assert.equal(c.grokVerdict.status, 'недоступен'); assert.equal(c.grokVerdict.word_id, w.id);
   success('grok', Date.now() + 1000);
@@ -195,7 +216,8 @@ test('18: team_change отклоняет Grok даже при записанно
   const team = new Team(root);
   await team.change({ action: 'start', name: 'ch', request: 'Запрос пользователя для проверки слова Grok.', design_file: design });
   await assert.rejects(team.change({ action: 'design', name: 'ch', who: 'grok', unavailable: true }), /Grok выключен из связки/);
-  assert.match(await team.word({ action: 'record', who_down: 'grok', quote: 'Grok отвалился' }), /недоступен Grok/);
+  await assert.rejects(team.word({ action: 'record', who_down: 'grok', quote: 'Grok отвалился' }), /who_down/);
+  assert.match(historicalGrok('Grok отвалился').text, /недоступен Grok/);
   const before = read(team.changeFile('ch'));
   await assert.rejects(team.change({ action: 'design', name: 'ch', who: 'grok', unavailable: true }), /Grok выключен из связки/);
   assert.deepEqual(read(team.changeFile('ch')), before);
@@ -204,7 +226,7 @@ test('18: team_change отклоняет Grok даже при записанно
 test('24: добавленные предложения п. 5 и п. 8 «Кто принимает итог» одинаковы в common.md и helpers', async () => {
   const common = rules('rules/common.md'), helpers = rules('skill/helpers/SKILL.md');
   const t5 = 'Доказательство и без поручения — слово пользователя «X отвалился»: его собственная реплика в чате Claude; Claude записывает её дословно через `team_word` и показывает ему строку записи. Слово действует до первого успешного ответа выпавшего, но не дольше 24 часов; после — доказательство по поручению, как выше, без нового слова. Слово не отменяет отказ, поданный до него, и не заменяет поручение на пересмотр после отклонённого замечания.';
-  const t6 = 'Codex и Antigravity обязательны; недоступен один — изменение ждёт. Решение о слиянии принимает Claude. Решение пользователя проверку не заменяет.';
+  const t6 = 'обязательны голосующие помощники из team_status; недоступен один — изменение ждёт. Решение о слиянии принимает Claude. Решение пользователя проверку не заменяет.';
   for (const text of [common, helpers]) {
     assert.equal(item(text, 'Кто принимает итог', 5).split(t5).length - 1, 1);
     assert.equal(item(text, 'Кто принимает итог', 8).split(t6).length - 1, 1);
@@ -223,17 +245,17 @@ test('25: противоречащих фраз нет в rules/ и skill/; «ж
       assert(text.slice(m.index, m.index + 200).split('\n')[0].includes('кроме слова пользователя «Antigravity отвалился»'), file + ': «ждёт свою» без исключения');
   }
   const common = rules('rules/common.md'), claude = rules('rules/claude.md'), grok = rules('rules/grok.md');
-  assert(common.includes('- **Недоступность**: в team_change Codex и Antigravity обязательны; недоступен один — изменение ждёт.'));
-  assert(common.includes('6. `team_change merge`: ПРИНЯТО Codex и Antigravity; решение Claude.'));
+  assert(common.includes('- **Недоступность**: в team_change обязательны голосующие помощники из team_status; недоступен один — изменение ждёт.'));
+  assert(common.includes('6. `team_change merge`: ПРИНЯТО голосующих помощников из team_status; вердикт Claude необязателен (решение пользователя 26.10), записанное им НЕ ПРИНЯТО останавливает слияние.'));
   for (const text of [common, claude, grok]) assert(!text.includes('Grok на место выпавшего'));
   assert.equal(grok.trim(), 'Grok выключен из связки 13.10.2026 словом пользователя');
   assert(claude.includes('Слово пользователя «X отвалился»') && claude.includes('сразу `team_word`'));
   assert(common.includes('Решение пользователя, затрагивающее несколько скиллов, — по клику на каждую карточку.'));
   assert(rules('rules/antigravity.md').includes('сверяет Codex, не пользователь') && rules('rules/antigravity.md').includes('перед переносом — копия файла'));
   const brief = rules('rules/brief.md');
-  assert(brief.includes('в team_change Codex и Antigravity обязательны.'));
+  assert(brief.includes('в team_change обязательны голосующие помощники из team_status.'));
   for (const f of ['rules/helpers/codex-section.md', 'rules/helpers/antigravity-section.md']) {
-    assert(rules(f).includes('Обязательные проверяющие — Codex и Antigravity (team_change)'));
+    assert(rules(f).includes('Обязательные проверяющие — голосующие помощники из team_status (team_change)'));
     assert(!rules(f).includes('Grok — поиск'));
   }
   // Т8 во всех копиях: «только Antigravity» для литературного текста — с исключением по слову пользователя (Codex 603f2827 п. 4).

@@ -16,7 +16,7 @@ const norm = (p) => path.resolve(p).replace(/\\/g, '/').replace(/\/+$/, '').toLo
 function windowsProcesses() {
   const ps = '$ErrorActionPreference = \'Stop\'; Get-CimInstance Win32_Process | Select-Object ProcessId,SessionId,ExecutablePath,CommandLine | ConvertTo-Json -Compress';
   const out = require('child_process').execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps],
-    { encoding: 'utf8', windowsHide: true, timeout: 60000 }).trim();
+    { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 }).trim();
   if (!out) throw Error('Список процессов не прочитан: пустой ответ.');
   return [].concat(JSON.parse(out)).map((p) => ({ pid: p.ProcessId, sessionId: p.SessionId, exe: p.ExecutablePath || null, cmd: p.CommandLine || null }));
 }
@@ -53,15 +53,14 @@ function defaults(root, apply) {
 
 const age = (d, p) => d.now - fs.lstatSync(p).mtimeMs;
 // Живые поручения Codex и Antigravity, чья папка внутри клона, даже без связи с работой (team-v10, случай Codex 39).
-const LIVE = ['running', 'queued', 'waiting_quota', 'delivery_unclear', 'cancelling', 'stop_unconfirmed', 'migration_conflict'];
 function liveJobsInFolder(folder) {
   const stores = require('./team-store'), inside = p => { try { return refersTo(p, folder); } catch { return true; } };
   const found = [];
   // Все помощники; папка есть в карточках Codex (folder) и Antigravity (papka), у Grok её нет.
-  for (const who of require('./members').helpers) {
+  for (const who of require('./members').scanIds) {
     const { jobs, errors } = stores.list(who, false);
     if (errors.length) throw Error('поручения не прочитаны: ' + errors[0]);
-    for (const j of jobs) if (LIVE.includes(j.status) && [j.folder, j.papka].some((f) => f && inside(f))) found.push(who + ' ' + j.id);
+    for (const j of jobs) if (require('./live-jobs').holdsFolder(j, who) && [j.folder, j.papka].some((f) => f && inside(f))) found.push(who + ' ' + j.id);
   }
   return found;
 }

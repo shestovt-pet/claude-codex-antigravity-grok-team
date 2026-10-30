@@ -4,6 +4,7 @@ const fx = require('./team-v16-fixture');
 const { fixture, job, fresh, accept, gate, stores, write, json, project, root, RUN, run } = fx;
 const tests = [], test = (n, f) => tests.push([n, f]);
 const members = require('../common/members'), cc = require('../common/client-configs'), deploy = require('../common/deploy');
+const { serverReady } = require('./runner-support');
 const release = path.join(root, 'live', 'a'.repeat(40)), state = path.join(root, 'state');
 const oldGrok = { command: 'node', args: [path.join(release, 'servers/grok/index.js')], env: { MOST_REPO_ROOT: root } };
 test('О1: подключения, разрешения, сравнение и повтор установки', () => {
@@ -162,7 +163,7 @@ test('О12: настоящие обработчики team_status и team_rules 
       const reply = await client.callTool({ name, arguments: { ...(owner ? { owner } : {}), ...(name === 'team_rules' ? { part: 'brief' } : {}) } });
       assert(!reply.isError, JSON.stringify(reply));
       const text = reply.content.map(c => c.text || '').join('\n');
-      assert.equal(text.includes('⚠ Статус пользователю не отправлялся'), owner === 'ours');
+      assert.equal(text.includes('⚠ Статус пользователю не отправлялся'), owner === 'ours' && name === 'team_status'); // team-v44 П3: напоминание только в team_status/team_work
     }
   } finally { await client.close(); await transport.close(); }
 });
@@ -287,8 +288,9 @@ test('О11: model/effort в новом запуске, продолжении, �
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js'), { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
   const jobs = path.join(RUN, 'model-jobs'), log = path.join(RUN, 'models.jsonl'); fs.mkdirSync(jobs);
   const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(__dirname, '../servers/codex/index.js')], stderr: 'pipe',
-    env: { ...process.env, MOST_CLIENT: 'claude', MOST_JOB_ID: '', MOST_CODEX_JOBS_DIR: jobs, MOST_QUEUE_TICK_MS: '50', CODEX_PATH: path.join(__dirname, 'fake-codex.js'), FAKE_CODEX_LOG: log } });
+    env: { ...process.env, NODE_ENV: 'test', MOST_CLIENT: 'claude', MOST_JOB_ID: '', MOST_CODEX_JOBS_DIR: jobs, MOST_QUEUE_TICK_MS: '50', CODEX_PATH: path.join(__dirname, 'fake-codex.js'), FAKE_CODEX_LOG: log } });
   const client = new Client({ name: 'v23-models', version: '1' }); await client.connect(transport);
+  await serverReady(state, transport.pid);
   const call = a => client.callTool({ name: 'codex_send', arguments: { folder: project, task: 'Проба', ...a } });
   const readJob = id => JSON.parse(fs.readFileSync(path.join(jobs, id + '.json')));
   const send = async a => { const r = await call(a); assert(!r.isError, JSON.stringify(r)); const text = r.content.map(c => c.text).join('\n'), id = text.match(/Номер поручения: (\S+)/)[1]; return { id, text }; };

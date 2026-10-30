@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 // team-v10: разделы замысла (Р1–Р2), возврат клона на ветку (Р3), уборка после установки (Р5), доп. защита уборки.
 const fs = require('fs'), path = require('path'), assert = require('assert');
 const ROOT = path.resolve(__dirname, '..'), RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v10-'));
@@ -167,8 +171,15 @@ test('Р5: контекст операции — чужой корень, нет
 test('Р5: отключение уборки доходит до карточки операции; испорченная карточка — без уборки', async () => {
   const root = path.join(RUN, 'p5off'); fs.mkdirSync(path.join(root, 'state'), { recursive: true });
   write(path.join(root, 'live/rel/common/path-compat.js'), '// team-v21 fixture');
-  let t = 0; const out = await ops.start({ root, release: path.join(root, 'live', 'rel'), configs: [], restartClaude: false, cleanup: false },
-    { launch: async () => 4242, alive: () => true, now: () => (t += 400000), sleep: async () => {} });
+  let t = 0, out;
+  const savedStateDir = process.env.MOST_STATE_DIR;
+  try {
+    process.env.MOST_STATE_DIR = path.join(root, 'state');
+    out = await ops.start({ root, release: path.join(root, 'live', 'rel'), configs: [], restartClaude: false, cleanup: false },
+      { launch: async () => 4242, alive: () => true, now: () => (t += 400000), sleep: async () => {} });
+  } finally {
+    if (savedStateDir === undefined) delete process.env.MOST_STATE_DIR; else process.env.MOST_STATE_DIR = savedStateDir;
+  }
   assert.match(out, /не подтверждён/);
   const card = fs.readdirSync(path.join(root, 'state', 'deploy-ops')).find(n => n.endsWith('.json') && !n.endsWith('.pid.json'));
   assert.equal(readJson(path.join(root, 'state', 'deploy-ops', card)).noCleanup, true);
@@ -291,7 +302,7 @@ test('Р1/Р4: правила живой проверки, опасных слу
   assert.match(text('rules/grok.md'), /Grok выключен из связки/);
   assert.match(text('rules/grok.md'), /Grok выключен из связки/);
   assert.match(text('rules/common.md'), /ничего не переключают/); assert.match(text('rules/roles.md'), /полный прогон тестов Windows делает Codex/);
-  assert.match(text('tests/run.js'), /MOST_AFTER_DEPLOY = 'off'/); assert.match(text('tests/run.js'), /'team-v10\.js'/);
+  assert.match(text('tests/runner-support.js'), /MOST_AFTER_DEPLOY: 'off'/); assert.match(text('tests/run.js'), /'team-v10\.js'/);
 });
 (async () => {
   console.log('team-v10: ' + process.platform + ' ' + process.version + '; ' + RUN);

@@ -659,7 +659,7 @@ async function loadService() {
   const names = Object.keys(servers);
   box.innerHTML = names.map((n) => {
     const s = servers[n] || {};
-    const label = n === "antigravity" ? "Антигравити" : n === "codex" ? "Кодекс" : n === "grok" ? "Грок" : n === "team" ? "Команда" : n;
+    const label = s.title || (n === "team" ? "Команда" : n);
     const st = s.alive ? "на связи" : (s.present ? "не отвечает" : "нет данных");
     return "<div class=\"card\"><strong>" + escapeHtml(label) + "</strong><div class=\"muted\">" + escapeHtml(st) + "</div></div>";
   }).join("") || "<p class=\"muted\">Нет данных о каналах.</p>";
@@ -705,7 +705,7 @@ async function createNewChat() {
   first = String(first).trim();
   if (first.length < 3) first = "Новый разговор";
   try {
-    const who = ($("composeWho") && $("composeWho").value) || "grok";
+    const who = composeWhoValue();
     const r = await api("POST", "/api/intents", { work: state.projectId, who, task: first });
     const id = r && r.intent && r.intent.id;
     await loadTree();
@@ -723,7 +723,7 @@ async function createNewChat() {
 }
 
 async function composeDraft() {
-  const who = $("composeWho").value;
+  const who = composeWhoValue();
   const task = ($("composeText").value || "").trim();
   const meta = $("composeMeta");
   if (!state.projectId) { meta.textContent = "Сначала выберите дело в дереве."; return; }
@@ -744,7 +744,7 @@ async function followupDraft() {
   const task = ($("followupText").value || "").trim();
   const meta = $("followupMeta");
   const work = state.projectId;
-  const who = (state.chat && state.chat.agent) || "grok";
+  const who = (state.chat && state.chat.agent) || composeWhoValue();
   if (!work || !task) { meta.textContent = "Нужен текст."; return; }
   meta.textContent = "Сохраняю…";
   const r = await api("POST", "/api/intents", { work, who, task });
@@ -898,8 +898,21 @@ function wire() {
   };
 }
 
+function composeWhoValue() {
+  const el = $("composeWho");
+  if (!el) return "";
+  if (el.value) return el.value;
+  return el.options && el.options.length ? el.options[0].value : "";
+}
+
 async function boot() {
+  let members = [];
+  // Экран обязан открыться, даже если список участников не пришёл.
+  try { members = await api("GET", "/api/members"); } catch (e) { members = []; }
+  $("composeWho").innerHTML = members.filter(m => m.receives).map(m => '<option value="' + escapeHtml(m.id) + '">' + escapeHtml(m.title) + '</option>').join('');
   restoreUi();
+  const sel = $("composeWho");
+  if (sel && sel.options.length && !sel.value) sel.selectedIndex = 0;
   wire();
   /* hour11 boot drawer */
   if (isNarrow()) openTreeDrawer();

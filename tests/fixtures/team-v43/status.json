@@ -1,0 +1,11 @@
+{
+  "now": "2026-10-25T20:00:00.000Z",
+  "change": {"name":"fixture-change","title":"Проверка установки","status":"на ревью","candidate":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "work": {"name":"fixture-work","title":"Проверка результата","status":"идёт","next_step":"Проверить результат","stages":[{"id":"check","title":"Проверка","state":"идёт","weight":1}]},
+  "jobs": {
+    "codex": [{"id":"fixture-codex","status":"needs_decision","task":"Проверить код","startedAt":"2026-10-25T19:00:00.000Z","owner":{"pid":2147483000,"instance":"fixture-codex"}}],
+    "antigravity": [{"id":"fixture-agy","status":"needs_decision","task":"Проверить текст","startedAt":"2026-10-25T19:00:00.000Z","owner":{"pid":2147483000,"instance":"fixture-agy"}}],
+    "deepseek": [{"id":"fixture-deepseek","status":"needs_decision","task":"Проверить материалы","startedAt":"2026-10-25T19:00:00.000Z","owner":{"pid":2147483000,"instance":"fixture-deepseek"}}],
+    "grok": []
+  }
+}

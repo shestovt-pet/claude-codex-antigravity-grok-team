@@ -60,7 +60,7 @@ function reminder(root = repoRoot, now = Date.now(), scope = require('./request-
 
 async function reconcileJobs(workName) {
   const stores = require('./team-store'), locks = require('./locks');
-  for (const who of ['codex', 'antigravity']) {
+  for (const who of require('./members').helpers) {
     const { jobs, errors } = stores.list(who, false);
     if (errors.length) throw Error('Нельзя проверить поручения работы: ' + errors.join('; '));
     for (const job of jobs) {
@@ -72,8 +72,10 @@ async function reconcileJobs(workName) {
         const card = JSON.parse(fs.readFileSync(job.cardFile, 'utf8'));
         if (!['running', 'cancelling', 'stop_unconfirmed'].includes(card.status) ||
             await locks.ownerState(card.owner) !== 'dead') continue;
-        card.status = 'lost';
-        card.error = 'Владелец завершился. Поручение потеряно; проверьте частичный результат.';
+        card.status = require('./live-jobs').effectiveStatus(card, 'dead');
+        card.error = card.status === 'needs_decision'
+          ? 'Владелец завершился. Нужно решение по частичным изменениям.'
+          : 'Владелец завершился. Поручение потеряно; проверьте частичный результат.';
         card.finishedAt = new Date().toISOString();
         atomic(job.cardFile, JSON.stringify(card, null, 2));
       } finally { await lock.release(); }
@@ -83,12 +85,11 @@ async function reconcileJobs(workName) {
 
 function hasLiveJobs(workName) {
   const stores = require('./team-store');
-  for (const who of require('./members').helpers) {
+  for (const who of require('./members').scanIds) {
     const { jobs, errors } = stores.list(who, false);
     if (errors.length) throw Error('Нельзя проверить поручения работы: ' + errors.join('; '));
     if (jobs.some(j => (j.workName || j.work) === workName &&
-      ['running', 'queued', 'waiting_quota', 'delivery_unclear', 'cancelling',
-        'stop_unconfirmed', 'migration_conflict'].includes(j.status))) return true;
+      require('./live-jobs').holdsFolder(j, who))) return true;
   }
   return false;
 }

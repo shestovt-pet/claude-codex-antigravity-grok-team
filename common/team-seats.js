@@ -4,8 +4,10 @@
 // или «ПРИНЯТО» Grok на месте выпавшего — только по поручению grok_slot. «РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ» — пометка в истории.
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const words = require('./user-word'), stores = require('./team-store');
-const SEATS = ['codex', 'antigravity'];
-const NAMES = { codex: 'Codex', antigravity: 'Antigravity', grok: 'Grok' };
+const SEATS = require('./members').dynamic(() => {
+  return require('./members').requiredVoters().map(m => m.id);
+}, true);
+const NAMES = require('./members').names;
 const TEN_MIN = 600000;
 const PENDING = ['queued', 'waiting_quota', 'running', 'cancelling', 'stop_unconfirmed'];
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');
@@ -33,9 +35,22 @@ function seat(c, who, phase, candidate = c.candidate) {
   // Отказ Grok на месте выпавшего снимает только новая редакция: ни «Отклонено:», ни позднее «ПРИНЯТО» вернувшегося.
   const grokNo = grok.find(v => v.decision === 'НЕ ПРИНЯТО');
   if (grokNo) return { ...base, blocked: true, by: 'grok', record: grokNo, reason: 'НЕ ПРИНЯТО Grok на месте ' + NAMES[who] + ' (' + grokNo.job_id + ') — снимает только новая редакция' };
-  // Собственный отказ снимает своё позднее «ПРИНЯТО» или замена Claude после двух отказов; «ПРИНЯТО» Grok — нет.
-  if (lastOwn?.decision === 'НЕ ПРИНЯТО' && !claude.some(v => recs.indexOf(v) > recs.indexOf(lastOwn)))
+  // Собственный отказ снимает своё позднее «ПРИНЯТО», замена Claude после двух отказов или
+  // reconsider_by_other: отклонение дирижёром с причиной + «ПРИНЯТО» другой активной семьи на ту же пару.
+  if (lastOwn?.decision === 'НЕ ПРИНЯТО' && !claude.some(v => recs.indexOf(v) > recs.indexOf(lastOwn))) {
+    const fam = id => require('./members').familyOf(id);
+    const rbo = (c.decisions || []).map(d => (d.kind === 'reconsider_by_other' && d.job_id === lastOwn.job_id && d.reason?.trim()) ? d : null).filter(Boolean)
+      .map(d => {
+        const conf = recs.find(v => v.job_id === d.review_job_id && v.who !== who && v.decision === 'ПРИНЯТО' && recs.indexOf(v) > recs.indexOf(lastOwn));
+        if (!conf || !SEATS.includes(conf.who) || fam(conf.who) === fam(who)) return null;
+        if (recs.some(v => v.who === conf.who && v.decision === 'НЕ ПРИНЯТО' && recs.indexOf(v) > recs.indexOf(conf))) return null;
+        const job = reviewJobs(c, conf.who, b).find(j => j.id === conf.job_id);
+        if (!job || !taskText(job).includes(lastOwn.job_id) || !taskText(job).includes(d.reason)) return null;
+        return conf;
+      }).find(Boolean);
+    if (rbo) return { ...base, closed: true, by: 'other', record: rbo };
     return { ...base, blocked: true, by: 'own', record: lastOwn, reason: 'НЕ ПРИНЯТО ' + NAMES[who] + (lastOwn.job_id ? ' (' + lastOwn.job_id + ')' : '') };
+  }
   if (lastOwn?.decision === 'ПРИНЯТО') return { ...base, closed: true, by: 'own', record: lastOwn };
   if (claude.length) return { ...base, closed: true, by: 'claude', record: claude.at(-1) };
   const yes = grok.find(v => v.decision === 'ПРИНЯТО');
@@ -44,7 +59,7 @@ function seat(c, who, phase, candidate = c.candidate) {
 }
 
 // Кто недоступен по действующему слову; при двух выпавших проверить вместо них некому.
-function down(now = Date.now()) { return require('./members').helpers.filter(w => words.active(w, now)); }
+function down(now = Date.now()) { return require('./members').seatIds.filter(w => words.active(w, now)); }
 function waitReason(c, who) { return down().includes(who) ? 'Изменение ждёт: недоступен ' + NAMES[who] : null; }
 function seatError(c, who, phase, candidate) {
   const st = seat(c, who, phase, candidate);
@@ -62,7 +77,13 @@ function reviewJobs(c, who, b) {
   return stores.list(who, false).jobs.filter(j => {
     const task = taskText(j);
     if (!c.requestMark || !task.includes(c.requestMark)) return false;
-    if (who === 'codex' ? (j.write || j.previous) : !['review', 'zamechaniya'].includes(j.mode || j.rezhim)) return false;
+    const adapter = require('./members').adapterOf(who);
+    if (adapter === 'codex-cli' && (j.write || j.previous)) return false;
+    if (adapter === 'agy-cli' && !['review', 'zamechaniya'].includes(j.mode || j.rezhim)) return false;
+    if (adapter === 'dsh-headless' && (j.write || j.previous || j.role !== 'проверка' || j.profile !== 'most-review' || !j.modelConfirmed ||
+      require('./model-family').family(j.reportedModel) !== 'deepseek' || !require('./dsh-probe').ok() ||
+      !j.dshVersion || j.dshVersion !== require('./dsh-probe').version())) return false;
+    if (!['codex-cli', 'agy-cli', 'dsh-headless'].includes(adapter)) return false;
     if (!b) return true;
     return b.designHash ? hashIn(task, b.designHash, true) : hashIn(task, b.base) && hashIn(task, b.candidate);
   }).sort((x, y) => Date.parse(x.startedAt) - Date.parse(y.startedAt));
@@ -74,7 +95,7 @@ const lastLine = text => (text.trim().split(/\r?\n/).at(-1) || '').trim().replac
 function answerText(who, j) {
   const dir = stores.roots()[who];
   try {
-    if (who === 'antigravity') {
+    if (who === 'antigravity' || require('./members').adapterOf(who) === 'agy-cli') {
       const folder = path.dirname(j.cardFile), text = fs.readFileSync(path.join(folder, 'result.txt'), 'utf8');
       const meta = path.join(folder, 'meta.json');
       if (fs.existsSync(meta) && JSON.parse(fs.readFileSync(meta, 'utf8')).hash !== sha(text)) return null;
@@ -102,6 +123,21 @@ function storeRefusal(c, who, phase, candidate = c.candidate) {
     if (text && refusal(lastLine(text))) return j;
   }
   return null;
+}
+// Все отказы участника по этой редакции в хранилище (как storeRefusal, но списком): для приостановленного участника
+// в merge — незаписанный и не закрытый пересмотром отказ держит слияние, в том числе ответ отменённого или упавшего поручения.
+function storeRefusals(c, who, phase, candidate = c.candidate) {
+  const b = binding(c, phase, candidate), out = [];
+  for (const j of reviewJobs(c, who, b)) {
+    if (j.status === 'done') {
+      try { stores.review(who, j.id, phase === 'design' ? null : c.base, phase === 'design' ? null : candidate, 'НЕ ПРИНЯТО', c.requestMark, phase === 'design' ? c.designHash : null); out.push(j); } catch {}
+      continue;
+    }
+    if (['queued', 'waiting_quota', 'running'].includes(j.status)) continue;
+    const text = answerText(who, j);
+    if (text && refusal(lastLine(text))) out.push(j);
+  }
+  return out;
 }
 // Поручения grok_slot этой редакции, ещё не в конечном состоянии (lost — конечное): пока Grok на месте читает, слияния нет.
 function slotPending() { return []; }
@@ -207,4 +243,4 @@ function grokSlotVote(c, phase, candidate = c.candidate) {
 }
 
 module.exports = { SEATS, NAMES, TEN_MIN, PENDING, binding, bound, records, slots, grokSeat, seat, down, waitReason, seatError,
-  reviewJobs, storeRefusal, slotPending, slotRefusals, basis, basisAtCreation, headings, uncovered, materialText, slotTask, verifySlot, grokSlotVote, hashIn, sha };
+  reviewJobs, storeRefusal, storeRefusals, slotPending, slotRefusals, basis, basisAtCreation, headings, uncovered, materialText, slotTask, verifySlot, grokSlotVote, hashIn, sha };

@@ -5,8 +5,8 @@ const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const { stateDir } = require('./paths');
 const locks = require('./locks');
 const DAY = 24 * 3600000;
-const WHO = ['codex', 'antigravity', 'grok'];
-const NAMES = { codex: 'Codex', antigravity: 'Antigravity', grok: 'Grok', claude: 'Claude' };
+const WHO = require('./members').dynamic(() => [...new Set([...require('./members').seatIds, ...require('./members').fallbackIds])], true);
+const NAMES = require('./members').names;
 const KINDS = ['record', 'return', 'handover', 'conductor'];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // Один источник пути журнала для записи и чтения во всех местах (team_word, ворота этапа, workflow, team_change):
@@ -30,7 +30,8 @@ function lines() {
 }
 // Слова о помощниках (правила team-v18).
 function read() {
-  return lines().filter(r => WHO.includes(r.who_down) && (r.kind === undefined || r.kind === 'record') && typeof r.quote === 'string' && r.quote.trim());
+  const historical = new Set([...require('./members').all().map(m => m.id), 'grok']);
+  return lines().filter(r => r.who_down !== 'claude' && historical.has(r.who_down) && (r.kind === undefined || r.kind === 'record') && typeof r.quote === 'string' && r.quote.trim());
 }
 // Записи о Claude: слово, возврат, остановка дирижёра, смена дирижёра.
 function claudeEntries() {
@@ -124,7 +125,8 @@ function line(r) {
 function entry(a) {
   require('./access').guard('team', 'team_word', { ...a, action: 'record' });
   if (require('./access').guest() && !require('./fallback').helperAllowed(a)) throw Error('Гостю это действие запрещено: слово о помощнике записывает чат Claude; в запасном режиме — дирижёр.');
-  if (!WHO.includes(a.who_down)) throw Error('who_down: codex, antigravity или grok.');
+  if (a.who_down !== 'grok') require('./members').assertAvailable(a.who_down);
+  if (!WHO.includes(a.who_down)) throw Error('who_down: нужен голосующий помощник или запасной дирижёр из team_status.');
   if (typeof a.quote !== 'string' || !a.quote.trim()) throw Error('Нужно слово пользователя дословно (quote).');
   const client = require('./access').client();
   return { who_down: a.who_down, quote: a.quote, source: 'chat-' + (require('./access').guest() ? client : 'claude'), recorded_by: client, ...(a.owner ? { owner: a.owner } : {}) };
@@ -134,12 +136,35 @@ async function record(a) {
   return { record: r, text: line(r) };
 }
 
+// Запись остановки: поиск и дописывание под тем же замком журнала.
+async function recordStopConfirmation(job_ids, quote, apply = async r => r) {
+  return locked(async () => {
+    if (mode().active) throw Error('Подтверждение остановки недоступно в запасном режиме.');
+    const ids = [...new Set(job_ids)].sort();
+    const record = lines().find(r => r.kind === 'stop_confirm' && r.quote === quote && JSON.stringify(r.job_ids) === JSON.stringify(ids)) ||
+      write({ kind: 'stop_confirm', job_ids: ids, quote, recorded_by: 'claude', source: 'chat-claude' });
+    return apply(record);
+  });
+}
+
+// Запись закрытия карточек «нужно решение» словом пользователя: поиск и дописывание под тем же замком журнала.
+async function recordJobClose(job_ids, quote, apply = async r => r) {
+  return locked(async () => {
+    if (mode().active) throw Error('Закрытие словом недоступно в запасном режиме.');
+    const ids = [...new Set(job_ids)].sort();
+    const record = lines().find(r => r.kind === 'job_close' && r.quote === quote && JSON.stringify(r.job_ids) === JSON.stringify(ids)) ||
+      write({ kind: 'job_close', job_ids: ids, quote, recorded_by: 'claude', source: 'chat-claude' });
+    return apply(record);
+  });
+}
+
 function listText(now = Date.now()) {
   const rows = read(), m = mode(now);
   const fallback = claudeEntries().map(r => local(Date.parse(r.at)) + ' · Claude · ' + ({ record: 'слово', return: 'возврат', handover: 'дирижёр остановился', conductor: 'смена дирижёра' }[r.kind]) +
     (r.quote ? ' „' + r.quote + '“' : '') + (r.recorded_by || r.conductor || r.by ? ' · ' + NAMES[r.conductor || r.recorded_by || r.by] : '') + ' · ' + r.id);
-  if (!rows.length && !fallback.length) return 'Записей слова нет.';
-  return [...(fallback.length ? ['Запасной режим: ' + (m.active ? 'действует, дирижёр ' + NAMES[m.conductor] : 'не действует'), ...fallback] : []), ...rows.map(r => {
+  const stops = lines().filter(r => r.kind === 'stop_confirm' || r.kind === 'job_close').map(r => local(Date.parse(r.at)) + ' · ' + (r.kind === 'stop_confirm' ? 'подтверждение остановки' : 'закрытие словом') + ' · ' + r.job_ids.join(', ') + ' · „' + r.quote + '“ · ' + r.id);
+  if (!rows.length && !fallback.length && !stops.length) return 'Записей слова нет.';
+  return [...stops, ...(fallback.length ? ['Запасной режим: ' + (m.active ? 'действует, дирижёр ' + NAMES[m.conductor] : 'не действует'), ...fallback] : []), ...rows.map(r => {
     const at = Date.parse(r.at), back = success(r.who_down, at, now);
     const state = back ? 'не действует: успешный ответ ' + back.id
       : now - at >= DAY ? 'истекло' : 'действует до ' + local(at + DAY);
@@ -147,4 +172,4 @@ function listText(now = Date.now()) {
   })].join('\n');
 }
 
-module.exports = { DAY, NAMES, dir, file, ms, lines, read, claudeEntries, mode, append, transact, entry, holds, active, latest, byId, success, record, line, local, listText };
+module.exports = { DAY, NAMES, dir, file, ms, lines, read, claudeEntries, mode, append, transact, entry, holds, active, latest, byId, success, record, line, local, listText, recordStopConfirmation, recordJobClose };

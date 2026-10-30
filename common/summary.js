@@ -41,24 +41,28 @@ function loadLine(state, jobs) {
   let c; try { c = read(path.join(state, 'claude-quota.json')); } catch {}
   const fresh = c?.window_h === 5 && Date.now() - Date.parse(c.taken_at) < 18000000;
   const recent = who => (jobs[who] || []).filter(j => !j.archived && Date.parse(j.startedAt) > Date.now() - 18000000);
-  const a = recent('antigravity');
-  return 'Нагрузка за 5 ч: Claude Desktop — ' + (fresh ? c.calls + ' обращений, перечитано ' + (c.reread / 1e6).toFixed(1) + ' млн' : 'нет замера за 5 ч') +
-    '; Codex — ' + recent('codex').length + ' поручений; Antigravity — ' + a.length + ' поручений, ' + (a.reduce((n, j) => n + (Number(j.usage?.total_tokens) || 0), 0) / 1e6).toFixed(2) + ' млн токенов.' +
-    (fresh && c.reread > 50000000 ? '\nClaude перегружен: отдавайте чтение и ревью помощникам' : '');
+  return 'Нагрузка за 5 ч: ' + require('./members').active().filter(m => m.roles.conductor || require('./members').effective(m).roles.receives).map(m => {
+    if (m.roles.conductor) return m.title + ' Desktop — ' + (fresh ? c.calls + ' обращений, перечитано ' + (c.reread / 1e6).toFixed(1) + ' млн' : 'нет замера за 5 ч');
+    const rows = recent(m.id);
+    return m.title + ' — ' + rows.length + ' поручений' + (m.adapter === 'agy-cli' ? ', ' + (rows.reduce((n, j) => n + (Number(j.usage?.total_tokens) || 0), 0) / 1e6).toFixed(2) + ' млн токенов' : '');
+  }).join('; ') + '.' + (fresh && c.reread > 50000000 ? '\nClaude перегружен: отдавайте чтение и ревью помощникам' : '');
 }
 function settings({ row = false } = {}) {
   const d = require('./deploy'), cc = require('./client-configs'), entries = [];
   for (const file of d.configPaths()) {
     try {
       const c = d.snapshot(file).config;
-      for (const n of require('./members').servers) entries.push({ name: 'Claude ' + file + ' / ' + n, arg: c.mcpServers?.[n]?.args?.[0] });
+      for (const n of require('./members').installedServers) entries.push({ name: 'Claude ' + file + ' / ' + n, arg: c.mcpServers?.[n]?.args?.[0] });
     } catch (e) { entries.push({ name: 'Claude ' + file, error: e.code === 'ENOENT' ? 'отсутствует' : 'ошибка чтения' }); }
   }
   for (const { file, kind } of cc.paths().filter(p => p.kind !== 'permissions')) {
     try {
-      const s = d.snapshot(file), servers = kind === 'codex' ? cc.block(s.text).parsed.root.mcp_servers : s.config.mcpServers;
-      for (const n of require('./members').servers) entries.push({ name: kind + '/' + n, arg: servers?.[n]?.args?.[0] });
-    } catch { entries.push({ name: kind, error: 'не подключён или ошибка чтения' }); }
+      const s = d.snapshot(file), servers = kind === 'codex' ? cc.block(s.text).parsed.root.mcp_servers : kind === 'dsh' ? require('./dsh-config').connections(s.text).mcpServers : s.config.mcpServers;
+      for (const n of require('./members').installedServers) {
+        const entry = servers?.[n], wrong = kind === 'dsh' && entry && !require('./ownership').own(entry, n, require('./paths').repoRoot);
+        entries.push({ name: kind + '/' + n, arg: wrong ? undefined : entry?.args?.[0], error: kind === 'dsh' ? (wrong ? 'подключение указывает не на ту установку' : entry ? undefined : 'подключение сервера отсутствует') : undefined });
+      }
+    } catch (e) { entries.push({ name: kind, error: kind === 'dsh' ? (e.code === 'ENOENT' ? 'файла нет' : 'файл не разобран: ' + e.message) : 'не подключён или ошибка чтения' }); }
   }
   const release = e => e.arg && /[\\/]live[\\/]([a-f0-9]{40})[\\/]servers[\\/]/.exec(e.arg)?.[1];
   const counts = new Map(); for (const e of entries) { const r = release(e); if (r) counts.set(r, (counts.get(r) || 0) + 1); }
@@ -70,8 +74,11 @@ function settings({ row = false } = {}) {
 }
 // Необязательные записи снимаются целиком; обязательные могут превышать бюджет.
 function fit(rows, budget = 3000) {
+  // Блок самой свежей работы (наибольший updated) вытесняется последним: полный состав и прочие работы
+  // сворачиваются раньше него (team-v29 О10). Если даже он один не влезает в бюджет — снимается и он.
+  const freshest = rows.filter(r => r.work).reduce((a, b) => !a || b.updated > a.updated ? b : a, null);
   const kept = new Set(rows), optional = rows.filter(r => r.priority != null)
-    .sort((a, b) => a.priority - b.priority || a.updated - b.updated);
+    .sort((a, b) => (a === freshest) - (b === freshest) || a.priority - b.priority || a.updated - b.updated);
   let hidden = 0, works = 0;
   const text = () => [...rows.filter(r => kept.has(r)).map(r => r.text),
     ...(hidden ? ['Ещё не показано: ' + hidden + ' строк (из них работ: ' + works + ') — team_status full=true'] : [])].join('\n');
@@ -86,30 +93,39 @@ async function compact(team, quota, snapshot = require('./job-snapshot').create(
   const add = (text, priority, extra = {}) => { if (text) rows.push({ text, priority, ...extra }); };
   const section = async fn => { try { await fn(); } catch (e) { add('Ошибка: ' + e.message); } };
   add(quota);
+  try {
+    const members = require('./members'), registry = members.snapshot();
+    // Полный состав можно свернуть раньше блока самой свежей работы.
+    add('Участники rev ' + registry.rev + ': ' + registry.members.filter(m => m.state !== 'removed').map(m => m.title + (m.title.toLowerCase() === m.id ? '' : ' (' + m.id + ')')).join(', '), 5);
+    if (registry.warning) add('Реестр участников: ' + registry.warning);
+    for (const m of registry.members.filter(m => m.state !== 'removed' && m.pause))
+      add('Пауза участника ' + m.title + ' (' + m.id + '): ' + m.pause.kind + ' — ' + members.pauseNote(m));
+  } catch (e) { add(e.message); }
   for (const line of options.required || []) add(line);
   for (const line of options.restartWarnings || require('./restart-hold').warnings(path.dirname(team.state))) add(line);
   await section(() => require('./release-drift').lines(team.root, require('./paths').stateDir).forEach(line => add(line)));
-  for (const who of require('./members').helpers) await section(async () => {
+  for (const who of require('./members').scanIds) await section(async () => {
     const result = stores.list(who, true, snapshot); jobs[who] = result.jobs;
     result.errors.forEach(e => add('Ошибка чтения: ' + e));
     const waiting = result.jobs.filter(j => !j.archived && j.status === 'waiting_quota');
     if (waiting.length) {
       const times = waiting.map(j => Date.parse(j.nextAttemptAt)).filter(Number.isFinite);
       const next = times.length ? new Date(Math.min(...times)).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) : 'время неизвестно';
-      add(({ codex: 'Codex', antigravity: 'Antigravity', grok: 'Grok' }[who]) + ': Ждут квоту: ' + waiting.length + ' поручений, ближайшее продолжение ' + next + ' · подробности: full=true');
+      add(require('./members').names[who] + ': Ждут квоту: ' + waiting.length + ' поручений, ближайшее продолжение ' + next + ' · подробности: full=true');
     }
     let decisions = 0, stops = 0;
     const active = ['running', 'queued', 'cancelling', 'cancel_requested', 'delivery_unclear', 'migration_conflict', 'applying'];
     for (const j of result.jobs.filter(j => !j.archived && (j.stopUnconfirmed || [...active, 'needs_decision', 'stop_unconfirmed'].includes(j.status)))) {
-      const stopped = j.stopUnconfirmed || j.status === 'stop_unconfirmed';
+      const confirmed = require('./live-jobs').confirmed(j, who);
+      const status = require('./live-jobs').effectiveStatus(j, ['running', 'cancelling', 'stop_unconfirmed'].includes(j.status) ? await snapshot.ownerState(j.owner) : 'unknown');
+      if (confirmed && status !== 'needs_decision' && !active.includes(status) && status !== 'waiting_quota') continue;
+      const stopped = !confirmed && (j.stopUnconfirmed || j.status === 'stop_unconfirmed');
       const old = Date.parse(j.startedAt) < Date.now() - 86400000;
-      if (old && !active.includes(j.status)) {
+      if (old && !active.includes(status)) {
         if (stopped) stops++;
-        if (j.status === 'needs_decision') decisions++;
+        if (status === 'needs_decision') decisions++;
         continue;
       }
-      let status = j.status;
-      if (who !== 'grok' && ['running', 'cancelling', 'stop_unconfirmed'].includes(status) && await snapshot.ownerState(j.owner) === 'dead') status = who === 'codex' && j.write ? 'needs_decision' : 'lost';
       add(who + ' ' + j.id.slice(0, 8) + ': ' + require('./states')[status] + (stopped ? ' · ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА' : '') + (j.nextAttemptAt ? ' до ' + j.nextAttemptAt : ''));
     }
     if (decisions) add(who + ': нужно решение по ' + decisions + ' поручениям старше суток — full=true');
@@ -126,7 +142,8 @@ async function compact(team, quota, snapshot = require('./job-snapshot').create(
     for (const w of works.filter(w => !done.includes(w))) {
       if (w.error) { add(w.error); continue; }
       const i = w.stages.findIndex(s => s.state !== 'принят');
-      const block = [short(title(w), 65) + ': принято ' + require('./team').percent(w) + ' % · этап ' + (i + 1) + '/' + w.stages.length + ' ' + short(w.stages[i]?.title, 45) + '; далее: ' + short(w.next_step, 85)];
+      const view = require('./acceptance').presentation(w);
+      const block = [short(title(w), 65) + ': ' + view.line.replace(/^Принято/, 'принято') + ' · этап ' + (i + 1) + '/' + w.stages.length + ' ' + short(w.stages[i]?.title, 45) + '; далее: ' + short(w.next_step, 85), ...view.details];
       for (const s of w.stages) {
         if (s.state === 'выдан без принятия') block.push(title(w) + ': ' + s.title + ' — выдан без принятия; ' + (s.gate?.reasons || []).join('; '));
         if (s.gate?.files?.length) block.push(title(w) + ': ' + s.title + ' — место помощника с чистой памятью заполнено файлом Claude; сервер его не проверял');
@@ -152,9 +169,11 @@ async function compact(team, quota, snapshot = require('./job-snapshot').create(
   });
   await section(() => {
     const file = path.join(team.root, 'live/deployed.json');
-    if (fs.existsSync(file)) { const m = read(file); add('Последнее развёртывание: ' + m.commit.slice(0, 8) + ' · ' + localTime(m.at) + ' · ' + (m.method || 'способ не записан'), 5); }
-    else add('Последнее развёртывание: не записано', 5);
-    const op = require('./deploy-ops').list(team.root, { reconcile: false }).at(-1);
+    try {
+      if (fs.existsSync(file)) { const m = read(file); add('Последнее развёртывание: ' + m.commit.slice(0, 8) + ' · ' + localTime(m.at) + ' · ' + (m.method || 'способ не записан'), 5); }
+      else add('Последнее развёртывание: не записано', 5);
+    } catch (e) { add('Последнее развёртывание: ошибка: ' + require('./errors').errorText(e)); }
+    const op = require('./deploy-status').visible(require('./deploy-ops').list(team.root, { reconcile: false }).at(-1), team.root);
     if (op) {
       const cleanup = op.cleanup && { ...op.cleanup, blocked: op.cleanup.blocked?.length ? [op.cleanup.blocked.length + ' — full=true'] : [] };
       const optional = op.status === 'завершено' && (!cleanup || ['готово', 'отключена'].includes(cleanup.state)) && !cleanup?.failed && !cleanup?.uncheckedHiddenProcesses;

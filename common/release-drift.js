@@ -31,7 +31,7 @@ function lines(root, state) {
   const ready = path.join(state, 'ready');
   if (fs.existsSync(ready)) {
     // team-v28 Р3: отметки готовности только текущих участников; чужие (Grok выключен) — справкой, без «⚠».
-    const servers = require('./members').servers, files = fs.readdirSync(ready).filter(n => n.endsWith('.json'));
+    const servers = require('./members').installedServers, files = fs.readdirSync(ready).filter(n => n.endsWith('.json'));
     const stale = files.filter(n => !servers.includes(n.slice(0, -5)));
     if (stale.length) rows.push('Устаревшая отметка готовности: ' + stale.join(', '));
     const releases = files.filter(n => !stale.includes(n)).map(n => {

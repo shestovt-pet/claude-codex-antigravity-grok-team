@@ -1,4 +1,9 @@
 ﻿'use strict';
+// Изоляция настроек до первого require; директива остаётся прологом модуля.
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 const fs = require('fs'),
   path = require('path'),
   os = require('os'),
@@ -46,6 +51,7 @@ function repo(label) {
     write(path.join(root, 'rules', n + '.md'), 'принятые правила ' + n);
   // team-v28 Р1: в каждом настоящем релизе есть common/access.js — по нему проба считает ожидаемый список гостя.
   write(path.join(root, 'common', 'access.js'), fs.readFileSync(path.join(ROOT, 'common', 'access.js')));
+  for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(root, 'common', name), fs.readFileSync(path.join(ROOT, 'common', name))); /* реестр кандидата А */
   g.git(root, ['add', '-A']);
   g.git(root, ['commit', '-m', 'База']);
   return root;
@@ -124,8 +130,9 @@ function configs(label, rootLabel = label) {
 }
 const mock = {
   archive: async (root, id, temp) => {
-    for (const n of ['team', 'codex', 'antigravity', 'grok']) write(path.join(temp, 'servers', n, 'index.js'), '');
-    write(path.join(temp, 'common', 'access.js'), fs.readFileSync(path.join(ROOT, 'common', 'access.js'))); // team-v28 Р1
+    for (const n of ['team', 'codex', 'antigravity', 'claude', 'grok']) write(path.join(temp, 'servers', n, 'index.js'), '');
+    write(path.join(temp, 'common', 'access.js'), fs.readFileSync(path.join(ROOT, 'common', 'access.js')));
+  for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(temp, 'common', name), fs.readFileSync(path.join(ROOT, 'common', name))); /* реестр кандидата А */ // team-v28 Р1
   },
   install: async () => {},
   probe: async (file, env) => {
@@ -257,7 +264,7 @@ test('Частичный сбой явно сообщается при чужо�
   );
   assert.equal(read(files[0]).external, true);
 });
-test('MCP: пять инструментов (team-v18: team_word), формат, русские описания', async () => {
+test('MCP: девять инструментов (кандидат А: team_members), формат, русские описания', async () => {
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js'),
     { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
   const tr = new StdioClientTransport({
@@ -270,8 +277,10 @@ test('MCP: пять инструментов (team-v18: team_word), формат
   try {
     await cl.connect(tr);
     const list = await cl.listTools();
-    assert.equal(list.tools.length, 5);
+    assert.equal(list.tools.length, 9);
+    assert(list.tools.some(t => t.name === 'team_members'));
     assert(list.tools.some(t => t.name === 'team_word'));
+    for (const name of ['team_ask', 'team_ask_result', 'team_inbox']) assert(list.tools.some(t => t.name === name), name);
     for (const t of list.tools)
       assert(
         !/most_|poruch|itog|perenesti|papka|rezhim|fayl|stroki|opora|zamechaniya|pravka|tekst|kuda|polno|zhdat|chernovik/.test(
@@ -518,6 +527,19 @@ test(
   async () => {
     const root = repo('repeat'),
       files = configs('repeat');
+    // Возврат после инициализации реестра разрешён только в читающий его релиз А.
+    const previous = path.join(root, 'live', 'd'.repeat(40));
+    for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js'])
+      write(path.join(previous, 'common', name), fs.readFileSync(path.join(ROOT, 'common', name)));
+    for (const server of ['team', 'codex', 'most']) write(path.join(previous, 'servers', server, 'index.js'), '// прежний сервер');
+    for (const file of files) {
+      const config = read(file);
+      config.mcpServers.team = { command: process.execPath, args: [path.join(previous, 'servers/team/index.js')] };
+      // Все возвращаемые подключения связки должны читать реестр А, не только team.
+      config.mcpServers.codex.args = [path.join(previous, 'servers/codex/index.js')];
+      config.mcpServers.most.args = [path.join(previous, 'servers/most/index.js')];
+      json(file, config);
+    }
     await d.deploy({ root, configs: files }, mock);
     const backups = files.map((f) => fs.readFileSync(f + '.prev', 'utf8')),
       mtimes = files.map((f) => fs.statSync(f + '.prev').mtimeMs);
@@ -537,10 +559,11 @@ test(
       c.theme = 'светлая';
       json(f, c);
     });
-    await d.rollback({ root, configs: files });
+    await rollbackChild({ root, configs: files });
     files.forEach((f) => {
       assert.equal(read(f).theme, 'светлая');
       assert.equal(read(f).mcpServers.most.command, 'old');
+      assert.equal(read(f).mcpServers.team.args[0], path.join(previous, 'servers/team/index.js'));
     });
   },
   true,
@@ -554,7 +577,7 @@ test(
     const out = cp.execFileSync(
       process.execPath,
       [path.join(ROOT, 'tools/deploy.js'), '--root', root, '--config', files[0], '--dry-run'],
-      { encoding: 'utf8', env: { ...process.env, MOST_STATE_DIR: state }, windowsHide: true },
+      { encoding: 'utf8', env: { ...process.env, MOST_STATE_DIR: path.join(root, 'state') }, windowsHide: true },
     );
     assert.match(out, /изменений нет/);
     assert(!fs.existsSync(path.join(root, 'live')));
@@ -568,7 +591,7 @@ test(
   async () => {
     const root = repo('archive-release'),
       files = configs('archive-release');
-    for (const n of ['team', 'codex', 'antigravity', 'grok']) write(path.join(root, 'servers', n, 'index.js'), 'принятый');
+    for (const n of ['team', 'codex', 'antigravity', 'claude', 'grok']) write(path.join(root, 'servers', n, 'index.js'), 'принятый');
     g.git(root, ['add', '-A']);
     g.git(root, ['commit', '-m', 'Серверы']);
     write(path.join(root, 'servers/team/index.js'), 'непринятый');
@@ -698,9 +721,7 @@ test('Откат: нет .prev, повреждённая .prev и сбой за�
     if (kind === 'broken') write(files[0] + '.prev', '{');
     if (kind === 'write') json(files[0] + '.prev', { mcpServers: {} });
     json(files[1] + '.prev', { mcpServers: { team: { command: 'previous' } } });
-    const out = await d.rollback({ root, configs: files }, { hook: async (_, p) => {
-      if (kind === 'write' && p.file === files[0]) throw Error('занят');
-    } });
+    const out = await rollbackChild({ root, configs: files }, kind === 'write' ? files[0] : '');
     assert.match(out, /отказ в откате/);
     if (kind === 'missing') assert.match(out, /нет резервного конфига/);
     assert.equal(fs.readFileSync(files[0], 'utf8'), before);
@@ -750,21 +771,47 @@ test('Атомарная запись: ошибка rename удаляет вре
   } finally { fs.renameSync = oldRename; fs.unlinkSync = oldUnlink; }
 });
 
+function rollbackChild(options, failFile = '') {
+  const root = options.root || RUN;
+  return cp.execFileSync(process.execPath, [path.join(__dirname,'fixtures/team-v43/rollback.js'),JSON.stringify({...options,root}), failFile], {
+    env:{...process.env,MOST_REPO_ROOT:root,MOST_STATE_DIR:path.join(root,'state')},encoding:'utf8',windowsHide:true,stdio:'pipe',timeout:60000
+  });
+}
+const rollbackReleases = new Map();
 function cli(args, cwd, env = {}) {
-  return cp.execFileSync(process.execPath, [path.join(ROOT, 'tools/deploy.js'), ...args], {
-    cwd, env: { ...process.env, ...env }, encoding: 'utf8', windowsHide: true, stdio: 'pipe', timeout: 60000,
+  let script = path.join(ROOT,'tools/deploy.js'), childEnv={...process.env,...env};
+  if (args.includes('--config-only') || args.includes('--clients-only') || args.includes('--rollback')) {
+    let root=args.includes('--root')?args[args.indexOf('--root')+1]:RUN;
+    if(args.includes('--release')) {
+      const release=args[args.indexOf('--release')+1];script=path.join(release,'tools/deploy.js');
+      if(fs.existsSync(path.join(release,'probe-ok.json'))) root=read(path.join(release,'probe-ok.json')).root;
+      if(!fs.existsSync(script))script=path.join(ROOT,'tools/deploy.js');
+    } else if(args.includes('--rollback')) {
+      if(!rollbackReleases.has(root))rollbackReleases.set(root,require('./fixtures/team-v43/fixture').release(root,'f'.repeat(40)));
+      script=path.join(rollbackReleases.get(root),'tools/deploy.js');
+    }
+    if(!args.includes('--root'))args=['--root',root,...args];
+    childEnv.MOST_REPO_ROOT=root;
+    // Явно переданный MOST_STATE_DIR не затирается: несовпадение с <root>\state отклоняется до записи.
+    if (env.MOST_STATE_DIR === undefined) childEnv.MOST_STATE_DIR=path.join(root,'state');
+  }
+  return cp.execFileSync(process.execPath, [script, ...args], {
+    cwd, env: childEnv, encoding: 'utf8', windowsHide: true, stdio: 'pipe', timeout: 60000,
   });
 }
 
 test('Bootstrap CLI: настоящий архив, готовые зависимости, три MCP запуска, раздельные конфиги', async () => {
   const root = repo('bootstrap'), files = configs('bootstrap-configs', 'bootstrap');
-  for (const dir of ['common', 'servers']) fs.cpSync(path.join(ROOT, dir), path.join(root, dir), { recursive: true });
+  require('./fixtures/team-v43/fixture').phaseB(root);
+  require('../common/members-v46').apply(require('path').join(root, 'state'), 'forward'); // развёртывание уже на team-v46: состав установки включает claude
+  for (const dir of ['common', 'servers', 'tools']) fs.cpSync(path.join(ROOT, dir), path.join(root, dir), { recursive: true });
   for (const file of ['package.json', 'package-lock.json']) fs.copyFileSync(path.join(ROOT, file), path.join(root, file));
   g.git(root, ['add', '-A']);
   g.git(root, ['commit', '-m', 'Серверы bootstrap']);
   const live = path.join(root, 'live'); fs.mkdirSync(live);
   const forbidden = path.join(RUN, 'must-not-be-created');
-  const env = { MOST_STATE_DIR: forbidden, LOCALAPPDATA: forbidden, APPDATA: forbidden,
+  const env = { MOST_STATE_DIR: path.join(root, 'state'), LOCALAPPDATA: forbidden, APPDATA: forbidden,
+    MOST_AGY_CLI_SETTINGS: path.join(RUN, 'bootstrap-agy-cli/settings.json'),
     MOST_CLAUDE_CONFIGS: '{не читается в release-only', MOST_TEST_WRITE_ROOT: live,
     NODE_OPTIONS: '--require ' + JSON.stringify(path.join(__dirname, 'deploy-write-guard.js')) };
   const before = files.map(f => fs.readFileSync(f, 'utf8'));
@@ -806,7 +853,7 @@ test('Bootstrap CLI: настоящий архив, готовые зависи�
 test('Bootstrap CLI: config-only отклоняет непроверенный релиз, отсутствующие параметры и конфликты', async () => {
   const release = path.join(RUN, 'untested-release'); fs.mkdirSync(release);
   const file = configs('untested')[0], before = fs.readFileSync(file, 'utf8');
-  assert.throws(() => cli(['--config-only', '--release', release, '--config', file], path.dirname(file)), /метки успешного пробного запуска/);
+  assert.throws(() => cli(['--config-only', '--release', release, '--config', file], path.dirname(file)), /CLI готового релиза/);
   for (const args of [
     ['--config-only', '--release', release, '--config', file],
     ['--config-only', '--config', file],
@@ -843,19 +890,24 @@ test('Откат: отсутствующий прежний сервер не м
   json(files[0] + '.prev', { mcpServers: { most: { command: process.execPath, args: [absent] } } });
   json(files[1] + '.prev', { mcpServers: { most: { command: process.execPath, args: [old] } } });
   const before = fs.readFileSync(files[0], 'utf8');
-  const out = await d.rollback({ root, configs: files });
+  const out = await rollbackChild({ root, configs: files });
   assert.match(out, /прежний сервер .*missing-server.js больше не существует — откат невозможен/);
   assert.equal(fs.readFileSync(files[0], 'utf8'), before);
   assert.equal(read(files[1]).mcpServers.most.args[0], old);
   const env = { MOST_TEST_WRITE_ROOT: path.dirname(files[0]), MOST_STATE_DIR: path.join(RUN, 'forbidden-rollback'),
     NODE_OPTIONS: '--require ' + JSON.stringify(path.join(__dirname, 'deploy-write-guard.js')) };
-  assert.match(cli(['--config-only', '--rollback', '--config', files[0]], path.dirname(files[0]), env), /откат невозможен/);
+  // Явный MOST_STATE_DIR не затирается: несовпадение с <root>\state отклоняется до записи.
+  assert.throws(() => cli(['--root', root, '--config-only', '--rollback', '--config', files[0]], path.dirname(files[0]), env), /MOST_STATE_DIR/);
   assert.equal(fs.readFileSync(files[0], 'utf8'), before);
   json(files[0] + '.prev', { mcpServers: { most: { command: process.execPath, args: [old] } } });
-  assert.match(cli(['--config-only', '--rollback', '--config', files[0]], path.dirname(files[0]), env), /возвращён/);
+  assert.throws(() => cli(['--root', root, '--config-only', '--rollback', '--config', files[0]], path.dirname(files[0]), env), /MOST_STATE_DIR/);
+  assert.equal(fs.readFileSync(files[0], 'utf8'), before);
+  assert(!fs.existsSync(env.MOST_STATE_DIR));
+  // Тот же откат с корректным состоянием (<root>\\state по умолчанию) восстанавливает прежнее подключение.
+  const okEnv = { ...env }; delete okEnv.MOST_STATE_DIR;
+  assert.match(cli(['--root', root, '--config-only', '--rollback', '--config', files[0]], path.dirname(files[0]), okEnv), /возвращён/);
   assert.equal(read(files[0]).mcpServers.most.args[0], old);
   assert.equal(read(files[0]).theme, 'тёмная');
-  assert(!fs.existsSync(env.MOST_STATE_DIR));
 }, true);
 
 test('Bootstrap принимает коммит вне main; обычный team deploy отклоняет его', async () => {
@@ -922,7 +974,7 @@ test('Откат: конфигурация пользователя most + cmd /
   missing.mcpServers.most.args = [path.join(RUN, 'absent-most/index.js')];
   json(files[1] + '.prev', missing);
   const original = files.map(f => fs.readFileSync(f, 'utf8'));
-  const out = await d.rollback({ root, configs: files });
+  const out = await rollbackChild({ root, configs: files });
   assert(out.includes(files[0] + ': возвращён'), out);
   assert.match(out, /прежний сервер .*absent-most.*больше не существует/);
   assert.deepEqual(read(files[0]).mcpServers.most, previous.mcpServers.most);
@@ -931,26 +983,27 @@ test('Откат: конфигурация пользователя most + cmd /
   assert.equal(read(files[0]).mcpServers.other.command, 'keep');
   assert.equal(fs.readFileSync(files[1], 'utf8'), original[1]);
   write(files[0], original[0]);
-  assert.match(cli(['--config-only', '--rollback', '--config', files[0]], path.dirname(files[0])), /возвращён/);
+  assert.match(cli(['--root', root, '--config-only', '--rollback', '--config', files[0]], path.dirname(files[0])), /возвращён/);
   assert.deepEqual(read(files[0]).mcpServers.antigravity, previous.mcpServers.antigravity);
-  assert.match(cli(['--config-only', '--rollback', '--config', files[1]], path.dirname(files[1])), /откат невозможен/);
+  assert.match(cli(['--root', root, '--config-only', '--rollback', '--config', files[1]], path.dirname(files[1])), /откат невозможен/);
   assert.equal(fs.readFileSync(files[1], 'utf8'), original[1]);
 }, true);
 
 test('Откат: ключи cmd и npx пропускаются; пути скриптов проверяются', async () => {
   const file = configs('rollback-flags')[0];
+  const root = path.join(RUN, 'rollback-flags-root'); fs.mkdirSync(root);
   for (const server of [
     { command: 'cmd', args: ['/k', 'npx', '-y', '--quiet', 'mcp-server-google-antigravity'] },
     { command: 'npx', args: ['-y', '--quiet', 'mcp-server-google-antigravity'] },
   ]) {
     json(file + '.prev', { mcpServers: { antigravity: server } });
-    assert.match(await d.rollback({ configOnly: true, configs: [file] }), /возвращён/);
+    assert.match(await rollbackChild({ root, configOnly: true, configs: [file] }), /возвращён/);
     assert.deepEqual(read(file).mcpServers.antigravity, server);
   }
   for (const script of ['absent.js', './absent.mjs', 'absent.cjs']) {
     json(file + '.prev', { mcpServers: { most: { command: 'node', args: [script] } } });
     const before = fs.readFileSync(file, 'utf8');
-    assert.match(await d.rollback({ configOnly: true, configs: [file] }), /откат невозможен/);
+    assert.match(await rollbackChild({ root, configOnly: true, configs: [file] }), /откат невозможен/);
     assert.equal(fs.readFileSync(file, 'utf8'), before);
   }
 });

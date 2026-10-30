@@ -98,13 +98,13 @@ function getFallbackStatus() {
 
 function getReady() {
   const readyDir = path.join(stateDir, 'ready');
-  const names = ['antigravity', 'codex', 'grok', 'team'];
+  const names = require('../../../common/members').servers;
   const servers = {};
   for (const name of names) {
     const file = path.join(readyDir, name + '.json');
     const r = readJsonSafe(file);
     if (!r.ok) {
-      servers[name] = { present: false, alive: false, error: r.error };
+      servers[name] = { present: false, alive: false, error: r.error, title: require('../../../common/members').names[name] || name };
       continue;
     }
     const v = r.value;
@@ -112,6 +112,7 @@ function getReady() {
     servers[name] = {
       present: true,
       alive,
+      title: require('../../../common/members').names[name] || name,
       pid: v.pid,
       startedAt: v.startedAt || null,
       release: v.release || null,
@@ -255,7 +256,7 @@ function formatOwnerLabel(raw, context) {
   if (/^user$/i.test(s)) return 'пользователь';
   if (/^grok-collegium/i.test(s)) return 'коллегия (Grok)';
   if (/^cowork-/i.test(s)) return 'группа ' + s.slice(0, 18);
-  if (/^(antigravity|codex|grok|claude)$/i.test(s)) return 'агент ' + s.toLowerCase();
+  if (require('../../../common/members').ids.includes(s.toLowerCase())) return 'агент ' + s.toLowerCase();
   if (s.length > 40) return s.slice(0, 37) + '…';
   return s;
 }
@@ -363,9 +364,20 @@ const AGENT_ALIASES = {
   grok: 'grok',
 };
 
+function knownAgents() {
+  const members = require('../../../common/members');
+  return [...new Set([...members.all().map((m) => m.id), 'grok'])];
+}
+
+function historyAgents() {
+  const members = require('../../../common/members');
+  return [...new Set([...members.all().filter((m) => members.adapters[m.adapter]).map((m) => m.id), 'grok'])];
+}
+
 function normalizeAgent(a) {
   const k = String(a || '').toLowerCase();
-  return AGENT_ALIASES[k] || null;
+  const alias = AGENT_ALIASES[k] || k;
+  return knownAgents().includes(alias) ? alias : null;
 }
 
 function jobSummary(who, j) {
@@ -373,6 +385,7 @@ function jobSummary(who, j) {
   const of = ownerFields(j.owner || who, { kind: 'job', agent: who });
   return {
     agent: who,
+    title: require('../../../common/members').names[who] || who,
     id: j.id,
     status: j.stopUnconfirmed ? 'stop_unconfirmed' : j.status,
     local_status: j.status,
@@ -395,7 +408,7 @@ function jobSummary(who, j) {
 }
 
 function getJobs({ agent, status, limit = JOB_LIST_LIMIT, includeArchive = false } = {}) {
-  const agents = agent ? [normalizeAgent(agent)].filter(Boolean) : ['antigravity', 'codex', 'grok'];
+  const agents = agent ? [normalizeAgent(agent)].filter(Boolean) : historyAgents();
   if (agent && !agents.length) throw Object.assign(new Error('unknown agent'), { status: 400 });
   const out = [];
   const errors = [];
@@ -538,7 +551,7 @@ function recentJobChanges(limit = 30) {
   // Lightweight: scan mtimes of card files / json — avoid full parse of all 900.
   const items = [];
   const roots = stores.roots();
-  for (const who of ['antigravity', 'codex', 'grok']) {
+  for (const who of historyAgents()) {
     const dir = roots[who];
     if (!fs.existsSync(dir)) continue;
     let names;
@@ -873,6 +886,7 @@ function getHostJobs({ agent, status, limit = JOB_LIST_LIMIT } = {}) {
       if (status && effectiveStatus !== status) continue;
       out.push({
         agent: who,
+    title: require('../../../common/members').names[who] || who,
         id: j.id,
         status: effectiveStatus,
         local_status: localStatus,
@@ -1522,7 +1536,7 @@ const AGENT_TITLE_RU = {
 
 function agentTitleRu(who) {
   const k = String(who || '').toLowerCase();
-  return AGENT_TITLE_RU[k] || (who ? String(who) : 'помощник');
+  return require('../../../common/members').names[k] || (who ? String(who) : 'помощник');
 }
 
 function projectStatusRu(w) {

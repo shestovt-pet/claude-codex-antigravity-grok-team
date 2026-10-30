@@ -1,5 +1,10 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 const fs = require('fs'), path = require('path'), assert = require('assert');
+const { serverReady } = require('./runner-support');
 const ROOT = path.resolve(__dirname, '..'), RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v6-'));
 Object.assign(process.env, { MOST_REPO_ROOT: RUN, MOST_STATE_DIR: path.join(RUN, 'state'), MOST_TEST_KEEP: '1', MOST_CLIENT: 'claude', MOST_NOTIFY: 'off', MOST_CLAUDE_CONFIGS: '[]', MOST_CODEX_CONFIG: path.join(RUN, 'absent.toml'), MOST_AGY_CONFIG: path.join(RUN, 'absent-permissions.json'), MOST_AGY_MCP_CONFIG: path.join(RUN, 'absent-mcp.json') });
 const write = (f, s) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, s); };
@@ -13,7 +18,7 @@ function checklist() {
   files.forEach((f, i) => {
     const s = fs.readFileSync(f, 'utf8');
     // Правила доставляются с корнем установки (team-v11 Р1): здесь корень — папка прогона.
-    for (const text of ['Claude — дирижёр', 'Codex — критик логики и код', 'Antigravity — автор литературного текста', 'Claude — веб-поиск, источники и термины', 'Оба помощника участвуют в обсуждении замысла и итоговом ревью', 'Рутину делают сервер и скрипты', 'Обязательные проверяющие — Codex и Antigravity', 'решение принимает Claude', ...['C:\\most\\AGENTS.md', 'C:\\most\\rules\\common.md', 'C:\\most\\lessons.md'].map(t => require('../common/paths').withRoot(t, process.env.MOST_REPO_ROOT)), '[блокирующее]/[улучшение]', '[разовое]/[системное]', 'последняя строка — «ПРИНЯТО» или «НЕ ПРИНЯТО: N блокирующих»', 'только с доказательством', i ? 'не разрешение самостоятельно отправлять задания или менять настройки' : 'Чат Codex может сам ставить поручения через мост']) assert(s.includes(text), text);
+    for (const text of ['Claude — дирижёр', 'Codex — критик логики и код', 'Antigravity — автор литературного текста', 'Claude — веб-поиск, источники и термины', ...require('../common/members').active().map(m => m.title + ': ' + m.specialization), 'Помощники из team_status участвуют в обсуждении замысла и итоговом ревью', 'Рутину делают сервер и скрипты', 'Обязательные проверяющие — голосующие помощники из team_status', 'решение принимает Claude', ...['C:\\most\\AGENTS.md', 'C:\\most\\rules\\common.md', 'C:\\most\\lessons.md'].map(t => require('../common/paths').withRoot(t, process.env.MOST_REPO_ROOT)), '[блокирующее]/[улучшение]', '[разовое]/[системное]', 'последняя строка — «ПРИНЯТО» или «НЕ ПРИНЯТО: N блокирующих»', 'только с доказательством', i ? 'не разрешение самостоятельно отправлять задания или менять настройки' : 'Чат Codex может сам ставить поручения через мост']) assert(s.includes(text), text);
     for (const text of i ? ['на диск не пишет', 'команд, меняющих файлы, не запускает', 'Результат переносит сервер по решению Claude'] : ['отдельного пользователя Windows без сети', '`.git` только для чтения', 'Удаления запрещены', 'перечисляй в отчёте']) assert(s.includes(text), text);
   });
 }
@@ -31,16 +36,24 @@ test('Р1: точные прежние структуры, обязательн�
 });
 test('Р1: CLI операции доставляет правила, фиксирует факт доставки, повтор и общий откат', async () => {
   resetRules(); process.env.MOST_CODEX_RULES = files[0]; process.env.MOST_AGY_RULES = files[1];
-  const dir = release(), config = path.join(RUN, 'claude.json'), result = path.join(RUN, 'state/deploy-ops/install.json');
-  json(config, {}); json(result, { id: 'install', root: RUN, createdAt: new Date().toISOString() });
-  await require('../tools/deploy').main(['--config-only', '--release', dir, '--config', config, '--result', result], { print: () => {} });
-  checklist(); const evidence = read(result).rulesDelivery;
-  assert.equal(evidence.length, 2); assert(evidence.every(e => e.operation === 'install' && e.deliveryPerformed && e.contentVerified && e.changed));
-  await require('../tools/deploy').main(['--config-only', '--release', dir, '--config', config, '--result', result], { print: () => {} });
-  assert(read(result).rulesDelivery.every(e => e.deliveryPerformed && !e.changed));
-  resetRules(); json(config, {}); const before = files.map(f => fs.readFileSync(f, 'utf8'));
-  await assert.rejects(require('../common/deploy').configure({ release: dir, configs: [config], method: 'из Claude через исполнителя вне пакета', result }, { hook: phase => { if (phase === 'config3') throw Error('сбой после правил'); } }), /Конфиги восстановлены/);
-  files.forEach((f, i) => assert.equal(fs.readFileSync(f, 'utf8'), before[i]));
+  const fixture = require('./fixtures/team-v43/fixture');
+  // Отдельный корень: успешная установка применяет forward-миграцию team-v46 (claude получает поручения).
+  // Общий RUN/state этого набора должен остаться исходным — иначе installedServers сдвинется и тесты Р5 увидят 4 сервера.
+  const base = path.join(RUN, 'cli-ops'); fs.mkdirSync(base, { recursive: true });
+  const savedState = process.env.MOST_STATE_DIR; process.env.MOST_STATE_DIR = path.join(base, 'state');
+  try {
+    const dir = fixture.release(base), config = path.join(base, 'claude.json'), result = path.join(base, 'state/deploy-ops/install.json');
+    json(config, {}); fixture.operation(base, dir);
+    await require(path.join(dir, 'tools/deploy.js')).main(['--root', base, '--config-only', '--release', dir, '--config', config, '--result', result], { print: () => {} });
+    checklist(); const evidence = read(result).rulesDelivery;
+    assert.equal(evidence.length, 2); assert(evidence.every(e => e.operation === 'install' && e.deliveryPerformed && e.contentVerified && e.changed));
+    fixture.operation(base, dir);
+    await require(path.join(dir, 'tools/deploy.js')).main(['--root', base, '--config-only', '--release', dir, '--config', config, '--result', result], { print: () => {} });
+    assert(read(result).rulesDelivery.every(e => e.deliveryPerformed && !e.changed));
+    resetRules(); json(config, {}); const before = files.map(f => fs.readFileSync(f, 'utf8'));
+    await assert.rejects(require('../common/deploy').configure({ release: dir, configs: [config], method: 'из Claude через исполнителя вне пакета', result }, { hook: phase => { if (phase === 'config3') throw Error('сбой после правил'); } }), /Конфиги восстановлены/);
+    files.forEach((f, i) => assert.equal(fs.readFileSync(f, 'utf8'), before[i]));
+  } finally { savedState === undefined ? delete process.env.MOST_STATE_DIR : process.env.MOST_STATE_DIR = savedState; }
 });
 test('Р2: числовой предел 8 МиБ, UTF-8; только последний result', () => {
   const a = require('../common/agy-input');
@@ -51,8 +64,9 @@ test('Р2: числовой предел 8 МиБ, UTF-8; только посл�
 });
 test('Р2: реальный дочерний процесс — весь длинный материал, EOF, последний result, отказ 0/ERROR и один повтор', async () => {
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js'), { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
-  const log = path.join(RUN, 'stream.log'), transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')], env: { ...process.env, AGY_PATH: path.join(__dirname, 'fake-agy-stream.js'), MOST_AGY_INPUT_FORMAT: '', FAKE_STREAM_LOG: log }, stderr: 'pipe' });
+  const log = path.join(RUN, 'stream.log'), transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')], env: { ...process.env, NODE_ENV: 'test', AGY_PATH: path.join(__dirname, 'fake-agy-stream.js'), MOST_AGY_INPUT_FORMAT: '', FAKE_STREAM_LOG: log }, stderr: 'pipe' });
   const client = new Client({ name: 'team-v6-test', version: '1' }); await client.connect(transport);
+  await serverReady(path.join(RUN, 'state'), transport.pid);
   try {
     for (const [n, directive, expected, attempts] of [[0, '', 'done', 1], [1, 'DENY_READ', 'failed', 2], [2, 'DENY_READ ERROR_STATUS', 'failed', 2], [3, 'DENY_OTHER', 'failed', 1], [4, 'DENY_READ ONLY_ONCE', 'done', 2], [5, 'NO_RESULT', 'failed', 1], [6, 'QUOTE_DENIAL', 'done', 1], [7, 'SERVICE_DENIAL', 'failed', 2]]) {
       const folder = path.join(RUN, 'material-' + n); fs.mkdirSync(folder);
@@ -73,8 +87,9 @@ test('Р2: реальный дочерний процесс — весь дли�
 });
 test('Р2: прежний путь также распознаёт SUCCESS+stderr и сохраняет ровно один повтор', async () => {
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js'), { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
-  const log = path.join(RUN, 'legacy.log'), transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')], env: { ...process.env, AGY_PATH: path.join(__dirname, 'fake-agy-stream.js'), MOST_AGY_INPUT_FORMAT: 'legacy', FAKE_STREAM_LOG: log }, stderr: 'pipe' });
+  const log = path.join(RUN, 'legacy.log'), transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')], env: { ...process.env, NODE_ENV: 'test', AGY_PATH: path.join(__dirname, 'fake-agy-stream.js'), MOST_AGY_INPUT_FORMAT: 'legacy', FAKE_STREAM_LOG: log }, stderr: 'pipe' });
   const client = new Client({ name: 'team-v6-legacy', version: '1' }); await client.connect(transport);
+  await serverReady(path.join(RUN, 'state'), transport.pid);
   try {
     const folder = path.join(RUN, 'legacy-material'); fs.mkdirSync(folder);
     const file = path.join(folder, 'source.txt'); write(file, 'Короткий материал');
@@ -88,8 +103,9 @@ test('Р2: прежний путь также распознаёт SUCCESS+stder
 });
 test('Р2: ошибка протокола — один запасной запуск, карточка и длинный материал с опорами', async () => {
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js'), { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
-  const log = path.join(RUN, 'fallback.log'), transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')], env: { ...process.env, AGY_PATH: path.join(__dirname, 'fake-agy-stream.js'), MOST_AGY_INPUT_FORMAT: '', FAKE_STREAM_LOG: log }, stderr: 'pipe' });
+  const log = path.join(RUN, 'fallback.log'), transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/antigravity/index.js')], env: { ...process.env, NODE_ENV: 'test', AGY_PATH: path.join(__dirname, 'fake-agy-stream.js'), MOST_AGY_INPUT_FORMAT: '', FAKE_STREAM_LOG: log }, stderr: 'pipe' });
   const client = new Client({ name: 'team-v6-fallback', version: '1' }); await client.connect(transport);
+  await serverReady(path.join(RUN, 'state'), transport.pid);
   try {
     for (const [n, directive, long, expected] of [[0, 'PROTOCOL_ERROR', false, 'done'], [1, 'PROTOCOL_ERROR', true, 'done'], [2, 'PROTOCOL_ERROR FAIL_LEGACY', false, 'failed'], [3, 'PROTOCOL_ERROR STDERR_PROTOCOL', false, 'done'], [4, 'PROTOCOL_ERROR LEGACY_DENIAL', false, 'failed'], [5, 'PROTOCOL_ERROR LEGACY_DENIAL LEGACY_ONCE', false, 'done'], [6, 'PROTOCOL_ERROR LEGACY_DENIAL LEGACY_ONCE', true, 'done'], [7, 'PROTOCOL_ERROR LEGACY_DENIAL', true, 'failed']]) {
       const folder = path.join(RUN, 'fallback-' + n); fs.mkdirSync(folder);
@@ -194,7 +210,7 @@ test('Круг 1 Р1: роли не зависят от порядка, один
   assert(!fs.readFileSync(other, 'utf8').includes('песочнице отдельного пользователя'));
   for (const role of ['codex', 'antigravity']) {
     const template = fs.readFileSync(path.join(ROOT, 'rules/helpers', role + '-section.md'), 'utf8');
-    assert.equal(rules.body(role), require('../common/paths').withRoot(template.replace(/\r\n/g, '\n').trimEnd() + '\n', process.env.MOST_REPO_ROOT));
+    assert.equal(rules.body(role), require('../common/members').rules() + '\n' + require('../common/paths').withRoot(template.replace(/\r\n/g, '\n').trimEnd() + '\n', process.env.MOST_REPO_ROOT));
     assert(rules.replace('## Связка четырёх ИИ\nстарое\n', role).includes(rules.body(role)));
   }
   assert(!fs.readFileSync(path.join(ROOT, 'common/client-rules.js'), 'utf8').includes('Claude — дирижёр'));

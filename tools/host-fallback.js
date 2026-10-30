@@ -15,7 +15,7 @@ const accessDraft = require('../common/access');
 const fallbackDetect = require('../common/fallback-detect');
 const taskRoles = require('../common/task-roles');
 
-const SERVERS = ['team', 'codex', 'antigravity', 'grok'];
+const SERVERS = require('../common/members').servers;
 const INCREMENT = 4;
 
 function readJson(p) {
@@ -627,7 +627,7 @@ async function stopJob(opts = {}) {
   const d = defaults(opts);
   const who = opts.who;
   const id = opts.id;
-  if (!['codex', 'antigravity', 'grok'].includes(who)) throw new Error('jobs-stop: who=codex|antigravity|grok');
+  if (!require('../common/members').helpers.includes(who)) throw new Error('jobs-stop: who=' + require('../common/members').helpers.join('|'));
   if (!id || !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw new Error('jobs-stop: bad id');
   opts.expectedGeneration = currentGeneration(d.fallbackDir);
   if (opts.legacyUserConfirm && !opts.confirmId) {
@@ -717,7 +717,7 @@ async function enqueueJob(opts = {}) {
   const d = defaults(opts);
   const who = opts.who;
   const task = opts.task || opts.text || '';
-  if (!['codex', 'antigravity', 'grok'].includes(who)) throw new Error('jobs-enqueue: who=codex|antigravity|grok');
+  if (!require('../common/members').helpers.includes(who)) throw new Error('jobs-enqueue: who=' + require('../common/members').helpers.join('|'));
   if (!task || String(task).trim().length < 3) throw new Error('jobs-enqueue: task required');
   opts.expectedGeneration = currentGeneration(d.fallbackDir);
   const used = consumeFor(d, 'jobs.enqueue', opts, (u) => {

@@ -5,9 +5,9 @@ const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const words = () => require('./user-word');
 const access = () => require('./access');
 const paths = () => require('./paths');
-const NAMES = { claude: 'Claude', codex: 'Codex', antigravity: 'Antigravity', grok: 'Grok' };
-const FAMILY = { codex: 'openai', antigravity: 'google', grok: 'xai', claude: 'anthropic' };
-const SEATS = ['codex', 'antigravity'];
+const NAMES = require('./members').names;
+const FAMILY = require('./members').dynamic(() => ({ ...Object.fromEntries(require('./members').all().map(m => [m.id, m.family])), grok: 'xai' }));
+const SEATS = require('./members').fallbackIds;
 const release = () => path.resolve(__dirname, '..');
 const stateDir = () => paths().stateDir;
 const two = n => String(n).padStart(2, '0');
@@ -32,7 +32,7 @@ function processTable(fresh = false, opts = {}) {
   if (process.platform === 'win32') {
     const out = require('child_process').execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
       "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name," + (cmd ? 'CommandLine,' : '') + "@{n='Start';e={if($_.CreationDate){$_.CreationDate.ToUniversalTime().ToString('o')}}} | ConvertTo-Json -Compress"],
-    { encoding: 'utf8', windowsHide: true, timeout: 15000, maxBuffer: 64e6 });
+    { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, maxBuffer: 64e6 });
     rows = [].concat(JSON.parse(out || '[]')).map(r => ({ pid: r.ProcessId, ppid: r.ParentProcessId, name: r.Name, startedAt: r.Start || null, ...(cmd ? { commandLine: r.CommandLine || '' } : {}) }));
   } else if (fs.existsSync('/proc/self/stat')) {
     const boot = Number((fs.readFileSync('/proc/stat', 'utf8').match(/^btime (\d+)/m) || [])[1]) * 1000, tick = 100;
@@ -88,7 +88,7 @@ function jobProof() {
   let chain;
   try { chain = ancestors(); } catch { return { ok: false, reason: 'не удалось снять отпечаток процесса' }; }
   if (!chain.length) return { ok: false, reason: 'не удалось снять отпечаток процесса' };
-  for (const name of ['team', 'codex', 'antigravity', 'grok']) {
+  for (const name of [...require('./members').servers, 'grok']) {
     const r = ready(name), hit = r?.pid && chain.find(p => p.pid === r.pid);
     if (hit && sameStart(hit.startedAt, r.startedAt)) return { ok: false, job: true, reason: 'среди предков — основной сервер ' + name + ': это поручение' };
   }
@@ -117,7 +117,7 @@ function fingerprintAlive(fp, fresh = true) {
     return !!p && (!fp.startedAt || !p.startedAt || Math.abs(Date.parse(p.startedAt) - Date.parse(fp.startedAt)) < 2000);
   } catch { return true; }
 }
-const LABEL = /^fallback-(codex|antigravity)-[a-zа-яё0-9]{4}$/i;
+const LABEL = { test: label => require('./members').fallbackIds.some(id => new RegExp('^fallback-' + id + '-[a-zа-яё0-9]{4}$', 'i').test(label)) };
 // Сеанс дирижёра у этого вызова: гость-чат той же семьи, тот же отпечаток процесса и та же метка owner.
 function session(a = {}) {
   const acc = access(), client = acc.client();
@@ -156,6 +156,9 @@ function guard(server, tool, a = {}) {
   }
   if ((tool === 'team_word' && a.action !== 'list') || send || tool === 'antigravity_apply' || /_cancel$/.test(tool)) {
     const proof = jobProof();
+    // team-v36: из поручения-сеанса — только подпоручение *_send по правилам job-chain (только чтение, глубина и бюджет).
+    if (!proof.ok && proof.job && send && client === server) throw Error(deny('Подпоручение своему же серверу из поручения запрещено.'));
+    if (!proof.ok && proof.job && send && tool !== 'team_word') { require('./job-chain').admit(server, tool, a); return; }
     if (!proof.ok) throw Error(proofRefusal(proof, 'Поручение-сеанс этого не делает: слово, поручения и перенос — только из чата; '));
   }
   // team-v25: jobProof выше обязателен для каждой отправки и отмены.
@@ -435,8 +438,8 @@ function continuation(w, old, a, jobs) {
   const c = a.continue_stage || {};
   const id = typeof c === 'string' ? c : c.id, au = c.author || {};
   if (typeof id !== 'string' || !id) throw Error('continue_stage: укажите id этапа.');
-  if (!['openai', 'google', 'xai'].includes(au.family) || typeof au.model !== 'string' || !au.model.trim())
-    throw Error('continue_stage: укажите author — семью и модель поручения «текст» (openai, google или xai).');
+  if (![...require('./members').all().filter(m => m.external).map(m => m.family), 'xai'].includes(au.family) || typeof au.model !== 'string' || !au.model.trim())
+    throw Error('continue_stage: укажите author — семью и модель поручения «текст» (допустимые семьи — из team_status).');
   const snap = readSnapshot(s0.word.id);
   if (!snap || snap.error) throw Error('continue_stage: ' + snapshotLine(snap));
   const from = snap.works?.find(x => x.name === w.name)?.stages?.find(s => s.id === id);
@@ -528,32 +531,34 @@ function continuation(w, old, a, jobs) {
 }
 // Состояние папки для списка записанных файлов поручения Codex с записью: путь → размер и время; .git и node_modules — мимо.
 // Больше 50 000 файлов — список не ведётся (null): такие файлы считаются тронутыми (отказ по умолчанию).
-function folderState(folder, limit = 50000) {
-  const out = new Map(), stack = [''];
+function folderState(folder, limit = 50000) { return folderStateDetailed(folder, limit).state; }
+function folderStateDetailed(folder, limit = 50000) {
+  const out = new Map(), stack = [''], errors = [];
   while (stack.length) {
     const rel = stack.pop();
     let entries;
-    try { entries = fs.readdirSync(path.join(folder, rel), { withFileTypes: true }); } catch { continue; }
+    try { entries = fs.readdirSync(path.join(folder, rel), { withFileTypes: true }); } catch (e) { errors.push({ path: rel || '.', op: 'readdirSync', code: e.code || e.message }); continue; }
     for (const e of entries) {
       if (e.isSymbolicLink() || ['.git', 'node_modules'].includes(e.name)) continue;
       const r = rel ? rel + '/' + e.name : e.name;
       if (e.isDirectory()) { stack.push(r); continue; }
       if (!e.isFile()) continue;
-      try { const st = fs.statSync(path.join(folder, r)); out.set(r, st.size + ':' + st.mtimeMs); } catch {}
-      if (out.size > limit) return null;
+      try { const st = fs.statSync(path.join(folder, r)); out.set(r, st.size + ':' + st.mtimeMs); } catch (e) { errors.push({ path: r, op: 'statSync', code: e.code || e.message }); }
+      if (out.size > limit) return { state: null, errors };
     }
   }
-  return out;
+  return { state: out, errors };
 }
-// Изменённые за поручение файлы: путь и sha256 после поручения (null — файл удалён).
-function folderChanges(folder, before) {
-  const after = folderState(folder);
+// Изменённые за поручение файлы: путь и sha256 после поручения (null — файл удалён или не прочитан; ошибки — в details.errors).
+function folderChanges(folder, before, details) {
+  const result = folderStateDetailed(folder), after = result.state;
+  if (details) Object.assign(details, result);
   if (!before || !after) return null;
   const changed = [];
   for (const p of new Set([...before.keys(), ...after.keys()])) {
     if (before.get(p) === after.get(p)) continue;
     let sha256 = null;
-    if (after.has(p)) { try { sha256 = crypto.createHash('sha256').update(fs.readFileSync(path.join(folder, p))).digest('hex'); } catch {} }
+    if (after.has(p)) { try { sha256 = crypto.createHash('sha256').update(fs.readFileSync(path.join(folder, p))).digest('hex'); } catch (e) { result.errors.push({ path: p, op: 'readFileSync', code: e.code || e.message }); } }
     changed.push({ path: p, sha256 });
   }
   return changed.sort((x, y) => x.path.localeCompare(y.path));
@@ -569,6 +574,7 @@ function queueHold(card) {
   const m = words().mode();
   // Слово имеет приоритет: fromChat никогда не снимает удержание запасного режима.
   if (!card.fallbackWord) {
+    if (card.parentJob) return require('./job-chain').queuedRefusal(card, undefined, 'codex') || '';
     if (card.fromChat === 'codex' && card.from === 'codex' && card.fullAccess !== true) return '';
     return 'запись из очереди — только по поручению дирижёра запасного режима или чата Codex';
   }
@@ -583,4 +589,4 @@ function caller() {
 
 module.exports = { NAMES, FAMILY, SEATS, LABEL, probe, processTable, ancestors, reset, chatProof, sameFingerprint, fingerprintAlive, session,
   conductorAllows, refusalText, guard, banner, releaseLine, launchLine, snapshot, readSnapshot, launchDesktop, word, helperAllowed, helperWord,
-  hasAnthropic, writtenBy, unknownCodex, drift, continuation, caller, jobEnv, queueHold, jobProof, folderState, folderChanges, snapshotLine };
+  hasAnthropic, writtenBy, unknownCodex, drift, continuation, caller, jobEnv, queueHold, jobProof, folderState, folderStateDetailed, folderChanges, snapshotLine };

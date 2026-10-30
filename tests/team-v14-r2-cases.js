@@ -30,8 +30,8 @@ module.exports = ({ test, fixture, job, file, fresh, accept, gate, Team, root, p
     else { await accept(f); assert.equal(f.s.state, 'принят'); }
   });
   test('КР2 К2: ошибка одного этапа не прерывает update работы', async () => {
-    const f = fixture({ state: 'принят', evidence: 'проверено', reviews: ['нет-поручения'] }), team = saveWork(f);
-    const out = await team.work({ action: 'update', owner: 'test', name: f.w.name, expected_revision: 1, next_step: 'исправить этап' });
+    const f = fixture({ state: 'идёт', evidence: 'проверено', reviews: ['нет-поручения'] }), team = saveWork(f);
+    const out = await team.work({ action: 'update', owner: 'test', name: f.w.name, expected_revision: 1, next_step: 'исправить этап', stages: [{ ...f.s, state: 'принят' }] });
     assert.match(out, /Этап не принят/); const w = read(team.workFile(f.w.name)); assert.equal(w.next_step, 'исправить этап'); assert.equal(w.stages[0].state, 'идёт');
   });
   test('КР2 К3: совет Codex с продолжением не блокирует этап', async () => {
@@ -51,7 +51,7 @@ module.exports = ({ test, fixture, job, file, fresh, accept, gate, Team, root, p
     assert.equal(JSON.stringify(read(team.workFile(f.w.name)).stages[0].gate.files), before);
     assert(a.task.includes(rejected)); assert.equal(a.replacementEvidence.files[0].hash, sha(rejected));
   });
-  test('КР2 М1: ошибка повторного чтения автора сохраняет принятие', async () => {
+  test('КР2 М1: исторический автор не перечитывается при сохранении приёмки', async () => {
     const f = fixture({ level: 'мелочь', author: { family: 'google', model: 'gemini' } });
     const id = job(f, 'antigravity', 0, { role: 'текст' }); job(f); await accept(f); const team = saveWork(f);
     const card = require('../common/team-store').list('antigravity', false).jobs.find(j => j.id === id).cardFile;
@@ -60,14 +60,14 @@ module.exports = ({ test, fixture, job, file, fresh, accept, gate, Team, root, p
       if (String(p) === card && ++reads > 1) throw Object.assign(Error(id + ': EACCES'), { code: 'EACCES' });
       return original(p, ...args);
     };
-    try { const w = await team.refreshWork(team.workFile(f.w.name)); assert.equal(w.stages[0].state, 'принят'); assert(w.stages[0].gate.warning.includes(id)); }
+    try { const w = await team.refreshWork(team.workFile(f.w.name)); assert.equal(w.stages[0].state, 'принят'); assert.equal(reads, 1); assert(!w.stages[0].gate.warning); }
     finally { fs.readFileSync = original; }
   });
   test('КР2 М2: возврат по порядку при одинаковом времени создания', async () => {
     const f = fixture(), stamp = new Date().toISOString(); job(f, 'antigravity', 0, { gateOrder: 1, startedAt: stamp });
     job(f, 'grok', 0, { gateOrder: 2, startedAt: stamp, replaces: { who: 'codex', reason: 'авария' }, replacementEvidence: { note: 'авария' } });
     await assert.rejects(accept(f), /openai/); job(f, 'codex', 0, { gateOrder: 2, startedAt: stamp }); await accept(f); const old = structuredClone(f.s); job(f, 'codex', 1, { gateOrder: 3, startedAt: stamp });
-    await assert.rejects(gate.evaluate(f.w, f.s, old), /НЕ ПРИНЯТО codex/);
+    assert.match(await gate.evaluate(f.w, f.s, old), /НЕ ПРИНЯТО codex/); assert.equal(f.s.state, 'идёт');
   });
   test('КР2 М3: составные и неоднозначные версии требуют одного указания', async () => {
     for (const [v, text] of [['ред. 1', 'ред. 1.2'], ['v2', 'v2.0'], ['ред. 1', 'сравни ред. 12 с ред. 1'], ['ред. 1', 'version: ред. 1\nversion: ред. 12']]) {

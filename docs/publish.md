@@ -22,7 +22,7 @@
 5. Установка в изолированном профиле в `"$w\check"`, всё в одном процессе PowerShell:
    - убрать ВСЕ переменные MOST_* — среди них переопределения путей, которые важнее USERPROFILE и APPDATA
      (Env:MOST_CLAUDE_CONFIGS, Env:MOST_CODEX_CONFIG, Env:MOST_AGY_MCP_CONFIG, Env:MOST_AGY_CONFIG,
-     Env:MOST_CODEX_RULES, Env:MOST_AGY_RULES, Env:MOST_REPO_ROOT, Env:MOST_STATE_DIR), и MOST_AFTER_DEPLOY из п. 4:
+     Env:MOST_CODEX_RULES, Env:MOST_AGY_RULES, Env:MOST_AGY_CLI_SETTINGS, Env:MOST_DSH_CONFIG, Env:MOST_DSH_RULES, Env:MOST_REPO_ROOT, Env:MOST_STATE_DIR), и MOST_AFTER_DEPLOY из п. 4:
      `Get-ChildItem Env:MOST_* | ForEach-Object { Remove-Item "Env:$($_.Name)" }`;
    - `$p = "$w\profile"`; `$env:USERPROFILE=$p`; `$env:APPDATA="$p\AppData\Roaming"`; `$env:LOCALAPPDATA="$p\AppData\Local"`;
      `$env:MOST_SETUP_NOPAUSE='1'`; проверка `Get-ChildItem Env:MOST_*` — нет ничего, кроме MOST_SETUP_NOPAUSE,

@@ -3,7 +3,7 @@
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const LIMITS = Object.freeze({ json: 8 * 1024 ** 2, text: 16 * 1024 ** 2,
   count: 4096, file: 512 * 1024 ** 2, total: 32 * 1024 ** 3, chunk: 1024 ** 2 });
-const QUORUM = require('./members').helpers;
+const QUORUM = require('./members').seatIds;
 const HEX = /^[a-f0-9]{64}$/;
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');
 const canonical = x => JSON.stringify(sort(x));
@@ -12,7 +12,7 @@ function sort(x) { return Array.isArray(x) ? x.map(sort) : x && typeof x === 'ob
 function fail(message, code = 2) { throw Object.assign(Error(message), { workflowCode: code }); }
 function need(condition, message, code) { if (!condition) fail(message, code); }
 function unique(xs) { return new Set(xs).size === xs.length; }
-function exactQuorum(xs) { return Array.isArray(xs) && unique(xs) && xs.filter(x => x !== 'grok').length === QUORUM.length && QUORUM.every(x => xs.includes(x)); }
+function exactQuorum(xs) { return QUORUM.length > 0 && Array.isArray(xs) && unique(xs) && xs.filter(x => x !== 'grok').length === QUORUM.length && QUORUM.every(x => xs.includes(x)); }
 function marker(text, key) {
   const rows = String(text).split(/\r?\n/).filter(x => x.startsWith(key + ':'));
   return rows.length === 1 ? rows[0].slice(key.length + 1).trim() : null;

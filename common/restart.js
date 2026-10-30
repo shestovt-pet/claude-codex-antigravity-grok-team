@@ -40,7 +40,7 @@ ${close ? closingScript({ state, runId, id }) : ''}  function Launch {
   $deadline = (Get-Date).AddSeconds(300)
   do {
     $missing = @()
-    foreach ($name in @(${require('./members').servers.map(quote).join(', ')})) {
+    foreach ($name in @(${require('./members').installedServers.map(quote).join(', ')})) {
       try {
         $ready = Get-Content -LiteralPath (Join-Path $state ('ready\\' + $name + '.json')) -Raw -Encoding utf8 | ConvertFrom-Json
         if ([DateTime]::Parse($ready.startedAt).ToUniversalTime() -le $started.ToUniversalTime() -or $ready.release -ne $release -or -not (Get-Process -Id $ready.pid -ErrorAction SilentlyContinue)) { $missing += $name }
@@ -50,7 +50,7 @@ ${close ? closingScript({ state, runId, id }) : ''}  function Launch {
     Start-Sleep -Seconds 1
   } while ((Get-Date) -lt $deadline)
   if ($missing.Count) { Complete $false ('Не готовы: ' + ($missing -join ', ')); Tell ('Перезапуск Claude: не готовы ' + ($missing -join ', ') + ' — истекло время ожидания') }
-  else { Complete $true 'Все три сервера готовы'; Tell ${quote('Claude перезапущен, серверы ' + path.basename(release).slice(0, 8) + ' работают')} }
+  else { Complete $true 'Все серверы реестра готовы'; Tell ${quote('Claude перезапущен, серверы ' + path.basename(release).slice(0, 8) + ' работают')} }
 } catch { Complete $false $_.Exception.Message; Tell ('Перезапуск Claude: не готовы team, codex, antigravity — ' + $_.Exception.Message) }
 `;
 }
@@ -180,13 +180,13 @@ async function waitForCompletion(info, deps = {}) {
       if (!fs.readFileSync(info.log, 'utf8').replace(/^\uFEFF/, '').split(/\r?\n/).includes('итог ' + info.runId + ' True')) throw Error('Успешный журнал перезапуска не подтверждён.');
       const started = Date.parse(value.startedAt);
       if (!Number.isFinite(started) || !Number.isFinite(Date.parse(value.finishedAt)) || Date.parse(value.finishedAt) < started) throw Error('Неверное время итога перезапуска.');
-      const ready = require('./members').servers.map(name => {
+      const ready = require('./members').installedServers.map(name => {
         const r = JSON.parse(fs.readFileSync(path.join(info.state, 'ready', name + '.json'), 'utf8'));
         if (!samePath(r.release, info.release) || !(Date.parse(r.startedAt) > started) || (deps.alive || require('./deploy-ops').alive)(r.pid) !== true)
           throw Error('Готовность нового сервера не подтверждена: ' + name);
         return { name, ...r };
       });
-      return { message: 'Claude перезапущен; все три сервера нового релиза готовы.', log: info.log, result: info.result, ...value, ready };
+      return { message: 'Claude перезапущен; все серверы реестра нового релиза готовы.', log: info.log, result: info.result, ...value, ready };
     }
     await sleep(250);
   }

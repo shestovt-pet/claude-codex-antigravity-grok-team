@@ -2,6 +2,7 @@
 // Transport observations are declarations, not cryptographic model attestations.
 const { family } = require('./model-family');
 const UNKNOWN = 'unknown';
+function historical(who) { try { return require('./members').all().find(m => m.id === who); } catch { return null; } }
 const TOOL_NAMES = new Set(['invoke_subagent', 'generate_image', 'image-generator', 'read_file', 'list_directory', 'grep_search', 'find_by_name', 'run_command', 'write_to_file', 'replace_file_content', 'call_mcp_tool', 'team_status', 'team_rules', 'team_work', 'codex_send', 'codex_status', 'codex_result', 'grok_send', 'grok_status', 'grok_result', 'web_search', 'command_execution', 'mcp_tool_call', 'web_search_call', 'file_change']);
 const id = v => typeof v === 'string' && v !== UNKNOWN && /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/.test(v) ? v : null;
 function toolNames(calls) {
@@ -19,7 +20,7 @@ function forJob(job = {}, who = 'unknown') {
     authenticated_client: client,
     client_identity_evidence: 'configured_client_label_not_authentication',
     agent_instance: id(job.threadId) || id(job.id) || UNKNOWN,
-    transport: ({antigravity: 'agy-cli', codex: 'codex-cli', grok: 'grok-webhook'})[who] || UNKNOWN,
+    transport: (who === 'grok' ? 'grok-webhook' : historical(who)?.adapter) || UNKNOWN,
     requested_text_model: requested || UNKNOWN,
     provider_reported_text_model: reported || UNKNOWN,
     evidence_level: reported ? 'provider_reported' : requested ? 'requested_only' : UNKNOWN,
@@ -60,7 +61,7 @@ function reviewerInfo(job, who) {
   const requested = family(p.requested_text_model), reported = family(p.provider_reported_text_model);
   // Model aliases may differ within a family; unknown reported families cannot corroborate requests.
   const mismatch = !!(requested && p.evidence_level === 'provider_reported' && requested !== reported);
-  const routeFamily = ({codex: 'openai', grok: 'xai'})[who] || null;
+  const routeFamily = (who === 'grok' ? 'xai' : historical(who)?.adapter === 'codex-cli' ? historical(who).family : null);
   return { ...p, family: reported || requested || routeFamily, family_evidence: reported ? 'provider_reported' : requested ? 'requested_only' : routeFamily ? 'configured_route' : UNKNOWN, mismatch };
 }
 function format(job, who) {

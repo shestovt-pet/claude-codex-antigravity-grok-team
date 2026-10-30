@@ -4,6 +4,7 @@ const RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v16-'));
 const root = path.join(RUN, 'repo'), project = path.join(RUN, 'project');
 fs.mkdirSync(root); fs.mkdirSync(project);
 Object.assign(process.env, { MOST_REPO_ROOT: root, MOST_STATE_DIR: path.join(root, 'state'),
+  MOST_AGY_CLI_SETTINGS: path.join(RUN, 'agy-cli/settings.json'),
   MOST_CODEX_JOBS_DIR: path.join(root, 'state', 'codex-jobs'), MOST_CODEX_ARCHIVE_DIR: '',
   MOST_CLIENT: 'claude', MOST_NOTIFY: 'off', MOST_AFTER_DEPLOY: 'off', MOST_FALLBACK_DIR: path.join(RUN, 'fallback') });
 process.env.MOST_CLAUDE_CONFIGS = '[]';
@@ -52,9 +53,10 @@ async function accept(f, opts = {}, old) {
   Object.assign(f.s, opts); return gate.evaluate(f.w, f.s, old);
 }
 async function run(tests) {
-  let failed = 0;
-  for (const [name, fn] of tests) try { await fn(); console.log('OK ' + name); } catch (e) { failed++; console.error('FAIL ' + name + '\n' + e.stack); }
-  console.log('Итого: пройдено ' + (tests.length - failed) + ', провалено ' + failed);
+  let failed = 0, skipped = 0;
+  for (const [name, fn] of tests) try { await fn(); console.log('OK ' + name); }
+    catch (e) { if (e && e.__skip) { skipped++; console.log('ПРОПУСК ' + name + ' — ' + e.message); } else { failed++; console.error('FAIL ' + name + '\n' + e.stack); } }
+  console.log('Итого: пройдено ' + (tests.length - failed - skipped) + ', провалено ' + failed + ', пропущено ' + skipped);
   process.exitCode = failed ? 1 : 0;
 }
 module.exports = { RUN, root, project, gate, stores, sha, write, json, fixture, job, fresh, dismiss, accept, run };

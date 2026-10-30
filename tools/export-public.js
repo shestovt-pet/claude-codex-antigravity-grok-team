@@ -118,7 +118,7 @@ function exportPublic({ root = path.resolve(__dirname, '..'), target, commit = '
   const tar = path.join(os.tmpdir(), 'most-public-' + process.pid + '-' + Date.now() + '.tar');
   try {
     git(['archive', '--format=tar', '-o', tar, hash]);
-    execFileSync('tar', ['-xf', tar, '-C', target], { windowsHide: true, stdio: 'pipe' });
+    execFileSync(require('../common/paths').systemTar(), ['-xf', tar, '-C', target], { windowsHide: true, stdio: 'pipe' });
   } finally { try { fs.rmSync(tar, { force: true }); } catch {} }
   const excluded = [], broken = [];
   let replaced = 0;

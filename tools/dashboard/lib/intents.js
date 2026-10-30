@@ -9,7 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { repoRoot } = require('../../../common/paths');
 
-const AGENTS = new Set(['codex', 'antigravity', 'grok']);
+const AGENTS = { has: id => require('../../../common/members').helpers.includes(id) };
 const WORK_RE = /^[a-z0-9-]{1,40}$/;
 const ID_RE = /^[a-zA-Z0-9_-]{1,80}$/;
 const TASK_MAX = 20000;

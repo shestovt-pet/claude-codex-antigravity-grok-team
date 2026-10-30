@@ -3,7 +3,7 @@
 const stores = require('./team-store');
 function create() {
   const helpers = new Map(), owners = new Map();
-  for (const who of require('./members').helpers) {
+  for (const who of require('./members').scanIds) {
     const entries = stores.scan(who), index = new Map();
     for (const entry of entries) for (const job of entry.jobs) {
       if (!index.has(job.id)) index.set(job.id, new Map());

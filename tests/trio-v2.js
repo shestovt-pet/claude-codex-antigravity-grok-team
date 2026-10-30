@@ -1,4 +1,8 @@
 'use strict';
+process.env.MOST_AGY_CLI_SETTINGS = require('path').join(__dirname, '.tmp-agy-cli-settings-'+process.pid, 'settings.json');
+// Клиент DSH в тестах изолирован так же, как остальные приложения.
+process.env.MOST_DSH_CONFIG = require('path').join(__dirname, 'missing-dsh-config.yml');
+process.env.MOST_DSH_RULES = require('path').join(__dirname, 'missing-dsh-rules.md');
 // Этот набор проверяет запасной путь и прежний тестовый agy.
 process.env.MOST_AGY_INPUT_FORMAT = 'legacy';
 const fs = require('fs'), path = require('path'), assert = require('assert'), crypto = require('crypto');
@@ -215,7 +219,7 @@ test('E1: гостевые списки инструментов, очередь
       }
       assert.equal(read(path.join(state,'ready',who+'.json')).release,path.resolve(__dirname,'..'));
       const result=await guest.callTool({name:who+'_result',arguments:{id}});assert.match(result.content[0].text,/Принято 100 %/);
-      const team=await connect('team','codex');const teamTools=(await team.listTools()).tools;assert.deepEqual(teamTools.map(t=>t.name).sort(),['team_rules','team_status','team_word','team_work']);
+      const team=await connect('team','codex');const teamTools=(await team.listTools()).tools;assert.deepEqual(teamTools.map(t=>t.name).sort(),['team_ask','team_ask_result','team_rules','team_status','team_word','team_work']);
       assert(teamTools.find(t=>t.name==='team_work').inputSchema.properties.stages.items.properties.closes);
       assert((await team.callTool({name:'team_status',arguments:{notify_test:true}})).isError);
       assert((await team.callTool({name:'team_work',arguments:{owner: 'test-owner', action: 'create',name:'no'}})).isError);
@@ -223,7 +227,8 @@ test('E1: гостевые списки инструментов, очередь
   }
 });
 test('E2: допустимые MCP-вызовы и запреты',()=>{
-  const a=require('../common/agy-tools'); assert(a.allowed({name:'call_mcp_tool',args:{tool_name:'team_status'}})); assert(a.allowed({name:'mcp__team__team_work',args:{owner: 'test-owner', action: 'get'}}));
+  const a=require('../common/agy-tools'); // Прежнее разрешённое чтение поручений Antigravity сохранено, Notion добавлен.
+  assert(a.allowed({name:'call_mcp_tool',args:{tool_name:'team_status'}})); assert(a.allowed({name:'mcp__team__team_work',args:{owner: 'test-owner', action: 'get'}})); assert(a.allowed({name:'mcp__team__team_rules',args:{part: 'common'}})); assert(a.allowed({name:'codex_status',args:{}})); assert(a.allowed({name:'codex_send',args:{role: 'совет'}})); assert(a.allowed({name:'call_mcp_tool',args:{server:'notion',tool:'API-get-self'}})); assert(!a.allowed({name:'codex_send',args:{role: 'текст', write: true}})); assert(!a.allowed({name:'call_mcp_tool',args:{server:'comfyui',tool:'queue'}}));
   assert(!a.allowed({name:'mcp__team__team_work',args:{owner: 'test-owner', action: 'update'}})); assert(a.forbidden([{name:'run_command'}])); assert(a.forbidden([{name:'invoke_subagent'}]));
 });
 test('E3: TOML сохраняет посторонние байты, повтор и конфликты',()=>{
@@ -246,10 +251,18 @@ test('E3–E4: deploy обновляет три приложения; повто
   const codex=path.join(dir,'config.toml'),agy=path.join(dir,'mcp.json'),permissions=path.join(dir,'permissions.json'),claude=path.join(dir,'claude.json');
   process.env.MOST_CODEX_CONFIG=codex;process.env.MOST_AGY_MCP_CONFIG=agy;process.env.MOST_AGY_CONFIG=permissions;process.env.MOST_CLAUDE_CONFIGS=JSON.stringify([claude]);
   write(codex,'# чужие байты\r\nmodel = "keep"\r\n');json(agy,{foreign:123});json(permissions,{userSettings:{globalPermissionGrants:{allow:['keep']}}});json(claude,{foreign:456});
+  // После инициализации реестра общий сервер возвращается в релиз А;
+  // отключённые прежде гостевые подключения восстанавливаются как отключённые.
+  const previous = path.join(root, 'live', 'd'.repeat(40));
+  for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js'])
+    write(path.join(previous, 'common', name), fs.readFileSync(path.join(__dirname, '..', 'common', name)));
+  for (const name of require('../common/members').servers) write(path.join(previous, 'servers', name, 'index.js'), '// прежний сервер');
+  json(claude, d.configFor({ foreign: 456 }, previous, root));
   const before=[codex,agy,permissions,claude].map(f=>fs.readFileSync(f,'utf8')), calls=[];
-  const deps={archive:async(root,commit,temp)=>{for(const n of ['team','codex','antigravity'])write(path.join(temp,'servers',n,'index.js'),'// подделка');write(path.join(temp,'common','access.js'),fs.readFileSync(path.join(__dirname,'..','common','access.js')));/* team-v28 Р1 */},install:async()=>{},probe:async(file,env)=>{calls.push(env.MOST_CLIENT);return {tools:(env.MOST_CLIENT==='claude'?[]:require('../common/access').guestTools(path.basename(path.dirname(file)),env.MOST_CLIENT)).map(name=>({name}))};}};
+  const deps={archive:async(root,commit,temp)=>{for(const n of ['team','codex','antigravity','claude'])write(path.join(temp,'servers',n,'index.js'),'// подделка');write(path.join(temp,'common','access.js'),fs.readFileSync(path.join(__dirname,'..','common','access.js')));
+  for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(temp, 'common', name), fs.readFileSync(path.join(path.join(__dirname, '..'), 'common', name))); /* реестр кандидата А *//* team-v28 Р1 */},install:async()=>{},probe:async(file,env)=>{calls.push(env.MOST_CLIENT);return {tools:(env.MOST_CLIENT==='claude'?[]:require('../common/access').guestTools(path.basename(path.dirname(file)),env.MOST_CLIENT)).map(name=>({name}))};}};
   try {
-    await d.deploy({root,stateDir:path.join(RUN,'deploy-state')},deps);assert.equal(calls.length,9);
+    await d.deploy({root,stateDir:path.join(RUN,'deploy-state')},deps);assert.equal(calls.length, 4 * (1 + require('../common/member-clients').all().length)); // team-v46: четыре сервера (добавлен claude)
     const after=[codex,agy,permissions,claude].map(f=>fs.readFileSync(f,'utf8'));assert(after[0].startsWith(before[0]));
     assert.equal(read(agy).foreign,123);assert.equal(read(claude).foreign,456);assert.equal(read(claude).mcpServers.team.env.MOST_STATE_DIR,read(agy).mcpServers.team.env.MOST_STATE_DIR);
     assert.equal(read(claude).mcpServers.team.env.MOST_STATE_DIR,path.join(root,'state'));
@@ -258,6 +271,7 @@ test('E3–E4: deploy обновляет три приложения; повто
     assert.match(await d.deploy({root,stateDir:path.join(RUN,'deploy-state'),restartClaude:true},restartDeps),/Перезапуск Claude запланирован/);assert(restarted);
     [codex,agy,permissions,claude].forEach((f,i)=>assert.equal(fs.readFileSync(f+'.prev','utf8'),before[i]));
     assert.match(await d.rollback({root}),/возвращён/);assert.equal(fs.readFileSync(codex,'utf8'),before[0]);assert.equal(read(agy).foreign,123);assert(!read(agy).mcpServers.team);assert.deepEqual(read(permissions).userSettings.globalPermissionGrants.allow,['keep']);
+    assert.equal(read(claude).mcpServers.team.args[0], path.join(previous, 'servers/team/index.js'));
     write(codex,'# most:begin повреждено\n');const current=fs.readFileSync(claude,'utf8');restarted=false;await assert.rejects(d.deploy({root,restartClaude:true},restartDeps),/метки/);assert(!restarted);assert.equal(fs.readFileSync(claude,'utf8'),current);
   } finally {for(const [k,v] of Object.entries(saved))v===undefined?delete process.env[k]:process.env[k]=v;}
 });

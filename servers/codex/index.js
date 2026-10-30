@@ -16,6 +16,8 @@ const { classifyCodex, retryPlan, codexQuota, quotaText, command } = require('..
 const { readCard, logFailure, guarded } = require('../../common/cards');
 const access = require('../../common/access');
 const restartHold = require('../../common/restart-hold');
+const writeLock = require('../../common/write-lock'),
+  writeFolder = require('../../common/write-folder');
 let restartServer;
 // Вызывается только под job_start: обработчики могут загрузиться до стартового цикла.
 function admitExecution() {
@@ -33,33 +35,14 @@ const active = new Map(),
 let closing = false,
   scanning = false;
 function findCli() {
-  if (process.env.CODEX_PATH) return fs.existsSync(process.env.CODEX_PATH) ? process.env.CODEX_PATH : null;
-  try {
-    return execFileSync(
-      process.platform === 'win32' ? 'where.exe' : 'which',
-      [process.platform === 'win32' ? 'codex.exe' : 'codex'],
-      { encoding: 'utf8', windowsHide: true },
-    )
-      .trim()
-      .split(/\r?\n/)[0];
-  } catch {}
-  try {
-    const root = path.join(process.env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin');
-    return fs
-      .readdirSync(root)
-      .map((n) => path.join(root, n, 'codex.exe'))
-      .filter((p) => fs.existsSync(p))
-      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0] || null; // пустой bin — null, как и без bin
-  } catch {
-    return null;
-  }
+  return require('../../common/codex-binary').findCli();
 }
 // team-v28 Р4: приложение Codex при обновлении переезжает в новую папку bin\<хеш>; запомненный путь проверяется
 // перед каждым использованием, иначе поручения падали с ENOENT до перезапуска Claude.
-// Пропавший путь ищется сразу; если Codex не найден вовсе — не чаще раза в минуту (очередь опрашивает часто).
+// team-v46 п.8: путь годен только с codex-code-mode-host.exe рядом; пропавший/неполный ищется сразу.
 let cachedBinary = findCli(), searchedAt = Date.now();
 function currentBinary() {
-  if (cachedBinary && fs.existsSync(cachedBinary)) return cachedBinary;
+  if (require('../../common/codex-binary').valid(cachedBinary)) return cachedBinary;
   if (cachedBinary || Date.now() - searchedAt >= 60000) { searchedAt = Date.now(); cachedBinary = findCli(); }
   return cachedBinary;
 }
@@ -152,6 +135,16 @@ async function normalized(id) {
   return j;
 }
 
+// Полный номер по полному номеру или однозначному префиксу: тот же источник, что у закрытия словом.
+async function resolveId(id) {
+  let j;
+  try { j = load(id); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  if (j && j.id === id) return j.id;
+  const found = list().filter(x => typeof x.id === 'string' && x.id.startsWith(id));
+  if (found.length !== 1) throw Error(found.length ? 'Предыдущее поручение неоднозначно: ' + id : 'Предыдущее поручение не найдено: ' + id);
+  return found[0].id;
+}
+
 function reply(j, body, next = 'Проверьте результат.', error = false) {
   return { content: [{ type: 'text', text: format('Codex', j, body, next) }], ...(error ? { isError: true } : {}) };
 }
@@ -188,7 +181,7 @@ function view(j, offset = 0) {
 
 function fullAccessAllowed(card) {
   return card.fullAccess === true && card.write === true && ['текст', 'совет'].includes(card.role) &&
-    card.from === 'claude' && !card.fallbackWord && !Object.hasOwn(card, 'fromChat');
+    card.from === 'claude' && !card.parentJob && !card.fallbackWord && !Object.hasOwn(card, 'fromChat');
 }
 
 function fullAccessFolderRefusal(folder) {
@@ -206,6 +199,8 @@ function chatFolderRefusal(folder) {
 }
 
 function chatCardRefusal(card) {
+  const chain = require('../../common/job-chain').queuedRefusal(card, undefined, 'codex');
+  if (chain) return chain;
   if (!Object.hasOwn(card, 'fromChat')) return null;
   if (card.fromChat !== 'codex' || card.from !== 'codex' || card.fullAccess === true)
     return 'Карточка чата Codex отклонена: противоречивые поля fromChat, from или fullAccess.';
@@ -237,6 +232,13 @@ async function execute(job, folderLock) {
   if (!execution.ok) {
     if (folderLock) await folderLock.release();
     throw Error('Поручение уже выполняется.');
+  }
+  let writesBefore = null, formatBefore = null, formatResult = null;
+  const textFormat = require('../../common/text-format');
+  const formatDir = path.join(path.dirname(file(job.id)), job.id, 'format-before');
+  function clearFormat() {
+    try { textFormat.cleanup({ dir: formatDir }); }
+    catch (e) { formatResult = { ...(formatResult || {}), formatCheck: 'неполная: ошибка уборки снимка: ' + e.message }; }
   }
   let child,
     buffer = '',
@@ -272,9 +274,18 @@ async function execute(job, folderLock) {
       if (f.kind !== 'none') failure = f;
     }
     let writes = [];
-    if (job.write) { try { writes = require('../../common/fallback').folderChanges(job.folder, writesBefore); } catch { writes = null; } }
     try {
+      if (job.write) {
+        const after = {};
+        try { writes = require('../../common/fallback').folderChanges(job.folder, writesBefore, after); }
+        catch (e) { writes = null; after.errors = [{ path: '.', code: e.code || e.message }]; }
+        try {
+          if (!formatResult) formatResult = textFormat.compare(job.folder, formatBefore, writesBefore, writes, { errors: after.errors || [] });
+        } catch (e) { formatResult = { formatCheck: 'ошибка проверки: ' + e.message, formatSuspicions: [] }; }
+        clearFormat();
+      }
       await mutate(job.id, (c) => {
+        if (job.write && formatResult) Object.assign(c, formatResult);
         if (!writes) { c.writes = null; c.writesUnknown = 'список записанных файлов не составлен'; }
         else if (c.writes !== null) {
           const byPath = new Map((Array.isArray(c.writes) ? c.writes : []).map(e => [e.path, e]));
@@ -285,13 +296,19 @@ async function execute(job, folderLock) {
         c.provenance = provenance.forJob(job, 'codex');
         c.finishedAt = new Date().toISOString();
         c.exitCode = code;
-        if (c.status === 'cancelling') {
+        const deadlines = require('../../common/chain-deadline');
+        if (c.status === 'running' && (deadlines.parentTerminal(c) || deadlines.deadlinePassed(c))) {
+          c.status = 'cancelling'; c.stopReason = deadlines.parentTerminal(c) ? 'parent' : 'timeout';
+        }
+        if (c.status === 'cancelling' || c.status === 'stop_unconfirmed') {
           c.status = c.stopReason === 'cancel' ? 'cancelled' : c.write ? 'needs_decision' : 'failed';
           c.error =
             c.stopReason === 'timeout'
               ? 'Истёк предел времени. Проверьте частичный результат.'
               : c.stopReason === 'shutdown'
                 ? 'Сервер остановлен. Проверьте частичный результат.'
+                : c.stopReason === 'parent'
+                ? 'Родитель завершился; поручение остановлено.'
                 : 'Выполнение остановлено. Уже внесённые изменения сохраняются.';
         } else if (failure?.kind === 'quota') {
           Object.assign(c, retryPlan(c, failure));
@@ -336,13 +353,25 @@ async function execute(job, folderLock) {
   args.push('-');
   // team-v19 (Grok cfb0705b Б2): поручение с записью оставляет в карточке список изменённых файлов папки с sha256 —
   // состояние до и после, под замком codex_folder; без записи список пуст.
-  const writesBefore = job.write ? require('../../common/fallback').folderState(job.folder) : null;
+
   // Повторный realpath после замков и снимка файлов, непосредственно перед запуском.
   // Это отдельный выход: исполнитель ещё ничего не выполнял.
   try {
+    if (job.write) {
+      try {
+        const before = require('../../common/fallback').folderStateDetailed(job.folder);
+        writesBefore = before.state;
+        formatBefore = textFormat.snapshot(job.folder, writesBefore, { dir: formatDir, errors: before.errors });
+      } catch (e) { formatResult = { formatCheck: 'ошибка снимка: ' + e.message, formatSuspicions: [] }; }
+    }
     job.fullAccessApplied = false;
     const chatRefusal = chatCardRefusal(job);
     if (chatRefusal) throw Error(chatRefusal);
+    // team-v46 п.5а: повторная проверка папки записи перед запуском.
+    if (job.write) {
+      const fref = writeFolder.refusal(job.folder, { client: job.from, guest: !!job.parentJob || job.from !== 'claude', fullAccess: fullAccessAllowed(job), owner: job.ownerLabel });
+      if (fref) throw Error(fref);
+    }
     if (job.fromChat && job.fallbackWord) {
       const hold = require('../../common/fallback').queueHold(job);
       if (hold) throw Error(hold);
@@ -354,6 +383,7 @@ async function execute(job, folderLock) {
       console.error('Codex: полный доступ карточки отклонён (значение, запись, роль или происхождение); запуск в песочнице.');
     }
   } catch (e) {
+    clearFormat();
     try {
       await mutate(job.id, c => {
         c.status = 'failed'; c.error = e.message; c.fullAccessApplied = false;
@@ -372,6 +402,7 @@ async function execute(job, folderLock) {
       c.fullAccessApplied = job.fullAccessApplied;
       c.resultFile = job.resultFile;
     });
+    if (require('../../common/chain-deadline').deadlinePassed(job)) throw Error('Срок поручения истёк до запуска.');
     const c = command(currentBinary(), args);
     child = spawn(c.bin, c.args, {
       cwd: job.folder,
@@ -408,17 +439,18 @@ async function execute(job, folderLock) {
       guarded((code) => finish(code)),
     );
     await mutate(job.id, (c) => {
-      c.childPid = child.pid;
+      c.childPid = child.pid; c.childStartedAt = new Date().toISOString();
     });
     if (done) return;
     timer = setTimeout(
       guarded(() => stop(job.id, 'timeout')),
-      Number(process.env.MOST_CODEX_TIMEOUT_MS || 3600000),
+      require('../../common/chain-deadline').runtimeBudget(job, 'codex'),
     );
     poll = setInterval(
       guarded(function pollJob() {
         const j = load(job.id);
-        if (j.status === 'cancelling') stop(job.id).catch(logFailure);
+        if (require('../../common/chain-deadline').parentTerminal(j)) stop(job.id, 'parent').catch(logFailure);
+        else if (j.status === 'cancelling') stop(job.id, j.stopReason).catch(logFailure);
         else if (job.threadId && j.threadId !== job.threadId)
           mutate(job.id, (c) => {
             c.threadId = job.threadId;
@@ -505,11 +537,12 @@ async function send(a) {
   if (closing) throw Error('Сервер останавливается.');
   if (!path.isAbsolute(a.folder) || !fs.statSync(a.folder).isDirectory())
     throw Error('Нужна абсолютная существующая папка.');
-  if (access.guest() && access.client() === 'codex' && a.write) {
-    const refusal = chatFolderRefusal(a.folder);
-    if (refusal) throw Error(refusal);
-  }
   if (a.work && !a.stage) throw Error('Для работы укажите этап.');
+  // team-v46 п.5а: общее правило папок для любой записи (дирижёр, гость, подпоручение).
+  if (a.write) {
+    const fref = writeFolder.refusal(a.folder, { client: access.client(), guest: access.guest(), fullAccess: a.full_access === true, owner: a.owner });
+    if (fref) throw Error(fref);
+  }
   const folder = fs.realpathSync(a.folder),
     id = randomUUID();
   let prior = null,
@@ -517,9 +550,11 @@ async function send(a) {
     folderLock = null;
   try {
     if (a.continue_id) {
-      priorLock = await locks.tryLock('codex_queue', a.continue_id, { jobId: id });
+      const full = await resolveId(a.continue_id);
+      priorLock = await locks.tryLock('codex_queue', full, { jobId: id });
       if (!priorLock.ok) throw Error('Предыдущее поручение возобновляется.');
-      prior = await normalized(a.continue_id);
+      prior = await normalized(full);
+      if (prior.closedByWord) throw Error('Поручение закрыто словом пользователя; продолжение недоступно.');
       ownChatJob(prior, a);
       if (
         prior.archived ||
@@ -533,8 +568,8 @@ async function send(a) {
         throw Error('Сохраните папку, режим записи и доступ предыдущего поручения.');
     }
     if (a.write) {
-      folderLock = await locks.tryLock('codex_folder', canon(folder), { jobId: id });
-      if (!folderLock.ok) throw Error('В этой папке уже идёт поручение с записью.');
+      folderLock = await writeLock.acquire(folder, { jobId: id });
+      if (!folderLock.ok) throw Error(folderLock.needsDecision ? 'Нужно решение: остановка прежнего исполнителя не подтверждена; замок записи сохранён.' : 'В этой папке (или вложенной) уже идёт поручение с записью.');
       for (const old of list()) {
         if (old.write && old.folder && fs.existsSync(old.folder) && canon(old.folder) === canon(folder)) {
           const current = await normalized(old.id);
@@ -550,6 +585,9 @@ async function send(a) {
     if (a.effort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(a.effort)) throw Error('Недопустимый уровень Codex.');
     if (!access.guest() && restartServer) restartHold.assertAdmitted(stateDir, restartServer, { early: true });
     await require('../../common/stage-gate').prepareJob(a, 'codex');
+    const chainFields = require('../../common/job-chain').fields(a);
+    const dl = require('../../common/chain-deadline').applyDeadline(chainFields, access.client(), 'codex');
+    if (dl.error) throw Error(dl.error);
     const job = {
       id,
       folder,
@@ -561,16 +599,19 @@ async function send(a) {
       task: a.task,
       stage: a.stage, stageTitle: a.stageTitle, stageId: a.stageId, gateOrder: a.gateOrder, scopeTask: a.scopeTask, role: a.role, replaces: a.replaces, replacementEvidence: a.replacementEvidence,
       work: a.work,
-      from: access.client(),
-      ...(access.guest() && access.client() === 'codex' ? { fromChat: 'codex' } : {}),
+      from: require('../../common/job-identity').memberId(access.client()) || access.client(),
+      ...chainFields,
+      ...(access.guest() && access.client() === 'codex' && !chainFields.parentJob ? { fromChat: 'codex' } : {}),
       status: access.guest() ? 'queued' : 'running',
       startedAt: new Date().toISOString(),
       owner: access.guest() ? null : locks.owner(),
+      ownerLabel: a.owner,
       // team-v19 К2: запись по поручению дирижёра запасного режима; основной сервер сверит слово при взятии.
       ...(access.guest() && a.write && require('../../common/user-word').mode().active ? { fallbackWord: require('../../common/user-word').mode().entry.id } : {}),
       threadId: prior?.threadId || null,
       previous: prior?.id || null,
       quotaAttempts: 0,
+      ...(dl.deadline ? { deadline: dl.deadline } : {}),
     };
     if (a.text !== undefined) {
       job.textFile = path.join(dir, id + '.input.txt');
@@ -603,6 +644,16 @@ async function queue() {
   try {
     await require('../../common/progress').longRunning('Codex', list(), mutate);
     for (const j of list()) {
+      if (['queued', 'waiting_quota'].includes(j.status) && require('../../common/chain-deadline').parentTerminal(j)) {
+        await mutate(j.id, c => { if (!['queued', 'waiting_quota'].includes(c.status)) return false; c.status = 'cancelled'; c.stopReason = 'parent'; c.error = 'Родитель завершился; запуск отменён.'; c.finishedAt = new Date().toISOString(); });
+        continue;
+      }
+      // team-v46 п.8: межпроцессная остановка идущих детей, чей родитель завершился досрочно.
+      if (j.status === 'running' && j.parentJob && require('../../common/chain-deadline').parentTerminal(j)) {
+        await mutate(j.id, c => { if (c.status !== 'running') return false; c.status = 'cancelling'; c.stopReason = 'parent'; });
+        if (active.has(j.id)) await stop(j.id, 'parent');
+        continue;
+      }
       if (!['queued', 'waiting_quota'].includes(j.status) || Date.parse(j.nextAttemptAt) > Date.now()) continue;
       // team-v25: противоречивая карточка чата получает отказ даже без записи.
       let refusal;
@@ -617,9 +668,14 @@ async function queue() {
         });
         continue;
       }
+      // team-v46 п.5а: срок родителя истёк в очереди — отмена без запуска.
+      if (require('../../common/chain-deadline').deadlinePassed(j)) {
+        await mutate(j.id, c => { if (!['queued', 'waiting_quota'].includes(c.status)) return false; c.status = 'cancelled'; c.error = 'Срок родителя истёк, пока поручение ждало очереди; запуск отменён.'; c.finishedAt = new Date().toISOString(); });
+        continue;
+      }
       // Запись: прежнее слово или согласованная карточка чата; слово всегда имеет приоритет.
       if (j.write) {
-        if (!j.fallbackWord && j.fromChat !== 'codex') continue;
+        if (!j.fallbackWord && j.fromChat !== 'codex' && !j.parentJob) continue;
         const hold = require('../../common/fallback').queueHold(j);
         if (hold) { if (j.fallbackHold !== hold) await mutate(j.id, (c) => { c.fallbackHold = hold; }).catch(logFailure); continue; }
       }
@@ -629,8 +685,13 @@ async function queue() {
       let folderLock = null;
       try {
         if (j.write) {
-          folderLock = await locks.tryLock('codex_folder', canon(j.folder), { jobId: j.id });
+          folderLock = await writeLock.acquire(j.folder, { jobId: j.id });
           if (!folderLock.ok) { folderLock = null; continue; }
+          const fref = writeFolder.refusal(j.folder, { client: j.from, guest: j.from !== 'claude', fullAccess: fullAccessAllowed(j), owner: j.ownerLabel });
+          if (fref) {
+            await mutate(j.id, c => { if (c.status !== 'queued') return false; c.status = 'failed'; c.error = fref; c.fullAccessApplied = false; c.finishedAt = new Date().toISOString(); });
+            continue;
+          }
         }
         let claimed = false;
         const c = await restartHold.locked(stateDir, () => mutate(j.id, (c) => {
@@ -782,7 +843,7 @@ async function shutdown() {
 
 (async () => {
   await require('../../common/state-migration').start(require('../../common/paths'));
-  restartServer = access.guest() ? null : restartHold.server(stateDir, 'codex');
+  restartServer = access.guest() ? null : restartHold.serverAsync(stateDir, 'codex');
   process.stdin.on('close', guarded(shutdown));
   const owner = await locks.startOwner({ version: VERSION, file: __filename });
   if (!owner.ok) throw Error('Не удалось открыть канал владельца.');

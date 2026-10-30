@@ -5,7 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const VERSION = 1;
-const WHO = new Set(['claude', 'codex', 'antigravity', 'grok', 'user']);
+const WHO = { has: id => [...require('./members').ids, 'grok', 'user'].includes(id) };
 const KINDS = new Set(['code', 'review', 'design', 'ops', 'fallback']);
 const STATUSES = new Set(['proposed', 'confirmed', 'expired', 'superseded']);
 
@@ -111,10 +111,16 @@ function validateSlots(slots, opts = {}) {
 
 function defaultHeuristic(kind, detect) {
   const k = KINDS.has(kind) ? kind : 'code';
+  const members = require('./members'), roster = members.active().map(members.effective);
+  const conductor = roster.find(m => m.roles.conductor)?.id;
+  const coder = roster.find(m => m.external && m.roles.writer)?.id;
+  const reserve = roster.find(m => m.roles.fallback_conductor && !m.roles.writer)?.id || members.fallbackIds[0];
+  // Удалённый пишущий помощник не должен давать семью undefined в исключении.
+  const excludeCoder = () => [members.get(coder)?.family].filter(Boolean);
   const claudeOnline = detect && detect.desktopAlive === true && detect.mcpAlive === true
     && detect.advice !== 'advise_enter' && detect.advice !== 'hold_fallback';
   const offline = [];
-  if (!claudeOnline) offline.push('claude');
+  if (!claudeOnline && conductor) offline.push(conductor);
 
   const base = {
     judge: 'user',
@@ -123,34 +129,34 @@ function defaultHeuristic(kind, detect) {
 
   if (k === 'code') {
     return Object.assign(base, {
-      orchestrator: claudeOnline ? 'claude' : 'antigravity',
-      coder: 'codex',
-      reviewer: ['antigravity'],
+      orchestrator: claudeOnline ? conductor : reserve,
+      coder,
+      reviewer: members.voters({ external: true, excludeFamilies: excludeCoder() }).map(m => m.id),
     });
   }
   if (k === 'review') {
     return Object.assign(base, {
-      orchestrator: claudeOnline ? 'claude' : 'antigravity',
-      reviewer: ['codex', 'antigravity'],
+      orchestrator: claudeOnline ? conductor : reserve,
+      reviewer: [...require('./members').seatIds],
     });
   }
   if (k === 'design') {
     return Object.assign(base, {
-      orchestrator: claudeOnline ? 'claude' : 'antigravity',
-      reviewer: ['codex'],
+      orchestrator: claudeOnline ? conductor : reserve,
+      reviewer: coder ? [coder] : [],
     });
   }
   if (k === 'ops') {
     return Object.assign(base, {
       orchestrator: 'user',
-      reviewer: ['codex', 'antigravity'],
+      reviewer: [...require('./members').seatIds],
     });
   }
   // fallback
   return Object.assign(base, {
-    orchestrator: 'antigravity',
-    coder: 'codex',
-    reviewer: ['antigravity'],
+    orchestrator: reserve,
+    coder,
+    reviewer: members.voters({ external: true, excludeFamilies: excludeCoder() }).map(m => m.id),
   });
 }
 
