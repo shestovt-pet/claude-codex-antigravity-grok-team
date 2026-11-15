@@ -55,7 +55,11 @@ tests.push(
       const admitted=require('../common/restart-hold').admit(path.join(f.root,'state'),server,{early:true});
       assert.notEqual(admitted.kind,'members');
       edit(n=>n.members.find(m=>m.id==='renamed').roles.writer=false);
-      assert.throws(()=>require('../common/access').guard('codex','codex_send',{write:true}), /запис|writer/);
+      // team-v48e Г4e: запись получателю без роли writer проходит безусловно (тумблер MOST_STRICT_REGISTRY удалён).
+      assert.doesNotThrow(()=>require('../common/access').guard('codex','codex_send',{write:true}));
+      process.env.MOST_STRICT_REGISTRY='1';
+      try { assert.doesNotThrow(()=>require('../common/access').guard('codex','codex_send',{write:true})); }
+      finally { delete process.env.MOST_STRICT_REGISTRY; }
     });
   }],
   ['Отмена: переименованный codex использует замок codex_job', async () => {
@@ -67,11 +71,28 @@ tests.push(
       finally{locks.waitLock=original;}
     });
   }],
-  ['Запись: даже Claude не отправляет write получателю без writer', async () => {
+  ['team-v48e Г4e: запись получателю без writer проходит безусловно (тумблер MOST_STRICT_REGISTRY удалён)', async () => {
     await roster(n => { n.members.find(m => m.id === 'codex').roles.writer = false; }, () => {
       const access = require('../common/access');
       assert.doesNotThrow(() => access.guard('codex', 'codex_send', { write: false }));
-      assert.throws(() => access.guard('codex', 'codex_send', { write: true }), /writer/);
+      // Ролевой фильтр writer получателя снят безусловно — даже при выставленной прежней переменной отказа нет.
+      assert.doesNotThrow(() => access.guard('codex', 'codex_send', { write: true }));
+      process.env.MOST_STRICT_REGISTRY = '1';
+      try { assert.doesNotThrow(() => access.guard('codex', 'codex_send', { write: true })); }
+      finally { delete process.env.MOST_STRICT_REGISTRY; }
+    });
+  }],
+  ['team-v48e Г4e: получатель без роли receives находится безусловно (тумблер MOST_STRICT_REGISTRY удалён)', async () => {
+    await roster(n => { n.members.find(m => m.id === 'codex').roles.receives = false; }, () => {
+      const access = require('../common/access');
+      assert(members.receiver('codex'), 'получатель найден без receives');
+      assert.doesNotThrow(() => access.guard('codex', 'codex_send', {}));
+      // Даже при выставленной прежней переменной получатель находится без receives — тумблер удалён.
+      process.env.MOST_STRICT_REGISTRY = '1';
+      try {
+        assert(members.receiver('codex'), 'получатель найден без receives при выставленной переменной');
+        assert.doesNotThrow(() => access.guard('codex', 'codex_send', {}));
+      } finally { delete process.env.MOST_STRICT_REGISTRY; }
     });
   }],
   ['Запуск: переименованный получатель допускается независимо от id сервера', async () => {

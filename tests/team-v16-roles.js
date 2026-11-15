@@ -22,7 +22,8 @@ run([['Р6а: сохранённые orchestrator=grok/offline=claude без fal
   process.env.MOST_CLIENT = 'grok';
   try {
     assert.equal(access.guest(), true);
-    assert.throws(() => access.guard('team', 'team_work', { action: 'update' }), /запрещено/);
+    // team-v48e Г4b: team_work-изменение гостю открыто безусловно (тумблер MOST_GUEST_STRICT удалён); team_change — всегда за каналом дирижёра.
+    assert.doesNotThrow(() => access.guard('team', 'team_work', { action: 'update' }));
     assert.throws(() => access.guard('team', 'team_change', { action: 'merge' }), /запрещено/);
   } finally { process.env.MOST_CLIENT = 'claude'; }
   assert(!fs.existsSync(path.join(fallbackDir, 'session.json')));

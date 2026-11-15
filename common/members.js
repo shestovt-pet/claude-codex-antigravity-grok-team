@@ -10,6 +10,19 @@ const phase = () => snapshot().phase || 'A';
 // Пауза manual выводит участника из кворума, доступа и приёма поручений только в фазе B.
 const pausedLive = m => phase() === 'B' && m.state === 'paused' && m.pause?.kind === 'manual';
 const paused = id => !!pausedLive(all().find(m => m.id === id));
+// team-v48 Г5 (§13.B.5): получатель недоступен, если на ручной паузе реестра (B) ИЛИ по слову пользователя о недоступности.
+// Очереди всех исполнителей держат карточку queued/waiting_quota, пока предикат истинен (не под переменной — класс (в)).
+// team-v48e (ревью п.3): получатель определяется по адаптеру сервера через receiver() среди известных (включая
+// приостановленных) — id участника может отличаться от имени сервера (напр. переименованный codex-cli), поэтому
+// paused(server) по совпадению id==сервер был бы неверен (и TypeError при отсутствии участника в фазе B).
+// team-v48e (ревью п.4): ручная пауза реестра держит карточку всегда; слово пользователя о недоступности держит, кроме
+// восстановления по слову дирижёра запасного режима (fallbackWord) — иначе первый успех не снял бы слово (К2).
+const recipientPaused = (server, fallbackWord) => {
+  const m = receiver(server, known());
+  if (!m) return false;
+  if (paused(m.id)) return true;
+  return !fallbackWord && !!require('./user-word').active(m.id);
+};
 // Одна формулировка паузы для сводки и списка участников (team-v44 П2).
 function pauseNote(m) {
   if (!m?.pause) return '';
@@ -52,7 +65,10 @@ const adapterOf = id => all().find(m => m.id === id)?.adapter || null;
 const familyOf = id => all().find(m => m.id === id)?.family || null;
 // Сервер обслуживает адаптер, а идентификатор участника может быть другим.
 function receiver(server, roster = active()) {
-  return roster.find(m => m.state !== 'removed' && adapters[m.adapter]?.server === server && effective(m).roles.receives);
+  // team-v48e Г4e: роль receives больше не условие существования получателя — находим по adapter.server и state!=='removed'
+  // безусловно (тумблер MOST_STRICT_REGISTRY удалён, снятие безусловно). Пауза сохраняется: roster по умолчанию active()
+  // (без paused), вызывающий код сверяет members.active/слово.
+  return roster.find(m => m.state !== 'removed' && adapters[m.adapter]?.server === server);
 }
 function requiredVoters() {
   const current = voters({ external: true });
@@ -107,5 +123,5 @@ function describe(full = false) {
   catch (e) { return e.message; }
 }
 function rules() { return describe() + '\nУчастники и специализации — из team_status:\n' + active().map(m => m.title + ': ' + m.specialization).join('\n'); }
-module.exports = { all, active, get, effective, voters, canWrite, canSend, adapterFor, adapterOf, familyOf, receiver, requiredVoters, rev: () => snapshot().rev, snapshot, store, adapters, dynamic, phase, paused, memberForClient, executorTitle,
+module.exports = { all, active, get, effective, voters, canWrite, canSend, adapterFor, adapterOf, familyOf, receiver, requiredVoters, rev: () => snapshot().rev, snapshot, store, adapters, dynamic, phase, paused, recipientPaused, memberForClient, executorTitle,
   knownIds, knownSeatIds, knownFallbackIds, knownVoterFamilies, assertAvailable, ids, servers, installedServers, installedClients, serversForInstall, helpers, scanIds, seats, seatIds, names, families, fallbackIds, describe, rules, pauseNote, grokDisabled: 'Grok выключен из связки (13.10.2026)' };

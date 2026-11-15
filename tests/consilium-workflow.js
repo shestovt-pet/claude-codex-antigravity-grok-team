@@ -130,15 +130,19 @@ async function main() {
     const f = fixture(), data = Buffer.alloc(6 * 1024 ** 2, 7); put(f.dir, 'large.bin', data);
     assert.equal((await cw.readFile(cw.context(f.dir), { path: 'large.bin' })).sha256, cw.sha(data));
   });
-  await test('каждый ресурсный лимит даёт отказ', async () => {
-    const f = fixture(), ctx = cw.context(f.dir); ctx.refs = cw.LIMITS.count;
-    await rejected(() => cw.readFile(ctx, { path: 's0.txt' }), /числа/);
-    const total = cw.context(f.dir); total.bytes = cw.LIMITS.total;
-    await rejected(() => cw.readFile(total, { path: 's0.txt' }), /суммарный/);
-    for (const limit of [cw.LIMITS.json, cw.LIMITS.text, cw.LIMITS.file]) {
-      const p = put(f.dir, 'over-' + limit, ''); fs.truncateSync(p, limit + 1);
-      await rejected(() => cw.readFile(cw.context(f.dir), { path: path.basename(p) }, limit), /размера/);
-    }
+  await test('team-v48e Г7: ресурсные лимиты консилиума сняты безусловно (тумблеры MOST_CONSILIUM_MAX_* удалены)', async () => {
+    const f = fixture();
+    // Число ссылок/размеры не ограничены — пороги Infinity, прежние значения не срабатывают.
+    { const ctx = cw.context(f.dir); ctx.refs = 4096; assert((await cw.readFile(ctx, { path: 's0.txt' })).sha256, 'число ссылок не ограничено'); }
+    // Даже при выставленных прежних переменных пределы остаются Infinity — тумблеры удалены, не читаются.
+    const env = { MOST_CONSILIUM_MAX_COUNT: '4096', MOST_CONSILIUM_MAX_TOTAL: String(32 * 1024 ** 3),
+      MOST_CONSILIUM_MAX_JSON: String(8 * 1024 ** 2), MOST_CONSILIUM_MAX_TEXT: String(16 * 1024 ** 2), MOST_CONSILIUM_MAX_FILE: String(512 * 1024 ** 2) };
+    Object.assign(process.env, env);
+    try {
+      for (const k of ['count', 'total', 'json', 'text', 'file']) assert.equal(cw.LIMITS[k], Infinity, 'LIMITS.' + k + ' = Infinity при выставленной переменной');
+      const ctx = cw.context(f.dir); ctx.refs = 4096; ctx.bytes = 32 * 1024 ** 3;
+      assert((await cw.readFile(ctx, { path: 's0.txt' })).sha256, 'отказа по числу/объёму нет при выставленных переменных');
+    } finally { for (const k of Object.keys(env)) delete process.env[k]; }
   });
   await test('junction внутри корня разрешён; наружу запрещён', async () => {
     const f = fixture(); fs.mkdirSync(path.join(f.dir, 'inner')); put(f.dir, 'inner/item.txt', 'ok');

@@ -117,6 +117,23 @@ function acquire(folder, info = {}) {
   });
 }
 
+// team-v48e (ревью п.1): перед запуском исполнителя фактический realpath папки записи должен совпадать
+// с папкой захваченного замка. Если путь сместился после захвата (подмена symlink/junction между
+// постановкой и запуском), прежний замок защищает уже не ту папку — захватываем замок фактической папки
+// (отказ, если она занята другим писателем). Так гарантия «папка записи — её замок» держится и при подмене.
+function reconcile(folderLock, folder, info = {}) {
+  let now;
+  try { now = canon(path.resolve(folder)); }
+  catch (e) { throw Error('Не удалось сверить папку записи перед запуском: ' + e.message); }
+  const held = folderLock && folderLock.ok !== false && folderLock.owner && folderLock.owner.folder;
+  if (held && held === now) return folderLock; // замок соответствует фактической папке
+  const moved = acquire(folder, info);
+  if (!moved.ok)
+    throw Error('Папка записи сместилась после захвата замка и занята другим поручением с записью.');
+  if (folderLock && folderLock.release) { try { folderLock.release(); } catch {} }
+  return moved;
+}
+
 // Вызывается после проверки процессов и сохранения подтверждения, под замком карточки.
 // Повтор снимает только замки этого поручения, не нового владельца той же папки.
 function releaseConfirmed(job) {
@@ -126,4 +143,4 @@ function releaseConfirmed(job) {
   });
 }
 
-module.exports = { acquire, releaseConfirmed, conflict, entryFile, dir };
+module.exports = { acquire, reconcile, releaseConfirmed, conflict, entryFile, dir };

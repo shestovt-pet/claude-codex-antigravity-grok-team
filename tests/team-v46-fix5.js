@@ -111,30 +111,35 @@ module.exports = ({ test, f, client, text }) => {
     assert.equal(store.read().members.find(m => m.id === 'claude').roles.receives, true);
     assert(JSON.parse(fs.readFileSync(file, 'utf8')).mcpServers.claude);
   });
-  test('fix5 #7: весь внешний каталог клонов запрещён, в том числе полный доступ', () => {
+  test('team-v48e Г4a: forbiddenRoots по-прежнему считает каталог клонов, но refusal папочный запрет не применяет (тумблер MOST_PROTECT_BRIDGE удалён)', () => {
     const wf = require('../common/write-folder');
+    // Хелпер forbiddenRoots сохранён (расчёт каталога клонов), но refusal папочную защиту больше не применяет.
     assert(wf.forbiddenRoots('E:/most').some(p => path.resolve(p).toLowerCase() === path.resolve('E:/test-most').toLowerCase()));
-    assert(wf.refusal('E:/test-most', { root: 'E:/most', fullAccess: true }));
     const custom = path.join(outside, 'custom-clones'); fs.mkdirSync(custom);
-    const old = process.env.MOST_CLONE_ROOTS; process.env.MOST_CLONE_ROOTS = JSON.stringify([custom]);
-    try { assert(wf.refusal(custom, { fullAccess: true })); }
-    finally { if (old === undefined) delete process.env.MOST_CLONE_ROOTS; else process.env.MOST_CLONE_ROOTS = old; }
+    // Папочный запрет снят безусловно — существующая абсолютная папка-клон допускается (refusal null) даже при выставленной прежней переменной.
+    process.env.MOST_PROTECT_BRIDGE = '1';
+    try { assert.equal(wf.refusal(custom, { fullAccess: true }), null, 'MOST_PROTECT_BRIDGE не возвращает папочный запрет'); }
+    finally { delete process.env.MOST_PROTECT_BRIDGE; }
   });
-  test('fix5 #8: исключение своей .work не разрешает переадресацию между рабочими копиями', () => {
+  test('team-v48e Г4a: папочный запрет .work/переадресации снят (refusal держит только абсолютную существующую папку)', () => {
     const wf = require('../common/write-folder'), root = path.join(f.RUN, 'junction-root');
     const real = path.join(root, '.work', 'actual'), alias = path.join(root, '.work', 'alias');
     fs.mkdirSync(real, { recursive: true }); fs.symlinkSync(real, alias, 'junction');
     const stateDir = path.join(root, 'state');
     for (const name of ['actual', 'alias']) f.json(path.join(stateDir, 'changes', name + '.json'), { name, owner: 'owner', status: 'открыто' });
     const opts = { root, stateDir, client: 'claude', guest: false, owner: 'owner' };
+    // Папочный запрет снят безусловно: и реальная, и алиас-копия, и выход-симлинк допускаются (refusal null для существующих абсолютных папок).
     assert.equal(wf.refusal(real, opts), null);
-    assert(wf.refusal(alias, opts));
+    assert.equal(wf.refusal(alias, opts), null);
     const escape = path.join(real, 'live-link'); fs.mkdirSync(path.join(root, 'live')); fs.symlinkSync(path.join(root, 'live'), escape, 'junction');
-    assert(wf.refusal(escape, opts));
+    assert.equal(wf.refusal(escape, opts), null);
+    // Подлинность пути сохранена: несуществующая папка — отказ.
+    assert(wf.refusal(path.join(root, 'no-such-folder'), opts));
   });
   test('fix5 #9: Antigravity-перенос проверяет папку и общий замок писателя', async () => {
     const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
     const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
+    // team-v48e Г4a: папочный запрет переноса снят безусловно — перенос в f.project проходит; замок писателя (lockedFolder) — всегда держит.
     const env = { ...process.env, MOST_CLIENT: 'claude', MOST_JOB_ID: '', MOST_PROBE_ONLY: '1', AGY_PATH: path.join(__dirname, 'fake-agy.js'),
       MOST_AGY_INPUT_FORMAT: 'legacy', MOST_JOURNAL: path.join(f.RUN, 'fix5-agy.log'), MOST_INPUT_DIR: path.join(f.RUN, 'input') };
     const transport = new StdioClientTransport({ command: process.execPath, args: [path.resolve(__dirname, '../servers/antigravity/index.js')], env, stderr: 'pipe' });
@@ -144,7 +149,20 @@ module.exports = ({ test, f, client, text }) => {
     try {
       await c.connect(transport);
       await serverReady(path.join(f.root, 'state'), transport.pid);
-      for (const [folder, id] of [[f.project, 'fix5-apply-forbidden'], [lockedFolder, 'fix5-apply-locked']]) {
+      // f.project: папочный запрет снят → перенос проходит, файл записан.
+      {
+        const id = 'fix5-apply-ok', folder = f.project;
+        save('antigravity', { id, status: 'done', papka: folder, rezhim: 'tekst', from: 'claude', startedAt: new Date().toISOString() });
+        const body = 'Готовый текст';
+        f.write(path.join(f.stores.roots().antigravity, id, 'result.txt'), body);
+        f.json(path.join(f.stores.roots().antigravity, id, 'meta.json'), { hash: f.sha(body) });
+        const target = path.join(folder, id + '.txt');
+        const r = await c.callTool({ name: 'antigravity_apply', arguments: { id, to: target } });
+        assert(!r.isError, text(r)); assert(fs.existsSync(target), 'перенос в f.project выполнен (папочный запрет снят)');
+      }
+      // lockedFolder: общий замок писателя (другой владелец) держит перенос — защита класса «в», сохранена.
+      {
+        const id = 'fix5-apply-locked', folder = lockedFolder;
         save('antigravity', { id, status: 'done', papka: folder, rezhim: 'tekst', from: 'claude', startedAt: new Date().toISOString() });
         const body = 'Готовый текст';
         f.write(path.join(f.stores.roots().antigravity, id, 'result.txt'), body);
@@ -152,7 +170,7 @@ module.exports = ({ test, f, client, text }) => {
         const target = path.join(folder, id + '.txt');
         const r = await c.callTool({ name: 'antigravity_apply', arguments: { id, to: target } });
         assert(r.isError, text(r)); assert(!fs.existsSync(target));
-        assert.match(text(r), /Запись запрещена|поручение с записью/);
+        assert.match(text(r), /поручение с записью/);
       }
     } finally { await c.close(); await lock.release(); }
   });
@@ -170,27 +188,35 @@ module.exports = ({ test, f, client, text }) => {
     assert(fs.existsSync(file), 'release в finally не должен снимать неопределённый замок');
     assert.equal((await wl.acquire(dir)).needsDecision, true);
   });
-  test('fix5 #11: корневые карточки, jobEnv-входящие и единый срок исполнителя', async () => {
+  test('fix5 #11: своего срока исполнителя нет даже при заданных прежних переменных; корневые карточки и запрос — без срока', async () => {
     const dl = require('../common/chain-deadline');
-    assert.equal(dl.normalTimeoutMs('claude'), 3600000);
-    for (const who of ['codex', 'deepseek', 'claude', 'antigravity']) {
-      const now = Date.now(), root = dl.applyDeadline({}, 'claude', who, now);
-      assert.equal(Date.parse(root.deadline), now + dl.normalTimeoutMs(who));
-      await client(who, 'codex', null, async c => {
-        const task = 'Срок корневого ' + who;
-        const r = await c.callTool({ name: who + '_send', arguments: { folder: outside, task, role: 'совет',
-          ...(who === 'antigravity' ? { mode: 'review', text: 'Материал.' } : {}) } });
-        assert(!r.isError, text(r));
-        const card = f.stores.list(who, false).jobs.find(j => (j.task || j.poruchenie) === task);
-        assert(Number.isFinite(Date.parse(card?.deadline)), JSON.stringify(card));
+    // team-v48e «нет срока» (§2.6/§3): сроковые тумблеры MOST_*_TIMEOUT_MS/MOST_PRINT_TIMEOUT/MOST_WATCHDOG_MS удалены —
+    // normalTimeoutMs всегда null даже при выставленных прежних переменных; корневая карточка (без родителя) создаётся без срока.
+    const savedEnv = ['MOST_CODEX_TIMEOUT_MS', 'MOST_DEEPSEEK_TIMEOUT_MS', 'MOST_CLAUDE_TIMEOUT_MS', 'MOST_PRINT_TIMEOUT', 'MOST_WATCHDOG_MS'].map(k => [k, process.env[k]]);
+    Object.assign(process.env, { MOST_CODEX_TIMEOUT_MS: '3600000', MOST_DEEPSEEK_TIMEOUT_MS: '3600000', MOST_CLAUDE_TIMEOUT_MS: '3600000', MOST_PRINT_TIMEOUT: '15m', MOST_WATCHDOG_MS: String(16 * 60 * 1000) });
+    try {
+      assert.equal(dl.normalTimeoutMs('claude'), null);
+      for (const who of ['codex', 'deepseek', 'claude', 'antigravity']) {
+        const now = Date.now(), root = dl.applyDeadline({}, 'claude', who, now);
+        assert.equal(root.deadline, null); assert.equal(root.error, null);
+        await client(who, 'codex', null, async c => {
+          const task = 'Срок корневого ' + who;
+          const r = await c.callTool({ name: who + '_send', arguments: { folder: outside, task, role: 'совет',
+            ...(who === 'antigravity' ? { mode: 'review', text: 'Материал.' } : {}) } });
+          assert(!r.isError, text(r));
+          const card = f.stores.list(who, false).jobs.find(j => (j.task || j.poruchenie) === task);
+          assert(card, JSON.stringify(card)); assert(!Number.isFinite(Date.parse(card.deadline)), 'корневая карточка без срока: ' + JSON.stringify(card));
+        });
+      }
+      await asJob('codex', async p => {
+        const root = { ...p, deadline: dl.applyDeadline({}, 'claude', 'codex').deadline }; save('codex', root);
+        const auth = require('../common/inbox').author({ ancestors: [{ pid: 4100, startedAt: p.startedAt }] });
+        assert.equal(require('../common/inbox').askDeadline({}, auth), null);
       });
+      assert(dl.parentTerminal({ parentJob: 'gone-parent' }, [{ id: 'gone-parent', status: 'running', childPid: 2147483647 }]));
+    } finally {
+      for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     }
-    await asJob('codex', async p => {
-      const root = { ...p, deadline: dl.applyDeadline({}, 'claude', 'codex').deadline }; save('codex', root);
-      const auth = require('../common/inbox').author({ ancestors: [{ pid: 4100, startedAt: p.startedAt }] });
-      assert.equal(Date.parse(require('../common/inbox').askDeadline({}, auth)), Date.parse(root.deadline) - 120000);
-    });
-    assert(dl.parentTerminal({ parentJob: 'gone-parent' }, [{ id: 'gone-parent', status: 'running', childPid: 2147483647 }]));
   });
   test('fix5 #11: Codex завершает процесс по абсолютному deadline, а не через час', async () => {
     const old = { ...process.env };

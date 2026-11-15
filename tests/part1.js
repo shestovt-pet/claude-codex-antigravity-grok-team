@@ -568,18 +568,23 @@ async function test(name, fn) {
       card = JSON.parse(fs.readFileSync(path.join(env.MOST_STATE_DIR, 'codex-jobs', id(r) + '.json'), 'utf8'));
     } while (['running', 'cancelling'].includes(card.status) && Date.now() < cancelLimit);
     ok(['cancelled', 'stop_unconfirmed'].includes(card.status), 'межпроцессная отмена');
+    // team-v48e §2.6: сроковый тумблер MOST_CODEX_TIMEOUT_MS удалён — срок не навязывается даже при выставленной переменной,
+    // HANG не уходит в needs_decision по таймауту. Карточка без deadline; дождавшись старта, снимаем отменой.
     const b = await start('codex', { MOST_CODEX_TIMEOUT_MS: '150' });
     const w = await call(b, 'codex_send', { folder: project(), task: 'HANG', write: true });
+    const readW = () => JSON.parse(fs.readFileSync(path.join(env.MOST_STATE_DIR, 'codex-jobs', id(w) + '.json'), 'utf8'));
+    const startLimit = Date.now() + 10000;
     let wc;
-    const limit = Date.now() + 15000;
-    do {
-      await sleep(100);
-      wc = JSON.parse(fs.readFileSync(path.join(env.MOST_STATE_DIR, 'codex-jobs', id(w) + '.json'), 'utf8'));
-    } while (['running', 'cancelling'].includes(wc.status) && Date.now() < limit);
-    ok(
-      wc.status === 'needs_decision' && wc.error.includes('предел времени'),
-      'таймаут записи требует решения: ' + JSON.stringify(wc),
-    );
+    do { await sleep(100); wc = readW(); } while (wc.status !== 'running' && Date.now() < startLimit);
+    ok(wc.status === 'running', 'HANG запущен: ' + JSON.stringify(wc));
+    ok(wc.deadline == null, 'срок не записан в карточку (тумблер удалён): ' + JSON.stringify(wc.deadline));
+    await sleep(1500);
+    wc = readW();
+    ok(wc.status === 'running', 'без срока HANG по-прежнему идёт (не needs_decision по таймауту): ' + JSON.stringify(wc));
+    await call(b, 'codex_cancel', { id: id(w) });
+    const cLimit = Date.now() + 15000;
+    do { await sleep(100); wc = readW(); } while (['running', 'cancelling'].includes(wc.status) && Date.now() < cLimit);
+    ok(['cancelled', 'stop_unconfirmed'].includes(wc.status), 'отмена останавливает бессрочный HANG: ' + JSON.stringify(wc));
   });
 
   await test('Очистка: двухдневная квота с файлами переживает очистку и повтор', async () => {

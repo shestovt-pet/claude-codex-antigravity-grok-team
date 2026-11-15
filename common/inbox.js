@@ -50,7 +50,8 @@ function askDeadline(a, auth, now = Date.now()) {
   const ttl = Number.isFinite(a.ttl_min) && a.ttl_min > 0 ? a.ttl_min * 60000 : null;
   if (auth.kind === 'chat') return new Date(now + (ttl || 24 * 3600000)).toISOString();
   const remaining = require('./chain-deadline').parentRemainingMs(auth.job, auth.job?.member, now);
-  if (remaining == null) throw Error('Не определён срок поручения для входящего запроса.');
+  // team-v48 «нет срока»: остаток родителя null → запрос без срока (deadline=null) либо только ttl_min, если задан.
+  if (remaining == null) return ttl == null ? null : new Date(now + ttl).toISOString();
   const dl = now + remaining;
   const fromParent = dl - now - 2 * 60000;
   const budget = ttl == null ? fromParent : Math.min(ttl, fromParent);
@@ -76,4 +77,12 @@ function notify(auth, text) {
   require('./notify').notify('Запрос дирижёру от ' + whoText(auth), first);
 }
 
-module.exports = { dir, file, read, save, list, pending, expired, author, askDeadline, banner, whoText, notify };
+// team-v48c: вывод срока запроса. deadline=null — «без срока» (поручение без срока и без ttl_min).
+function deadlineText(e) { return Number.isFinite(Date.parse(e && e.deadline)) ? String(e.deadline) : 'без срока'; }
+function waitText(e, now = Date.now()) {
+  const t = Date.parse(e && e.deadline);
+  if (!Number.isFinite(t)) return 'ждёт дирижёра, без срока';
+  return 'ждёт дирижёра ' + Math.max(0, Math.floor((t - now) / 60000)) + ' мин';
+}
+
+module.exports = { deadlineText, waitText, dir, file, read, save, list, pending, expired, author, askDeadline, banner, whoText, notify };

@@ -79,6 +79,15 @@ async function guest(who, client, p, fn) {
   try { await c.connect(transport); await fn(c); } finally { await c.close(); }
 }
 const text = r => (r.content || []).map(c => c.text || '').join('\n');
+// team-v48e Г3: кепки/запреты вида цепочки сняты безусловно, тумблеры MOST_CHAIN_* удалены; withChain лишь очищает эти
+// переменные среды (на случай унаследованных из окружения), прежних пределов они уже не возвращают.
+const CHAIN_ENV = ['MOST_CHAIN_MAX_DEPTH', 'MOST_CHAIN_PER_PARENT', 'MOST_CHAIN_PER_ROOT', 'MOST_CHAIN_STRICT'];
+function withChain(env, fn) {
+  const old = {}; for (const k of CHAIN_ENV) old[k] = process.env[k];
+  for (const k of CHAIN_ENV) delete process.env[k];
+  for (const [k, v] of Object.entries(env)) process.env[k] = v;
+  try { return fn(); } finally { for (const k of CHAIN_ENV) { if (old[k] === undefined) delete process.env[k]; else process.env[k] = old[k]; } }
+}
 
 for (const [from, to] of [['codex', 'deepseek'], ['codex', 'antigravity'], ['antigravity', 'codex'], ['antigravity', 'deepseek'], ['deepseek', 'antigravity'], ['deepseek', 'codex']]) {
   test(from + ' → ' + to + ': running, без записи, поля в сохранённой карточке', async () => {
@@ -99,51 +108,49 @@ for (const [from, to] of [['codex', 'deepseek'], ['codex', 'antigravity'], ['ant
   });
 }
 
-test('Ограничения: full_access/work/stage/continue_id и запись без пишущего родителя', () => {
+test('team-v48 Г3: по умолчанию full_access/work/stage/continue_id и запись шире родителя — допускаются', () => withChain({}, () => {
   for (const a of [{ full_access: true }, { work: 'w' }, { stage: 's' }, { continue_id: 'old' }]) {
     const p = parent();
-    assert.throws(() => admit(p, a), /Подпоручение.*отклонено/);
-    assert.equal(slots('parent', p.id), 0); assert.deepEqual(chain.fields(a), {});
+    assert.equal(admit(p, a).parentJob, p.id, 'без MOST_CHAIN_STRICT вид подпоручения не ограничен: ' + JSON.stringify(a));
+    assert.equal(slots('parent', p.id), 1);
   }
-  // team-v46 п.4: запись подпоручения — только у пишущего поручения-родителя.
-  assert.throws(() => admit(parent(), { write: true }), /пишущего поручения-родителя/);
-  const w = parent({ write: true });
-  assert.equal(admit(w, { write: true }).parentJob, w.id);
-});
+  // запись шире непишущего родителя: по умолчанию допускается (место цепочки выдаётся).
+  const w = parent(); assert.ok(admit(w, { write: true }).parentSlot, 'запись шире родителя допускается без MOST_CHAIN_STRICT');
+}));
+// team-v48e Г3: тумблер MOST_CHAIN_STRICT удалён — отдельного теста «под strict возвращается прежний отказ» больше нет.
 test('team-v46: роль «проверка» подпоручению разрешается как совет (без голоса)', () => {
   const p = parent();
   assert.equal(admit(p, { role: 'проверка' }).parentJob, p.id);
 });
-test('Глубина: второй уровень принят, третий отклонён', () => {
-  const root = parent(), first = admit(root), p = parent({ ...first, member: 'deepseek' });
-  const second = admit(p, { role: 'текст' }); assert.equal(second.depth, 2); assert.equal(second.rootJob, root.id);
-  assert.throws(() => admit(parent({ ...second })), /глубина/);
-});
-test('Бюджет: четвёртое место родителя отклонено', () => {
-  const p = parent(); for (let i = 0; i < 3; i++) admit(p);
-  assert.throws(() => admit(p), /у поручения уже 3/);
-  assert.equal(slots('parent', p.id), 3); assert.equal(slots('root', p.id), 4);
-});
-test('Бюджет: седьмое место корня отклонено', () => {
-  const root = parent(), children = Array.from({ length: 3 }, () => parent({ ...admit(root), member: 'deepseek' }));
-  for (let i = 0; i < 3; i++) admit(children[0]);
-  assert.throws(() => admit(children[1]), /в цепочке уже 6/);
-  assert.equal(slots('root', root.id), 6);
-});
-test('Параллельно: у родителя не больше трёх мест', async () => {
-  const p = parent(), results = await race(Array(8).fill(p));
-  assert.equal(results.filter(r => r.value).length, 3);
-  for (const r of results.filter(r => r.error)) assert.match(r.error, /у поручения уже 3|в цепочке уже 6/);
-  assert.equal(slots('parent', p.id), 3); assert.equal(slots('root', p.id), 6);
-});
-test('Параллельно: у корня не больше шести мест', async () => {
+test('team-v48 Г3: по умолчанию глубина не ограничена (третий и четвёртый уровни приняты)', () => withChain({}, () => {
+  // Получатель подпоручений — codex (admit-хелпер), поэтому member предков codex не используем (иначе lineageRefusal).
+  const root = parent(), p2 = parent({ ...admit(root), member: 'deepseek' });
+  const second = admit(p2, { role: 'текст' }); assert.equal(second.depth, 2); assert.equal(second.rootJob, root.id);
+  const p3 = parent({ ...second, member: 'antigravity' });
+  const third = admit(p3); assert.equal(third.depth, 3);
+  const p4 = parent({ ...third, member: 'deepseek' });
+  assert.equal(admit(p4).depth, 4, 'без MOST_CHAIN_MAX_DEPTH глубина не ограничена');
+}));
+// team-v48e Г3: тумблеры MOST_CHAIN_MAX_DEPTH/PER_PARENT/PER_ROOT удалены — тестов «под переменной возвращается прежний
+// предел» больше нет. Безусловное снятие проверяется выше (глубина/число не ограничены) и в §5-тестах ниже.
+test('team-v48 Г3: по умолчанию число подпоручений у родителя не ограничено', () => withChain({}, () => {
+  const p = parent(); for (let i = 0; i < 5; i++) assert.ok(admit(p).parentSlot);
+  assert.equal(slots('parent', p.id), 5, 'пятое место выдано без предела');
+}));
+test('team-v48e §5: perParent>3 — один родитель раздаёт 8 подпоручений, все проходят, места уникальны', () => withChain({}, () => {
+  const p = parent(); const got = [];
+  for (let i = 0; i < 8; i++) { const c = admit(p); assert.ok(c.parentSlot); got.push(c.parentSlot); }
+  assert.equal(slots('parent', p.id), 8); assert.equal(new Set(got).size, 8, 'места у родителя уникальны');
+}));
+test('team-v48e §5: perRoot>6 — параллельно у корня больше шести мест, все уникальны', async () => await withChain({}, async () => {
+  // 3 admit(root) при создании родителей = 3 места корня, затем 9 заявок = всего 12 мест корня (прежний предел 6 снят).
   const root = parent(), parents = Array.from({ length: 3 }, () => parent({ ...admit(root), member: 'deepseek' }));
-  const results = await race(parents.flatMap(p => [p, p, p]));
-  assert.equal(results.filter(r => r.value).length, 3);
-  for (const r of results.filter(r => r.error)) assert.match(r.error, /в цепочке уже 6/);
-  assert.equal(slots('root', root.id), 6);
-  assert.equal(new Set(results.filter(r => r.value).map(r => r.value.rootSlot)).size, 3);
-});
+  const results = await race(parents.flatMap(p => [p, p, p])); // ещё 9 заявок
+  assert.equal(results.filter(r => r.value).length, 9, 'без предела все 9 заявок выданы');
+  assert.equal(slots('root', root.id), 12, 'всего 12 мест корня (3 + 9), предел 6 снят');
+  const used = new Set(results.filter(r => r.value).map(r => r.value.rootSlot));
+  assert.equal(used.size, 9, 'места корня у 9 заявок уникальны (атомарность сохранена)');
+}));
 test('Повторный admit того же объекта сохраняет место и nonce', () => {
   const p = parent(), a = {}, first = admit(p, a);
   assert.deepEqual(admit(p, a), first); assert.deepEqual(chain.fields(a), first);
@@ -164,34 +171,76 @@ test('MOST_JOB_ID и предки указывают на разные пору�
   assert.match(chain.parent([p, other], [{ pid: 81, startedAt }, { pid: 82, startedAt }]).error, /разные поручения/);
   assert.equal(chain.parent([p, other], [{ pid: 81, startedAt }]).job.id, p.id);
 });
-test('Из поручения cancel/apply/team_word — прежний отказ', () => {
-  const p = parent(); process.env.MOST_JOB_ID = p.id; process.env.MOST_CLIENT = 'codex';
+test('Из поручения apply/team_word — отказ «поручение-сеанс»; cancel — только свои потомки (§D.3)', () => {
+  const now = new Date().toISOString();
+  // team-v48e (ревью п.2/п.3): вызывающего подтверждает parent() по предкам процесса — карточка родителя в store, идёт,
+  // и её childPid среди предков процесса (pid 4199 из дерева с окном времени); иначе отмена не дойдёт до проверки родства.
+  const p = parent({ childPid: 4199, startedAt: now }); save('codex', p); process.env.MOST_JOB_ID = p.id; process.env.MOST_CLIENT = 'codex';
+  const beforeTree = process.env.MOST_TEST_PROCESS_TREE;
+  process.env.MOST_TEST_PROCESS_TREE = JSON.stringify([{ pid: 'self', ppid: 4199, startedAt: now }, { pid: 4199, ppid: 1, startedAt: now }]);
+  fallback.reset();
   try {
-    for (const tool of ['codex_cancel', 'antigravity_cancel', 'deepseek_cancel', 'antigravity_apply', 'team_word'])
+    for (const tool of ['antigravity_apply', 'team_word'])
       assert.throws(() => fallback.guard(tool.split('_')[0], tool, { action: 'record' }), /поручение-сеанс этого не делает/i);
-  } finally { process.env.MOST_CLIENT = 'claude'; }
+    // team-v48 Г4d (§D.3): *_cancel из поручения-сеанса проходит guard и проверяется на потомка; не-потомок/без номера — отказ «только для своих потомков».
+    for (const tool of ['codex_cancel', 'antigravity_cancel', 'deepseek_cancel'])
+      assert.throws(() => fallback.guard(tool.split('_')[0], tool, { id: 'not-a-descendant' }), /только для своих потомков/i);
+  } finally {
+    process.env.MOST_CLIENT = 'claude';
+    if (beforeTree === undefined) delete process.env.MOST_TEST_PROCESS_TREE; else process.env.MOST_TEST_PROCESS_TREE = beforeTree;
+    fallback.reset();
+  }
 });
-test('Свой сервер из поручения запрещён; Claude-исполнитель доступен; team — нет', () => {
+test('team-v48e (ревью п.2): подмена MOST_JOB_ID чужого поручения — отмена отклонена проверкой предков процесса', () => {
+  const before = process.env.MOST_JOB_ID, now = new Date().toISOString();
+  try {
+    // Процесс реально принадлежит поручению A (его childPid среди предков), но MOST_JOB_ID подставлен на чужое B.
+    const forge = [
+      { id: 'forge-A', member: 'codex', status: 'running', childPid: 4242, startedAt: now },
+      { id: 'forge-B', member: 'codex', status: 'running', startedAt: now },
+      { id: 'forge-Bc', member: 'deepseek', parentJob: 'forge-B' },
+    ];
+    process.env.MOST_JOB_ID = 'forge-B';
+    assert.throws(() => chain.assertDescendant('forge-Bc', { cards: forge, ancestors: [{ pid: 4242, startedAt: now }] }),
+      /не подтверждено предками процесса/, 'чужой MOST_JOB_ID не отменяет потомков B');
+    // Законный вызов из самого B (его childPid среди предков) — отмена своего потомка проходит.
+    const ok = [
+      { id: 'forge-B2', member: 'codex', status: 'running', childPid: 5252, startedAt: now },
+      { id: 'forge-B2c', member: 'deepseek', parentJob: 'forge-B2' },
+    ];
+    process.env.MOST_JOB_ID = 'forge-B2';
+    assert.doesNotThrow(() => chain.assertDescendant('forge-B2c', { cards: ok, ancestors: [{ pid: 5252, startedAt: now }] }));
+  } finally { if (before === undefined) delete process.env.MOST_JOB_ID; else process.env.MOST_JOB_ID = before; }
+});
+test('Свой сервер из поручения: цикл A→A — отказ (lineageRefusal); чужая семья — подпоручение', () => {
   const p = parent(); save('codex', p); process.env.MOST_JOB_ID = p.id;
   try {
-    for (const who of ['codex', 'antigravity', 'deepseek']) {
+    // team-v48e Г4b-2b: «подпоручение своему же серверу» снято безусловно — цикл A→A (codex→codex, семья уже в цепочке)
+    // ловит lineageRefusal в admit; чужая семья (antigravity/deepseek из поручения codex) — законное подпоручение.
+    process.env.MOST_CLIENT = 'codex';
+    assert.throws(() => fallback.guard('codex', 'codex_send', {}), /уже есть в цепочке|цикл/);
+    for (const who of ['antigravity', 'deepseek']) {
       process.env.MOST_CLIENT = who;
-      assert.throws(() => fallback.guard(who, who + '_send', {}), /своему же серверу/);
+      assert.doesNotThrow(() => fallback.guard(who, who + '_send', {}));
     }
     assert.doesNotThrow(() => chain.admit('claude', 'claude_send', {}));
     assert.throws(() => chain.admit('team', 'team_send', {}), /team поручений не принимает/);
   } finally { process.env.MOST_CLIENT = 'claude'; }
 });
-test('access.guard: допускает чтение, отклоняет опасные поля', () => {
+test('team-v48e Г3: access.guard из поручения допускает чтение И опасные поля (вид подпоручения снят безусловно)', () => withChain({}, () => {
   const p = parent(); save('antigravity', p);
   process.env.MOST_JOB_ID = p.id; process.env.MOST_CLIENT = 'antigravity';
   try {
     const a = { write: false }; access.guard('codex', 'codex_send', a);
     assert.equal(chain.fields(a).parentJob, p.id);
-    for (const a of [{ write: true }, { full_access: true }, { work: 'w' }, { stage: 's' }, { continue_id: 'x' }])
-      assert.throws(() => access.guard('codex', 'codex_send', a), /запрещ|отклонено/);
+    // Прежние опасные поля (write/full_access/work/stage/continue) теперь допускаются подпоручению: admit выдаёт место.
+    for (const extra of [{ write: true }, { full_access: true }, { work: 'w' }, { stage: 's' }, { continue_id: 'x' }]) {
+      const a2 = { ...extra };
+      assert.doesNotThrow(() => access.guard('codex', 'codex_send', a2));
+      assert.equal(chain.fields(a2).parentJob, p.id, 'место цепочки выдано: ' + JSON.stringify(extra));
+    }
   } finally { process.env.MOST_CLIENT = 'claude'; }
-});
+}));
 test('JSON parentJob из чата не попадает в карточку', async () => {
   const forged = { parentJob: 'forged', rootJob: 'forged', depth: 1, parentSlot: 1, rootSlot: 1, chainNonce: 'forged' };
   assert.deepEqual(chain.fields(forged), {});
@@ -203,18 +252,124 @@ test('JSON parentJob из чата не попадает в карточку', a
     for (const k of Object.keys(forged)) assert(!Object.hasOwn(j, k), k);
   });
 });
-test('queuedRefusal: исправная карточка проходит, полный доступ/этап/продолжение и повреждённая цепочка — нет', () => {
-  const p = parent(), j = { id: 'queued', member: 'codex', status: 'queued', ...admit(p), write: false };
-  assert.equal(chain.queuedRefusal(j, [p]), null);
-  for (const bad of [{ fullAccess: true }, { work: 'w' }, { stage: 's' }, { stageId: 's' }, { previous: 'old' }])
-    assert.match(chain.queuedRefusal({ ...j, ...bad }, [p]), /запрещены/);
-  // team-v46 п.4: запись подпоручения — только у пишущего родителя; роль «проверка» — без голоса, но допускается.
-  assert.match(chain.queuedRefusal({ ...j, write: true }, [p]), /пишущего поручения-родителя/);
-  assert.equal(chain.queuedRefusal({ ...j, write: true, role: 'проверка' }, [{ ...p, write: true }]), null);
-  assert.match(chain.queuedRefusal({ ...j, rootSlot: 6 }, [p]), /место.*не подтверждено/);
-  assert.match(chain.queuedRefusal({ ...j, chainNonce: 'foreign' }, [p]), /место.*не подтверждено/);
-  assert.match(chain.queuedRefusal(j, [{ ...p, rootJob: 'other' }]), /не сходится/);
+test('Г4d (§D.3): isDescendant — только свои потомки (parentJob-путь к MOST_JOB_ID)', () => {
+  const before = process.env.MOST_JOB_ID; process.env.MOST_JOB_ID = 'g4d-p';
+  const now = new Date().toISOString();
+  try {
+    // team-v48e (ревью п.3): отмена разрешена только при положительном подтверждении предками — childPid идущего
+    // поручения MOST_JOB_ID среди предков процесса (здесь pid 4100).
+    const cards = [
+      { id: 'g4d-p', member: 'codex', status: 'running', childPid: 4100, startedAt: now },
+      { id: 'g4d-c', member: 'deepseek', parentJob: 'g4d-p' },
+      { id: 'g4d-gc', member: 'antigravity', parentJob: 'g4d-c' },
+      { id: 'g4d-foreign', member: 'codex' },
+      { id: 'g4d-foreign-c', member: 'codex', parentJob: 'g4d-foreign' },
+    ];
+    assert(chain.isDescendant('g4d-c', { cards }), 'прямой потомок');
+    assert(chain.isDescendant('g4d-gc', { cards }), 'внук');
+    assert(!chain.isDescendant('g4d-p', { cards }), 'сам родитель — не потомок');
+    assert(!chain.isDescendant('g4d-foreign', { cards }), 'чужая карточка');
+    assert(!chain.isDescendant('g4d-foreign-c', { cards }), 'потомок чужого');
+    assert(!chain.isDescendant('missing', { cards }), 'нет карточки');
+    const anc = { cards, ancestors: [{ pid: 4100, startedAt: now }] };
+    assert.throws(() => chain.assertDescendant('g4d-p', anc), /только для своих потомков/);
+    assert.doesNotThrow(() => chain.assertDescendant('g4d-gc', anc));
+    delete process.env.MOST_JOB_ID;
+    assert(!chain.isDescendant('g4d-c', { cards }), 'без MOST_JOB_ID — нет');
+  } finally { if (before === undefined) delete process.env.MOST_JOB_ID; else process.env.MOST_JOB_ID = before; }
 });
+test('team-v48e (ревью п.3): отмена из поручения — только при положительном подтверждении byAncestors', () => {
+  const before = process.env.MOST_JOB_ID, now = new Date().toISOString();
+  try {
+    // (а) вызывающий процесс не потомок ни одного идущего поручения; MOST_JOB_ID=B подставлен → byAncestors=false, отказ.
+    const none = [{ id: 'p3a-B', member: 'codex', status: 'running', startedAt: now }, { id: 'p3a-Bc', member: 'deepseek', parentJob: 'p3a-B' }];
+    process.env.MOST_JOB_ID = 'p3a-B';
+    assert.throws(() => chain.assertDescendant('p3a-Bc', { cards: none, ancestors: [{ pid: 777, startedAt: now }] }),
+      /не подтверждено предками процесса/, 'процесс не потомок идущего поручения — отказ');
+    // (б) A ждало очередь и стартовало позже — окно времени (startedAfter) исключает A из предков; `other` его не ловит,
+    // но byAncestors для подставного B=false → отказ (прежде мёртвое условие p.job.id!==id пропускало B).
+    const late = [
+      { id: 'p3b-A', member: 'codex', status: 'running', childPid: 4242, startedAt: new Date(Date.now() - 24 * 3600000).toISOString() },
+      { id: 'p3b-B', member: 'codex', status: 'running', startedAt: now },
+      { id: 'p3b-Bc', member: 'deepseek', parentJob: 'p3b-B' },
+    ];
+    process.env.MOST_JOB_ID = 'p3b-B';
+    assert.throws(() => chain.assertDescendant('p3b-Bc', { cards: late, ancestors: [{ pid: 4242, startedAt: now }] }),
+      /не подтверждено предками процесса/, 'A исключено окном времени, B подставлен — byAncestors=false');
+    // (в) законный вызов из B: его childPid среди предков процесса — отмена своего потомка проходит.
+    const legit = [{ id: 'p3c-B', member: 'codex', status: 'running', childPid: 888, startedAt: now }, { id: 'p3c-Bc', member: 'deepseek', parentJob: 'p3c-B' }];
+    process.env.MOST_JOB_ID = 'p3c-B';
+    assert.doesNotThrow(() => chain.assertDescendant('p3c-Bc', { cards: legit, ancestors: [{ pid: 888, startedAt: now }] }));
+  } finally { if (before === undefined) delete process.env.MOST_JOB_ID; else process.env.MOST_JOB_ID = before; }
+});
+test('team-v48e (ревью п.3): поручение ждало очередь >10 мин — отмена своего потомка проходит по childStartedAt', () => {
+  const before = process.env.MOST_JOB_ID;
+  const launchedAt = new Date().toISOString();
+  const queuedLongAgo = new Date(Date.now() - 11 * 60000).toISOString(); // постановка 11 мин назад
+  try {
+    // B ждало в очереди 11 мин (startedAt), процесс запустился только что (childStartedAt). Сверка идёт с реальным
+    // временем запуска, а не постановки, — законная отмена своего потомка проходит (прежде окно 10 мин её отклоняло).
+    const waited = [
+      { id: 'p3q-B', member: 'codex', status: 'running', childPid: 6363, startedAt: queuedLongAgo, childStartedAt: launchedAt },
+      { id: 'p3q-Bc', member: 'deepseek', parentJob: 'p3q-B' },
+    ];
+    process.env.MOST_JOB_ID = 'p3q-B';
+    assert.doesNotThrow(() => chain.assertDescendant('p3q-Bc', { cards: waited, ancestors: [{ pid: 6363, startedAt: launchedAt }] }),
+      'очередь 11 мин, настоящий childPid — отмена проходит');
+    // Процесс реально принадлежит A (его childPid среди предков), MOST_JOB_ID подставлен на Bf — отказ по-прежнему.
+    const forged = [
+      { id: 'p3q-A', member: 'codex', status: 'running', childPid: 6363, startedAt: queuedLongAgo, childStartedAt: launchedAt },
+      { id: 'p3q-Bf', member: 'codex', status: 'running', startedAt: launchedAt },
+      { id: 'p3q-Bfc', member: 'deepseek', parentJob: 'p3q-Bf' },
+    ];
+    process.env.MOST_JOB_ID = 'p3q-Bf';
+    assert.throws(() => chain.assertDescendant('p3q-Bfc', { cards: forged, ancestors: [{ pid: 6363, startedAt: launchedAt }] }),
+      /разные поручения|не подтверждено предками процесса/, 'подставной MOST_JOB_ID — отказ');
+  } finally { if (before === undefined) delete process.env.MOST_JOB_ID; else process.env.MOST_JOB_ID = before; }
+});
+test('Г4d (§D.3): отмена из поручения-сеанса — свой потомок да, предок/чужой нет', async () => {
+  const now = new Date().toISOString();
+  // team-v48e (ревью п.3): отмена разрешена только при подтверждении предками — childPid поручения-сеанса g4d-anc
+  // среди предков процесса-гостя (pid 4100 из дерева), окно времени startedAfter.
+  save('codex', { id: 'g4d-anc', status: 'running', from: 'claude', childPid: 4100, startedAt: now });
+  save('codex', { id: 'g4d-desc', status: 'queued', parentJob: 'g4d-anc', from: 'claude' });
+  save('codex', { id: 'g4d-other', status: 'queued', from: 'claude' });
+  const beforeTree = process.env.MOST_TEST_PROCESS_TREE;
+  process.env.MOST_TEST_PROCESS_TREE = JSON.stringify([{ pid: 'self', ppid: 4100, startedAt: now }, { pid: 4100, ppid: 1, startedAt: now }]);
+  // MOST_PROBE_GUEST=full — боевой набор инструментов (guestTools), чтобы поручение-сеанс получило codex_cancel (§D.3).
+  const before = process.env.MOST_PROBE_GUEST; process.env.MOST_PROBE_GUEST = 'full';
+  try {
+    await guest('codex', 'job', { id: 'g4d-anc' }, async c => {
+      assert((await c.listTools()).tools.map(t => t.name).includes('codex_cancel'), 'поручение-сеанс получает codex_cancel');
+      const ok = await c.callTool({ name: 'codex_cancel', arguments: { id: 'g4d-desc' } });
+      assert(!ok.isError, text(ok));
+      const anc = await c.callTool({ name: 'codex_cancel', arguments: { id: 'g4d-anc' } });
+      assert(anc.isError); assert.match(text(anc), /только для своих потомков/);
+      const foreign = await c.callTool({ name: 'codex_cancel', arguments: { id: 'g4d-other' } });
+      assert(foreign.isError); assert.match(text(foreign), /только для своих потомков/);
+    });
+  } finally {
+    if (before === undefined) delete process.env.MOST_PROBE_GUEST; else process.env.MOST_PROBE_GUEST = before;
+    if (beforeTree === undefined) delete process.env.MOST_TEST_PROCESS_TREE; else process.env.MOST_TEST_PROCESS_TREE = beforeTree;
+  }
+  assert.equal(JSON.parse(fs.readFileSync(cardFile('codex', 'g4d-desc'))).status, 'cancelled');
+  assert.equal(JSON.parse(fs.readFileSync(cardFile('codex', 'g4d-other'))).status, 'queued');
+  assert.equal(JSON.parse(fs.readFileSync(cardFile('codex', 'g4d-anc'))).status, 'running');
+});
+// team-v48e Г3: тумблер MOST_CHAIN_STRICT удалён — тест «под strict queuedRefusal отвергает вид» убран; безусловное снятие — ниже.
+test('team-v48 Г3: по умолчанию queuedRefusal пропускает полный доступ/этап/запись шире родителя, но держит подпись и предков', () => withChain({}, () => {
+  const p = parent(), j = { id: 'queued2', member: 'codex', status: 'queued', ...admit(p), write: false };
+  assert.equal(chain.queuedRefusal(j, [p]), null);
+  // вид подпоручения больше не отвергается (кроме подписи места и подлинности полей):
+  for (const extra of [{ fullAccess: true }, { work: 'w' }, { stage: 's' }, { stageId: 's' }, { previous: 'old' }])
+    assert.equal(chain.queuedRefusal({ ...j, ...extra }, [p]), null, JSON.stringify(extra));
+  assert.equal(chain.queuedRefusal({ ...j, write: true }, [p]), null, 'запись шире родителя допускается');
+  // подпись места, подлинность полей, запрет возврата к предку и схождение с родителем — по-прежнему держат:
+  assert.match(chain.queuedRefusal({ ...j, chainNonce: 'foreign' }, [p]), /место.*не подтверждено/);
+  assert.match(chain.queuedRefusal({ ...j, depth: 0 }, [p]), /повреждены поля цепочки/);
+  assert.match(chain.queuedRefusal(j, [{ ...p, member: 'codex' }]), /уже есть в цепочке/);
+  assert.match(chain.queuedRefusal(j, [{ ...p, rootJob: 'other' }]), /не сходится/);
+}));
 test('review: подпоручение не засчитывается голосом ни участника, ни этапа', () => {
   for (const who of ['codex', 'antigravity', 'deepseek']) {
     const id = f.job(f.fixture(), who, 0, { parentJob: 'parent-review' });
@@ -292,6 +447,7 @@ for (const status of ['done', 'cancelled', 'running']) {
       require: name => name.endsWith('/job-chain') ? chain :
         name.endsWith('/chain-deadline') ? require('../common/chain-deadline') :
         name.endsWith('/progress') ? { longRunning: async () => {} } :
+        name.endsWith('/members') ? { recipientPaused: () => false } :
         name.endsWith('/notify') ? { transition: () => {} } : assert.fail(name),
       access: { guest: () => false }, currentBinary: () => 'fake-dsh', scanning: false, closing: false,
       stateDir: path.join(f.root, 'state'), list: () => [{ ...card }],
@@ -346,7 +502,7 @@ test('Р1–Р3: очередь Antigravity отклоняет цикл до gen
     assert.match(card.error, status === 'queued' ? /уже есть в цепочке/ : /место.*не подтверждено/);
   }
 });
-test('Р3: оба файла мест существуют и оба nonce проверяются; корень резервируется первым', () => {
+test('Р3: оба файла мест существуют и оба nonce проверяются; подпись места сохранена', () => withChain({}, () => {
   const p = parent(), j = { ...admit(p), member: 'codex', status: 'queued' };
   for (const [kind, slot] of [['parent', j.parentSlot], ['root', j.rootSlot]]) {
     const file = path.join(f.root, 'state/job-chain', kind, p.id, String(slot));
@@ -358,24 +514,16 @@ test('Р3: оба файла мест существуют и оба nonce пр�
     assert.match(chain.queuedRefusal({ ...j, [field]: 2 }, [p]), /место.*не подтверждено/);
     assert.match(chain.queuedRefusal({ ...j, [field]: undefined }, [p]), /повреждены поля/);
   }
-  const full = parent();
-  for (let n = 0; n < 6; n++) chain.reserve('root', full.id, 6, 'occupied');
-  assert.throws(() => admit(full), /в цепочке уже 6/);
-  assert.equal(slots('parent', full.id), 0);
-});
-test('Р4: work Antigravity — материал, work Codex/DeepSeek — работа любого типа', () => {
+}));
+test('team-v48e Г3: work/этап/продолжение подпоручению допускаются у всех исполнителей (вид снят безусловно)', () => withChain({}, () => {
   const p = parent({ member: 'deepseek' }), fields = admit(p);
   for (const server of ['codex', 'deepseek', 'antigravity']) {
     const list = [{ ...p, member: server === 'deepseek' ? 'codex' : 'deepseek' }];
     const j = { ...fields, member: 'forged', status: 'queued' };
-    for (const work of ['исходный текст', { text: 'исходный текст' }]) {
-      const refusal = chain.queuedRefusal({ ...j, work }, list, server);
-      if (server === 'antigravity') assert.equal(refusal, null); else assert.match(refusal, /запрещены/);
-    }
     for (const field of [server === 'antigravity' ? 'workName' : 'work', 'stage', 'stageId'])
-      assert.match(chain.queuedRefusal({ ...j, [field]: 'work' }, list, server), /запрещены/);
+      assert.equal(chain.queuedRefusal({ ...j, [field]: 'work' }, list, server), null, server + '/' + field + ' допущено');
   }
-});
+}));
 test('Р5: сбой/пустой отпечаток — отказ; границы окна старта включены', () => {
   const startedAt = '2026-10-22T10:00:00Z', p = parent(), other = parent({ childPid: 82, startedAt });
   process.env.MOST_JOB_ID = p.id;
@@ -393,16 +541,16 @@ test('Р5: сбой/пустой отпечаток — отказ; границ
   }
   for (const value of [undefined, 'invalid']) assert.equal(chain.parent([p, other], [{ pid: 82, startedAt: value }]).byAncestors, false);
 });
-test('Р6: родитель-проверка не делегирует у всех исполнителей', () => {
+test('team-v48e Г3: родитель-проверка делегирует у всех исполнителей (запрет снят безусловно)', () => withChain({}, () => {
   for (const member of ['codex', 'antigravity', 'deepseek']) {
     const p = parent({ member, role: 'проверка' }), server = member === 'codex' ? 'deepseek' : 'codex';
     process.env.MOST_JOB_ID = p.id;
-    assert.throws(() => chain.admit(server, server + '_send', {}, { cards: [p], ancestors: [{ pid: 999999 }] }), /ролью «проверка»/);
-    assert.equal(slots('root', p.id), 0);
+    const c = chain.admit(server, server + '_send', {}, { cards: [p], ancestors: [{ pid: 999999 }] });
+    assert.equal(c.parentJob, p.id, member + ': родитель-проверка выдал место');
   }
   const p = parent(), j = { ...admit(p), member: 'codex', status: 'queued' };
-  assert.match(chain.queuedRefusal(j, [{ ...p, role: 'проверка' }]), /ролью «проверка»/);
-});
+  assert.equal(chain.queuedRefusal(j, [{ ...p, role: 'проверка' }]), null, 'queuedRefusal допускает родителя-проверку');
+}));
 test('Р7: доставляемые правила не содержат прежнего запрета подпоручений', () => {
   const files = ['rules/common.md', 'rules/fallback.md', ...fs.readdirSync(path.join(ROOT, 'rules/helpers')).filter(n => n.endsWith('.md')).map(n => 'rules/helpers/' + n)];
   for (const file of files) {

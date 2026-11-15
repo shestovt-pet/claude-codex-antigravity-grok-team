@@ -6,7 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { spawnSync } = require('child_process');
-const { validateManifest, readLocal, imageInfo, MAX_BYTES } = require('../common/artifact-manifest');
+const { validateManifest, readLocal, imageInfo } = require('../common/artifact-manifest');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'most-artifacts-'));
 const hash = b => crypto.createHash('sha256').update(b).digest('hex');
 function crc(b) { let c = 0xffffffff; for (const v of b) { c ^= v; for (let k = 0; k < 8; k++) c = (c >>> 1) ^ ((c & 1) ? 0xedb88320 : 0); } return (c ^ 0xffffffff) >>> 0; }
@@ -46,6 +46,28 @@ test('JPEG размеры из SOF, не имени', () => {
 test('метаданные не повышают доказательство модели', () => { const m=copy(); m.artifacts[0].providerReportedArtifactModel='Grok Imagine'; m.artifacts[0].metadataClaims={declaredModel:'Grok Imagine',signatureValidation:'verified',trustValidation:'trusted'}; const a=validateManifest(m,root).artifacts[0]; assert.equal(a.modelEvidence,'manifest_claim'); assert.equal(a.metadataClaims.trustValidation,'not_checked'); });
 test('выход из корня, абсолютный путь, ADS, каталог отвергаются', () => { for(const p of ['../escape.png',path.join(root,'art-0-grok.png'),'art-0-grok.png:secret','.']) assert.throws(()=>readLocal(root,p)); });
 test('предел размера соблюдается до чтения', () => assert.throws(()=>readLocal(root,'art-0-grok.png',1), /размера/));
+test('team-v48e Г7: чтение артефакта без размерного предела (тумблер MOST_ARTIFACT_MAX_BYTES удалён)', () => {
+  const rel='art-0-grok.png', size=fs.statSync(path.join(root,rel)).size;
+  assert.equal(readLocal(root,rel).bytes.length,size,'файл читается без размерного предела');
+  // Даже при выставленной прежней переменной предела нет — тумблер удалён, не читается.
+  process.env.MOST_ARTIFACT_MAX_BYTES=String(size-1);
+  try { assert.equal(readLocal(root,rel).bytes.length,size,'MOST_ARTIFACT_MAX_BYTES не ограничивает'); } finally { delete process.env.MOST_ARTIFACT_MAX_BYTES; }
+});
+test('Г7 B.1: распаковка PNG ограничена INFLATE_MAX_BYTES (защита от zip-бомбы) отдельно от размера чтения', () => {
+  const b=png(0,4,4);
+  assert(imageInfo(b),'по умолчанию валидный PNG распаковывается');
+  process.env.MOST_ARTIFACT_INFLATE_MAX_BYTES='2';
+  // team-v48e п.15: текст отказа содержит фактическое значение настройки.
+  try { assert.throws(()=>imageInfo(b), /INFLATE_MAX_BYTES=2/); } finally { delete process.env.MOST_ARTIFACT_INFLATE_MAX_BYTES; }
+});
+test('team-v48e Г7: матрица >10000 ячеек и order >1000 валидны (тумблеры MOST_ARTIFACT_MAX_CELLS/ORDER удалены)', () => {
+  const big={ schemaVersion:1, order:{ ids:Array.from({length:1001},(_,i)=>'i'+i), operators:['grok'] }, artifacts:[] };
+  // Размер order/матрицы не отвергается (ошибки — только по доставке ячеек, не по размеру).
+  assert(!validateManifest(big,root).errors.some(e=>/order\.ids|Матрица слишком велика/.test(e)),'размер order не ограничен');
+  // Даже при выставленной прежней переменной отказа по размеру нет — тумблер удалён.
+  process.env.MOST_ARTIFACT_MAX_ORDER='1000';
+  try { assert(!validateManifest(big,root).errors.some(e=>/order\.ids|Матрица слишком велика/.test(e)),'MOST_ARTIFACT_MAX_ORDER не ограничивает'); } finally { delete process.env.MOST_ARTIFACT_MAX_ORDER; }
+});
 test('junction наружу отвергается', () => { const outside=fs.mkdtempSync(path.join(os.tmpdir(),'most-artifacts-out-')); const link=path.join(root,'outside'); fs.symlinkSync(outside,link,'junction'); fs.writeFileSync(path.join(outside,'x.png'),png(4)); assert.throws(()=>readLocal(root,'outside/x.png'), /Ссылки/); });
 test('неверные типы схемы не приводят к готовности', () => { for(const m of [null,{}, {...copy(),order:{ids:['a'],operators:[]}}, {...copy(),order:{ids:['a','a'],operators:['grok']}}]) assert.equal(validateManifest(m,root).ready,false); });
 test('CLI 0 только готовому, 1 неполному заказу', () => { fs.writeFileSync(path.join(root,'manifest.json'),JSON.stringify(manifest)); const cli=path.join(__dirname,'../tools/verify-artifacts.js'); const ok=spawnSync(process.execPath,[cli,root,'manifest.json'],{encoding:'utf8'}); assert.equal(ok.status,0,ok.stdout); const m=copy(); m.artifacts.pop(); fs.writeFileSync(path.join(root,'incomplete.json'),JSON.stringify(m)); const no=spawnSync(process.execPath,[cli,root,'incomplete.json'],{encoding:'utf8'}); assert.equal(no.status,1); assert.equal(JSON.parse(no.stdout).ready,false); });

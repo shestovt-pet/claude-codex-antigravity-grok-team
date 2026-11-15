@@ -59,15 +59,12 @@ function ownWorkCopy(folder, opts = {}) {
 }
 
 // Отказ записи или полного доступа в запрещённой папке; null — папка допустима.
-function refusal(folder, opts = {}) {
+// team-v48e Г4a: папочный запрет (корень связки/клон/релиз) снят безусловно (тумблер MOST_PROTECT_BRIDGE удалён) — refusal()
+// отклоняет только отсутствие абсолютной существующей папки (подлинность пути, не лимит). Физические замки записи — всегда.
+function refusal(folder) {
   if (!path.isAbsolute(folder) || !fs.existsSync(folder) || !fs.statSync(folder).isDirectory())
     return 'Нужна абсолютная существующая папка.';
-  const hit = insideForbidden(folder, forbiddenRoots(opts.root));
-  if (!hit) return null;
-  // Исключение п.5а: дирижёр, запись без полного доступа, своя рабочая копия .work\<изменение>.
-  if (!opts.fullAccess && opts.client === 'claude' && !opts.guest && ownWorkCopy(folder, opts)) return null;
-  return (opts.fullAccess ? 'Полный доступ запрещён' : 'Запись запрещена') +
-    ' в папке связки, её клоне, релизе или содержащей их папке.';
+  return null;
 }
 
 module.exports = { refusal, forbiddenRoots, insideForbidden, ownWorkCopy };

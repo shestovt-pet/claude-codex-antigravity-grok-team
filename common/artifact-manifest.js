@@ -3,7 +3,11 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
-const MAX_BYTES = 64 * 1024 * 1024;
+// team-v48e Г7: размерные кепы (чтение артефакта, число элементов order, размер матрицы) сняты безусловно (Infinity; тумблеры
+// MOST_ARTIFACT_MAX_BYTES/MAX_ORDER/MAX_CELLS удалены). Предел распаковки PNG (INFLATE_MAX_BYTES) — СОХРАНЯЕМАЯ защита ресурса
+// (zip-бомба): отдельная конечная константа 512 МБ по умолчанию (maxOutputLength zlib не принимает Infinity: ERR_OUT_OF_RANGE),
+// настройка MOST_ARTIFACT_INFLATE_MAX_BYTES — это настройка сохраняемого потолка, не тумблер возврата (сообщение — по её значению).
+const INFLATE_MAX_BYTES = () => { const v = Number(process.env.MOST_ARTIFACT_INFLATE_MAX_BYTES); return Number.isInteger(v) && v >= 0 ? v : 512 * 1024 * 1024; };
 const sha = b => crypto.createHash('sha256').update(b).digest('hex');
 const object = v => v && typeof v === 'object' && !Array.isArray(v);
 const text = v => typeof v === 'string' && v.trim().length > 0;
@@ -18,7 +22,7 @@ function inside(root, p) {
   return rel !== '' && !path.isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + path.sep);
 }
 // Reject every link component, including in-root links, before opening a bounded regular file.
-function readLocal(root, relative, limit = MAX_BYTES) {
+function readLocal(root, relative, limit = Infinity) {
   if (!text(root) || !path.isAbsolute(root)) throw Error('Нужна абсолютная папка заказа');
   if (!text(relative) || path.isAbsolute(relative) || path.win32.isAbsolute(relative) || /[:\0]/.test(relative)) throw Error('Нужен относительный путь файла');
   const base = fs.realpathSync(root), target = path.resolve(base, relative);
@@ -63,7 +67,10 @@ function imageInfo(b) {
     const bits = header[8], color = header[9], channels = {0:1,2:3,3:1,4:2,6:4}[color];
     const allowedBits = {0:[1,2,4,8,16],2:[8,16],3:[1,2,4,8],4:[8,16],6:[8,16]};
     if (!channels || !allowedBits[color].includes(bits) || header[10] || header[11] || header[12] > 1) throw Error('Неверный формат пикселей PNG');
-    const pixels = zlib.inflateSync(Buffer.concat(data), { maxOutputLength: MAX_BYTES });
+    let pixels;
+    // team-v48e п.15: сообщение сохраняемой защиты ресурса — по фактическому значению настройки INFLATE_MAX_BYTES.
+    try { pixels = zlib.inflateSync(Buffer.concat(data), { maxOutputLength: INFLATE_MAX_BYTES() }); }
+    catch (e) { throw e.code === 'ERR_BUFFER_TOO_LARGE' ? Error('Распаковка PNG превысила предел INFLATE_MAX_BYTES=' + INFLATE_MAX_BYTES() + ' байт') : e; }
     if (header[12] === 0) {
       const stride = Math.ceil(width * channels * bits / 8) + 1;
       if (pixels.length !== stride * height) throw Error('Неверный объём пикселей PNG');
@@ -101,10 +108,11 @@ function validateManifest(manifest, root) {
   const order = manifest.order;
   for (const field of ['ids', 'operators']) {
     const a = order[field];
-    if (!Array.isArray(a) || !a.length || a.length > 1000 || a.some(v => !text(v) || v !== v.trim()) || new Set(a).size !== a.length) errors.push('Неверный список order.' + field);
+    // team-v48e Г7: число элементов order не ограничено (тумблер MOST_ARTIFACT_MAX_ORDER удалён). Проверки непустоты/уникальности/вида — всегда.
+    if (!Array.isArray(a) || !a.length || a.some(v => !text(v) || v !== v.trim()) || new Set(a).size !== a.length) errors.push('Неверный список order.' + field);
   }
   if (errors.length) return { ready: false, errors, artifacts };
-  if (order.ids.length * order.operators.length > 10000 || manifest.artifacts.length > 10000) return { ready: false, errors: ['Матрица слишком велика'], artifacts };
+  // team-v48e Г7: размер матрицы (ячейки/артефакты) не ограничен (тумблер MOST_ARTIFACT_MAX_CELLS удалён).
   if (order.aspectRatio !== undefined && (!Array.isArray(order.aspectRatio) || order.aspectRatio.length !== 2 || order.aspectRatio.some(n => !Number.isSafeInteger(n) || n <= 0))) errors.push('Неверное order.aspectRatio');
   const ratioValid = Array.isArray(order.aspectRatio) && order.aspectRatio.length === 2 && order.aspectRatio.every(n => Number.isSafeInteger(n) && n > 0);
   const expected = new Set(order.ids.flatMap(id => order.operators.map(op => JSON.stringify([id, op]))));
@@ -146,4 +154,4 @@ function validateManifest(manifest, root) {
   for (const key of expected) if (!seen.has(key)) errors.push('Не доставлена ячейка ' + key);
   return { ready: errors.length === 0, errors, artifacts };
 }
-module.exports = { validateManifest, readLocal, imageInfo, MAX_BYTES };
+module.exports = { validateManifest, readLocal, imageInfo };

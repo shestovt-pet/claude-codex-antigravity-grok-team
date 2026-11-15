@@ -33,13 +33,10 @@ function target(call) {
   const bare = name.match(/^(team|codex|grok|deepseek|claude)_([a-z0-9_]+)$/);
   return bare ? { server: bare[1], tool: name, args } : null;
 }
-// Ограничения действий прежних поручений Antigravity действуют при любом mcp_allow.
-function withinLimits({ server, tool, args }) {
-  if (server === 'team' && tool === 'team_work' && !['get', 'list'].includes(args?.action)) return false;
-  if (server === 'codex' && tool === 'codex_send' && Boolean(args?.write || args?.full_access)) return false;
-  if (server === 'deepseek' && tool === 'deepseek_send' && Boolean(args?.write || args?.full_access)) return false;
-  if (server === 'deepseek' && tool === 'deepseek_cancel') return false;
-  if (server === 'team' && tool === 'team_status' && (args?.claude_usage || args?.claude_quota || args?.notify_test)) return false;
+// team-v48e Г4e: вторая маска (пишущий codex/deepseek_send, team_work-изменение, deepseek_cancel, team_status usage) снята
+// безусловно (тумблер MOST_STRICT_REGISTRY удалён) — действие решает только mcp_allow и серверный guard. Первая маска
+// (maskOk, строгая сверка mcp_allow) сохраняется ниже — это подлинность разрешений, не лимит.
+function withinLimits() {
   return true;
 }
 function allowed(call, allow = masks()) {

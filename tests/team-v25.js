@@ -143,30 +143,86 @@ test('О2: запись, замок папки, needs_decision, перезапу
   } finally { if (main) await main.close(); await guest.close(); }
 });
 
-test('О3: корень, клон, релиз, родители, junction; полный доступ', async () => {
+test('team-v48e Г4a О3: папочный запрет корня/клона/релиза/junction снят безусловно (тумблер MOST_PROTECT_BRIDGE удалён)', async () => {
   ready(); const clone = path.join(REPO, '.work/change'), release = path.join(REPO, 'live/hash');
   for (const folder of [clone, release]) fs.mkdirSync(folder, { recursive: true });
   const link = path.join(RUN, 'alias'); junction(link, REPO);
   const forbidden = [REPO, clone, release, RELEASE, path.join(RELEASE, 'common'), RUN, path.parse(RUN).root, link];
-  await withMcp(async guest => { for (const folder of forbidden) await refuse(guest, { folder, write: true }, /Запись запрещена/); }, chatEnv());
-  await withMcp(async main => { for (const folder of [RUN, path.parse(RUN).root, link]) await refuse(main, { folder, write: true, full_access: true }, /Полный доступ запрещён/); });
-  assert.equal(logs().length, 0); await freeLocks('unused');
+  const writeFolder = lib('write-folder');
+  // Папочный запрет снят безусловно — refusal() для существующих абсолютных папок возвращает null даже при выставленной прежней переменной.
+  for (const folder of forbidden) assert.equal(writeFolder.refusal(folder, { fullAccess: true }), null, 'папочный запрет снят: ' + folder);
+  process.env.MOST_PROTECT_BRIDGE = '1';
+  try { for (const folder of forbidden) assert.equal(writeFolder.refusal(folder, { fullAccess: true }), null, 'MOST_PROTECT_BRIDGE не возвращает запрет: ' + folder); }
+  finally { delete process.env.MOST_PROTECT_BRIDGE; }
+  // Подлинность пути сохранена: относительный/несуществующий — отказ.
+  assert.match(writeFolder.refusal('относительный', {}), /Нужна абсолютная существующая папка/);
+  assert.equal(logs().length, 0);
 });
 
-test('О3: смена realpath после постановки и после замков — отказ без оставленных замков', async () => {
+test('team-v48e Г4a О3: смена realpath в папку связки больше не отклоняется (папочный запрет снят), замки освобождаются', async () => {
   ready(); const api = internals(), paths = lib('paths'), locks = lib('locks');
-  asChat(); const sent = await api.send({ ...defaults(), write: true }); const id = idOf(sent);
-  process.env.MOST_CLIENT = 'claude'; const original = fs.realpathSync.native;
-  fs.realpathSync.native = p => path.resolve(p) === PROJECT ? original(REPO) : original(p);
-  try { await api.queue(); } finally { fs.realpathSync.native = original; }
-  assert.equal(card(id).status, 'failed'); assert.match(card(id).error, /Запись из чата/); await freeLocks(id);
-  // Та же смена пути непосредственно перед spawn, после снимка файлов под замком.
-  const j = seeded('late-path', { from: 'codex', fromChat: 'codex', write: true, status: 'running', threadId: 'late-thread' });
-  const held = await locks.tryLock('codex_folder', paths.canon(PROJECT), {}); assert(held.ok);
-  const fallback = lib('fallback'), before = fallback.folderStateDetailed;
-  fallback.folderStateDetailed = (...args) => { const value = before(...args); fs.realpathSync.native = p => path.resolve(p) === PROJECT ? original(REPO) : original(p); return value; };
-  try { await api.execute(j, held); } finally { fallback.folderStateDetailed = before; fs.realpathSync.native = original; }
-  assert.equal(card(j.id).status, 'failed'); assert.equal(logs().length, 0); await freeLocks(j.id, PROJECT, j.threadId);
+  // Папочный запрет снят безусловно (тумблер MOST_PROTECT_BRIDGE удалён) — подмена пути PROJECT→REPO не вызывает отказа «Запись из чата»; карточка доходит до done.
+  {
+    asChat(); const sent = await api.send({ ...defaults(), write: true }); const id = idOf(sent);
+    process.env.MOST_CLIENT = 'claude'; const original = fs.realpathSync.native;
+    fs.realpathSync.native = p => path.resolve(p) === PROJECT ? original(REPO) : original(p);
+    try { await api.queue(); await until(() => card(id).status === 'done', 'запуск после подмены пути'); } finally { fs.realpathSync.native = original; }
+    assert.equal(card(id).status, 'done'); assert.doesNotMatch(card(id).error || '', /Запись из чата/); await freeLocks(id);
+  }
+  // Подмена пути в окне после последнего await (mutate перед запуском) и до spawn — на шаге deadlinePassed, который
+  // идёт сразу за этим await и непосредственно перед reconcile+spawn (team-v48e ревью п.1). Старое размещение reconcile
+  // (до await) запустило бы писателя в REPO с замком PROJECT; теперь связка сверяется синхронно перед spawn.
+  const writeLock = lib('write-lock'), cd = lib('chain-deadline'), beforeDeadline = cd.deadlinePassed;
+  const swap = original => { fs.realpathSync.native = p => path.resolve(p) === PROJECT ? original(REPO) : original(p); };
+  // (2а) Замок прежней папки PROJECT; realpath сместился на REPO уже после снимка/карточки — reconcile перехватывает замок фактической папки REPO, поручение доходит до done.
+  {
+    const original = fs.realpathSync.native;
+    const j = seeded('late-path', { from: 'codex', fromChat: 'codex', write: true, status: 'running', threadId: 'late-thread' });
+    const prior = await writeLock.acquire(PROJECT, { jobId: j.id }); assert(prior.ok);
+    cd.deadlinePassed = job => { swap(original); return beforeDeadline(job); };
+    try { await api.execute(j, prior); await until(() => card(j.id).status === 'done', 'запуск после поздней подмены пути'); } finally { cd.deadlinePassed = beforeDeadline; fs.realpathSync.native = original; }
+    await until(() => !api.active.size, 'конец исполнения поздней подмены');
+    assert.equal(card(j.id).status, 'done'); assert.doesNotMatch(card(j.id).error || '', /Запись из чата/, 'папочного отказа нет');
+    // Прежний замок PROJECT снят reconcile; замок фактической папки REPO снят по завершению — обе свободны.
+    for (const folder of [PROJECT, REPO]) { const l = await writeLock.acquire(folder, { jobId: 'probe' }); assert(l.ok, folder); await l.release(); }
+  }
+  // (2б) Исключительность фактической папки: второй писатель держит REPO — поручение с поздней подменой пути туда не запускается (не B с замком A), а отказывает.
+  {
+    const original = fs.realpathSync.native;
+    const other = await writeLock.acquire(REPO, { jobId: 'other-writer' }); assert(other.ok);
+    try {
+      const j = seeded('late-path2', { from: 'codex', fromChat: 'codex', write: true, status: 'running', threadId: 'late-thread-2' });
+      const prior = await writeLock.acquire(PROJECT, { jobId: j.id }); assert(prior.ok);
+      cd.deadlinePassed = job => { swap(original); return beforeDeadline(job); };
+      try { await api.execute(j, prior); await until(() => ['failed', 'needs_decision'].includes(card(j.id).status), 'отказ по занятой фактической папке'); }
+      finally { cd.deadlinePassed = beforeDeadline; fs.realpathSync.native = original; }
+      await until(() => !api.active.size, 'конец исполнения');
+      assert.match(card(j.id).error || '', /сместилась|занята другим/, 'не пишет в папку второго писателя');
+      assert(!(await writeLock.acquire(REPO, { jobId: 'probe' })).ok, 'второй писатель держит REPO');
+    } finally { await other.release(); }
+  }
+});
+
+test('team-v48e (ревью п.1): все аргументы запуска codex — канонический путь замка, не строка-ссылка job.folder', async () => {
+  ready(); const api = internals(), writeLock = lib('write-lock'), paths = lib('paths');
+  // job.folder — junction на PROJECT; канонический путь — realpath(PROJECT). Замок, cwd и --cd несут этот
+  // канонический путь, а не строку-ссылку: подмена junction после сверки не уводила бы запуск по строке-ссылке.
+  const LINK = path.join(RUN, 'link-proj');
+  junction(LINK, PROJECT); // на не-Windows бросит { skip }, диспетчер CASE переведёт в ПРОПУЩЕНО
+  const want = paths.canon(LINK); // = канонический realpath(PROJECT)
+  const j = seeded('p1-cd', { folder: LINK, write: true, status: 'running', task: 'ЗАПИШИ ФАЙЛ p1.txt' });
+  const lock = await writeLock.acquire(LINK, { jobId: j.id }); assert(lock.ok);
+  const before = logs().length;
+  await api.execute(j, lock);
+  await until(() => logs().length > before, 'fake-codex запущен');
+  await until(() => !api.active.size, 'конец исполнения');
+  const row = logs().at(-1);
+  const cdArg = row.args[row.args.indexOf('--cd') + 1];
+  assert.equal(cdArg, want, '--cd — канонический путь замка: ' + cdArg);
+  assert.notEqual(path.resolve(cdArg).toLowerCase(), path.resolve(LINK).toLowerCase(), '--cd не строка-ссылка');
+  assert.equal(paths.canon(row.cwd), want, 'cwd — канонический путь: ' + row.cwd);
+  assert(fs.existsSync(path.join(PROJECT, 'p1.txt')), 'запись легла в канонический PROJECT');
+  assert.equal(card(j.id).status, 'done');
 });
 
 test('О4: поручение-сеанс не отправляет и не отменяет; недоказанный чат получает отказ', async () => {
@@ -177,14 +233,18 @@ test('О4: поручение-сеанс не отправляет и не от�
     const guest = await mcp(chatEnv({ MOST_JOB_ID: 'assigned-job' }), server);
     try {
       for (const continue_id of [undefined, 'foreign', 'own']) {
+        // team-v48 Г4b-2b: «своему же серверу» снято по умолчанию — codex_send из поручения идёт в admit (карточки assigned-job нет → отказ).
         const r = await guest.call(server + '_send', { ...defaults(), continue_id, mode: 'review' });
-        assert(r.isError); assert.match(text(r), server === 'codex' ? /своему же серверу/i : /поручение assigned-job не найдено/);
+        assert(r.isError); assert.match(text(r), /поручение assigned-job не найдено/);
       }
+      // team-v48 Г4d (§D.3): отмена из поручения-сеанса допустима только для своих потомков; чужие/без parentJob — отказ.
+      // team-v48e (ревью п.2): MOST_JOB_ID assigned-job не идёт в store — вызывающий не подтверждён предками процесса (отказ до проверки родства).
       if (server === 'codex') for (const id of ['foreign', 'own']) {
-        const r = await guest.call('codex_cancel', { id }); assert(r.isError); assert.match(text(r), /поручение-сеанс/i);
+        const r = await guest.call('codex_cancel', { id }); assert(r.isError); assert.match(text(r), /только для своих потомков|не подтверждено предками процесса/i);
       }
     } finally { await guest.close(); }
   }
+  // team-v48e Г4b-2b: «своему же серверу» снято безусловно (тумблер MOST_GUEST_STRICT удалён) — отдельного теста возврата запрета нет.
   assert.deepEqual(fs.readdirSync(JOBS).map(n => [n, fs.readFileSync(path.join(JOBS, n), 'utf8')]), before);
   asChat(); const access = lib('access');
   const actions = [['codex', 'codex_send', {}], ['codex', 'codex_send', { write: true }], ['codex', 'codex_cancel', { id: 'own' }], ['antigravity', 'antigravity_send', {}]];
@@ -200,29 +260,36 @@ test('О4: поручение-сеанс не отправляет и не от�
     if (kind === 'empty-tree') process.env.MOST_TEST_PROCESS_TREE = '[]';
     if (kind === 'main-ancestor') process.env.MOST_TEST_PROCESS_TREE = tree(7000);
     lib('fallback').reset();
+    // team-v48 Г4b-2b/Г4d: из поручения (main-ancestor) codex_send идёт в admit, codex_cancel — в assertDescendant; оба без MOST_JOB_ID → «нет номера поручения-родителя».
     for (const [s, t, a] of actions) assert.throws(() => access.guard(s, t, a),
-      kind === 'main-ancestor' && /_send$/.test(t) ? s === 'codex' ? /своему же серверу/i : /нет номера поручения-родителя/ : /не могу подтвердить/);
+      kind === 'main-ancestor' && (/_send$/.test(t) || /_cancel$/.test(t)) ? /нет номера поручения-родителя/ : /не могу подтвердить/);
   }
+  // team-v48e Г4b-2b: «своему же серверу» (main-ancestor) снято безусловно (тумблер MOST_GUEST_STRICT удалён).
 });
 
-test('О5: полный доступ гостю запрещён до постановки', async () => {
-  ready(); await withMcp(async guest => {
-    for (const full_access of [true, 'true']) await refuse(guest, { full_access, write: true }, /Гостю полный доступ Codex запрещён/);
-  }, chatEnv());
+test('team-v48e Г4b О5: полный доступ гостю открыт безусловно до постановки (тумблер MOST_GUEST_STRICT удалён)', async () => {
+  // Полный доступ гостю в access.guard открыт безусловно — отказа «Гостю полный доступ Codex запрещён» больше нет.
+  ready(); const access = lib('access');
+  asChat();
+  try {
+    for (const full_access of [true, 'true']) assert.doesNotThrow(() => access.guard('codex', 'codex_send', { ...defaults(), full_access, write: true }));
+  } finally { process.env.MOST_CLIENT = 'claude'; }
 });
 
-test('О6: противоречивые карточки не исполняются, согласованная — только в песочнице', async () => {
-  const bad = [{ from: 'claude', write: false }, { from: 'claude', write: true }, { fullAccess: true, write: false },
-    { fullAccess: true, write: true }, { folder: REPO, write: true }, { folder: RUN, write: true }, { fromChat: '', from: 'claude', fullAccess: true, write: true }];
+test('О6: несогласованные карточки (fromChat/from) не исполняются; полный доступ из чата исполняется (team-v48e Г4a/Г4c, MOST_PROTECT_BRIDGE удалён)', async () => {
+  // Рассогласование источника (fromChat/from) — сохраняемая подлинность: отказ всегда, независимо от снятых лимитов.
+  const bad = [{ from: 'claude', write: false }, { from: 'claude', write: true }, { fromChat: '', from: 'claude', fullAccess: true, write: true }];
   for (const [i, patch] of bad.entries()) seeded('bad-' + i, { from: 'codex', fromChat: 'codex', ...patch });
+  // team-v48e Г4a/Г4c: отказ противоречивых полей fullAccess и папочный запрет чата сняты безусловно (тумблер MOST_PROTECT_BRIDGE
+  // удалён) — чат вправе ставить полный доступ, карточка исполняется. Приёмка папок связки (REPO/RUN) — соседним тестом writeFolder.refusal.
+  seeded('ok-full', { from: 'codex', fromChat: 'codex', fullAccess: true, write: true, task: 'Проба' });
   seeded('word', { from: 'codex', fromChat: 'codex', write: true, fallbackWord: 'old-word' });
   await withMcp(async main => {
-    await until(() => bad.every((_, i) => card('bad-' + i).status === 'failed') && card('word').fallbackHold, 'отказы карточек');
+    await until(() => bad.every((_, i) => card('bad-' + i).status === 'failed') && card('ok-full').status === 'done' && card('word').fallbackHold, 'отказы несогласованных и исполнение полного доступа');
     for (const [i] of bad.entries()) { const c = card('bad-' + i); assert(c.error); assert.equal(c.fullAccessApplied, false); await freeLocks(c.id, c.folder); }
-    assert.match(card('word').fallbackHold, /запасной режим снят/); assert.equal(logs().length, 0);
+    assert.match(card('word').fallbackHold, /запасной режим снят/);
     const j = seeded('consistent', { from: 'codex', fromChat: 'codex', write: true, task: 'Проба' });
-    await until(() => card(j.id).status === 'done', 'согласованная карточка');
-    assert.equal(mode(logs()[0]), 'workspace-write'); assert.equal(card(j.id).fullAccessApplied, false);
+    await until(() => card(j.id).status === 'done', 'согласованная карточка'); await freeLocks(j.id, PROJECT);
   });
 });
 
@@ -259,11 +326,15 @@ test('О7: своя отмена; чужие продолжение и отме�
 
 test('О8, О10: Antigravity закрыт своей семье; чужие полномочия закрыты', async () => {
   ready(); asChat(); const access = lib('access');
-  for (const [server, tool, args] of [['team', 'team_change', { action: 'start' }], ['team', 'team_work', { action: 'create' }],
-    ['team', 'team_work', { action: 'update' }], ['antigravity', 'antigravity_apply', { id: 'x' }]])
+  // team_change (за словом через allowed()) и antigravity_apply (канал дирижёра) закрыты гостю всегда.
+  for (const [server, tool, args] of [['team', 'team_change', { action: 'start' }], ['antigravity', 'antigravity_apply', { id: 'x' }]])
     assert.throws(() => access.guard(server, tool, args), /Гостю это действие запрещено/);
+  // team-v48e Г4b-2: team_work-изменение гостю открыто безусловно (тумблер MOST_GUEST_STRICT удалён).
+  for (const action of ['create', 'update']) assert.doesNotThrow(() => access.guard('team', 'team_work', { action }), 'team_work открыт');
+  // team-v48e Г4b-2b: свой сервер Antigravity открыт гостю безусловно — antigravity_send проходит guard (упирается в проверку review),
+  // а не в «только дирижёр».
   const agy = await mcp({ ...chatEnv(), MOST_CLIENT: 'antigravity' }, 'antigravity');
-  try { const r = await agy.call('antigravity_send', { ...defaults(), mode: 'review' }); assert(r.isError); assert.match(text(r), /только у дирижёра/); }
+  try { const r = await agy.call('antigravity_send', { ...defaults(), mode: 'review' }); assert(r.isError); assert.doesNotMatch(text(r), /только у дирижёра/); }
   finally { await agy.close(); }
   const material = path.join(PROJECT, 'review.txt'); write(material, 'Материал проверки');
   const peer = await mcp(chatEnv(), 'antigravity');
@@ -289,6 +360,27 @@ test('О9: fallbackWord сохраняет исполнение и удержа�
   assert.equal(logs().length, 1);
 });
 
+test('team-v48e (ревью п.4): метку fallbackWord ставит только сеанс дирижёра — посторонний owner без метки (держится словом), дирижёр с write=false — с меткой', async () => {
+  ready(); asChat(); const words = lib('user-word'), members = lib('members'), owner = 'fallback-codex-ab12';
+  const t = new (lib('team').Team)(REPO);
+  t.fallbackDeps = { evaluate: () => ({ desktopAlive: true }), restart: async () => { throw Error('Не запускать Desktop'); } };
+  await t.word({ action: 'record', who_down: 'claude', quote: 'Claude отвалился', owner });
+  const api = internals(), entry = words.mode().entry.id;
+  // Дирижёр с write=false — метка есть (прежде условие a.write её не ставило → удержание словом не снималось, К2).
+  const ro = await api.send({ ...defaults(), write: false, owner }); const roId = idOf(ro);
+  assert.equal(card(roId).fallbackWord, entry, 'дирижёр write=false получает метку');
+  // Посторонний owner (не сеанс дирижёра: метка не совпадает с записью слова) — без метки (прежде метку получал любой гость с записью).
+  const out = await api.send({ ...defaults(), write: true, owner: 'fallback-codex-zz99' }); const outId = idOf(out);
+  assert(!card(outId).fallbackWord, 'посторонний owner без метки');
+  // Слово о недоступности получателя: метка дирижёра снимает удержание (members.js:24), у постороннего без метки — держит.
+  const orig = words.active; words.active = who => who === 'codex' ? { who_down: 'codex' } : null;
+  try {
+    assert(!members.recipientPaused('codex', card(roId).fallbackWord), 'метка дирижёра снимает удержание словом');
+    assert(members.recipientPaused('codex', card(outId).fallbackWord), 'посторонний без метки держится словом');
+  } finally { words.active = orig; }
+  await freeLocks(roId); await freeLocks(outId);
+});
+
 test('О9а: дирижёр активного режима продолжает и отменяет прежние поручения, как в базе (Codex c9116d5d)', async () => {
   ready(); asChat(); const words = lib('user-word'), owner = 'fallback-codex-cd34';
   const t = new (lib('team').Team)(REPO);
@@ -298,8 +390,8 @@ test('О9а: дирижёр активного режима продолжает
   seeded('old-conductor', { from: 'codex', write: true, fallbackWord: word, status: 'needs_decision', threadId: 'thread-old' });
   seeded('old-claude', { from: 'claude', status: 'done', threadId: 'thread-claude' });
   seeded('claude-waiting', { from: 'claude' });
-  // Без метки дирижёра в активном режиме отказ даёт уже fallback.guard (Codex 4c42429e); сам ownChatJob — «только свои».
-  await assert.rejects(api.send({ ...defaults(), continue_id: 'old-claude' }), /только у дирижёра запасного режима/);
+  // team-v48e Г4b-2b: свой сервер открыт безусловно — отказ даёт только ownChatJob («только свои»); тумблер MOST_GUEST_STRICT удалён.
+  await assert.rejects(api.send({ ...defaults(), continue_id: 'old-claude' }), /только свои поручения/);
   assert.throws(() => api.ownChatJob(card('old-claude'), {}), /только свои поручения/);
   assert.throws(() => api.ownChatJob(card('claude-waiting'), { owner: 'fallback-codex-zz99' }), /только свои поручения/);
   // Дирижёр: старая карточка со словом без fromChat и поручение Claude продолжаются, как в базе.
@@ -317,15 +409,68 @@ test('О9а: дирижёр активного режима продолжает
   assert.equal(logs().length, 0);
 });
 
+test('team-v48e Г4c: полный доступ и запись гостя из очереди открыты безусловно (тумблер MOST_GUEST_STRICT удалён)', async () => {
+  const api = internals(), fallback = lib('fallback');
+  // Серверная карточка: роль совет + write=true + fullAccess дают полный доступ гостю/подпоручению/чату безусловно.
+  for (const patch of [{ from: 'antigravity' }, { parentJob: 'p1' }, { fallbackWord: 'w' }, { fromChat: 'codex', from: 'codex' }]) {
+    const j = { folder: PROJECT, role: 'совет', write: true, fullAccess: true, ...patch };
+    assert(api.fullAccessAllowed(j));
+    process.env.MOST_GUEST_STRICT = '1';
+    try { assert(api.fullAccessAllowed(j), 'MOST_GUEST_STRICT не ограничивает'); } finally { delete process.env.MOST_GUEST_STRICT; }
+  }
+  // queueHold: пишущее поручение гостя без fallbackWord/чата/цепочки — '' (запуск) безусловно, даже при выставленной переменной.
+  const guestWrite = { from: 'antigravity', write: true };
+  assert.equal(fallback.queueHold(guestWrite), '');
+  process.env.MOST_GUEST_STRICT = '1';
+  try { assert.equal(fallback.queueHold(guestWrite), '', 'MOST_GUEST_STRICT не держит очередь'); }
+  finally { delete process.env.MOST_GUEST_STRICT; }
+});
+
+test('team-v48e Г4c: пишущее поручение гостя подхватывается очередью безусловно (тумблер MOST_GUEST_STRICT удалён)', async () => {
+  ready(); asChat(); const api = internals(), locks = lib('locks');
+  const mk = id => seeded(id, { from: 'codex', write: true, status: 'queued', owner: locks.owner(), threadId: id, startedAt: new Date().toISOString() });
+  process.env.MOST_CLIENT = 'claude';
+  // Гостевое пишущее поручение (без fallbackWord/fromChat/цепочки) очередь берёт и доводит до конца — безусловно.
+  mk('guest-open');
+  await api.queue(); await until(() => card('guest-open').status === 'done', 'гостевая запись из очереди');
+  await until(() => !api.active.size, 'конец исполнения');
+  // Даже при выставленной прежней переменной поручение запускается — тумблер удалён.
+  process.env.MOST_GUEST_STRICT = '1';
+  try { mk('guest-held'); await api.queue(); await until(() => card('guest-held').status === 'done', 'запуск при выставленной MOST_GUEST_STRICT'); await until(() => !api.active.size, 'конец'); }
+  finally { delete process.env.MOST_GUEST_STRICT; }
+});
+
 test('О11: правила согласованы и доставляются; О12: адресная регрессия team-v19', async () => {
   const helper = fs.readFileSync(path.join(ROOT, 'rules/helpers/codex-section.md'), 'utf8');
-  for (const phrase of ['Чат Codex может сам ставить поручения', 'codex_cancel', 'только свои', 'Полного доступа у гостя нет', 'может отправлять другому участнику подпоручения', 'Отмена из поручения запрещена']) assert(helper.includes(phrase), phrase);
-  assert(!helper.includes('Поручение-сеанс поручений не ставит и не отменяет'));
-  assert(!helper.includes('не разрешение самостоятельно отправлять задания'));
+  // team-v48e Г9: новое поведение кода выпуска 1 — проверяем наличие новых формулировок и отсутствие снятых пределов/запретов.
+  for (const phrase of ['Чат Codex может сам ставить поручения', 'codex_cancel', 'только свои', 'может отправлять другому участнику подпоручения', 'полный доступ — в любой существующей папке', 'глубина и число подпоручений не ограничены', 'отменять только своих потомков']) assert(helper.includes(phrase), phrase);
+  for (const gone of ['Полного доступа у гостя нет', 'Отмена из поручения запрещена', 'глубина до 2', 'на корень', 'без полного доступа', 'Поручение-сеанс поручений не ставит и не отменяет', 'не разрешение самостоятельно отправлять задания']) assert(!helper.includes(gone), 'снятая фраза осталась: ' + gone);
   const common = fs.readFileSync(path.join(ROOT, 'rules/common.md'), 'utf8');
   assert(!common.includes('себя никто не получает')); assert(!common.includes('Codex на запись и перенос Antigravity — нельзя'));
   assert(common.includes('для своего поручения из чата Codex — чат Codex'));
-  assert(fs.readFileSync(path.join(ROOT, 'AGENTS.md'), 'utf8').includes('чат Codex для своего поручения вне связки'));
+  for (const gone of ['глубина до 2', 'в цепочке до 6', 'дочернее не шире родителя', 'Поручение-сеанс не отменяет поручений']) assert(!common.includes(gone), 'common: снятая фраза осталась: ' + gone);
+  // team-v48e (ревью п.6): доставляемые тексты не содержат снятых фраз (полный доступ — любой участник; роль «проверка» допускается; team_work-изменение открыто).
+  for (const gone of ['кроме роли «проверка»', 'изменение team_work', 'только по поручению Claude', 'не изменяй файлы связки'])
+    assert(!helper.includes(gone), 'codex-section: снятая фраза осталась: ' + gone);
+  assert(helper.includes('роль «проверка» тоже'), 'codex-section: роль проверка допускается');
+  assert(!common.includes('изменение team_work'), 'common: team_work-изменение больше не запрещено гостю');
+  assert(common.includes('при write=true, роли «текст» или «совет»'), 'common: условия полного доступа');
+  // DeepSeek 95332f7a: Bash Claude-исполнителя не привязан к дирижёру — условие кода (common/claude-args.js) — полный доступ.
+  assert(!common.includes('с полным доступом от дирижёра'), 'common: «Bash с полным доступом от дирижёра» снято');
+  assert(common.includes('Bash только с полным доступом — любому поручению при write=true'), 'common: Bash по условиям полного доступа');
+  const brief = fs.readFileSync(path.join(ROOT, 'rules/brief.md'), 'utf8');
+  assert(!brief.includes('полный доступ — только Claude'), 'brief: «полный доступ — только Claude» снято');
+  assert(brief.includes('полный доступ — при write=true и роли текст/совет'), 'brief: условия полного доступа');
+  const claudeRules = fs.readFileSync(path.join(ROOT, 'rules/claude.md'), 'utf8');
+  for (const gone of ['ставит только Claude', 'который ставит только дирижёр Claude', 'полного доступа не получает'])
+    assert(!claudeRules.includes(gone), 'claude.md: снятая фраза осталась: ' + gone);
+  assert(claudeRules.includes('Полный доступ получает любое поручение'), 'claude.md: полный доступ — любой участник');
+  for (const section of ['antigravity-section.md', 'member-section.md']) {
+    const s = fs.readFileSync(path.join(ROOT, 'rules/helpers/' + section), 'utf8');
+    assert(!s.includes('кроме роли «проверка»'), section + ': «кроме роли проверка» снято');
+    assert(s.includes('роль «проверка» тоже'), section + ': роль проверка допускается');
+  }
+  assert(fs.readFileSync(path.join(ROOT, 'AGENTS.md'), 'utf8').includes('чат Codex для своего поручения'));
   assert(fs.readFileSync(path.join(ROOT, 'rules/fallback.md'), 'utf8').includes('Поручение-сеанс'));
   const rules = lib('client-rules'), target = path.join(RUN, 'delivered.md'); write(target, 'Личные правила\r\n<!-- most:begin -->\r\nСтарый раздел\r\n<!-- most:end -->\r\n');
   const plans = rules.plans([{ file: target, role: 'codex' }]); await rules.configure({ files: [{ file: target, role: 'codex' }] });

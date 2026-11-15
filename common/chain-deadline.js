@@ -3,17 +3,10 @@
 // остаток срока родителя − 3 мин). Deadline — абсолютное время в карточке; ожидание в очереди его не сдвигает.
 const PARENT_MARGIN_MS = 3 * 60 * 1000;
 
-function normalTimeoutMs(server) {
-  server = require('./job-identity').memberId(server) || server;
-  const env = process.env;
-  if (server === 'antigravity') {
-    const m = /^(\d+(?:\.\d+)?)(ms|s|m|h)$/.exec(env.MOST_PRINT_TIMEOUT || '15m');
-    const print = m ? Number(m[1]) * ({ ms: 1, s: 1000, m: 60000, h: 3600000 }[m[2]]) : 15 * 60000;
-    return Math.min(print, Number(env.MOST_WATCHDOG_MS || 16 * 60 * 1000));
-  }
-  if (server === 'deepseek') return Number(env.MOST_DEEPSEEK_TIMEOUT_MS || 3600000);
-  if (server === 'claude') return Number(env.MOST_CLAUDE_TIMEOUT_MS || 3600000);
-  if (server === 'codex') return Number(env.MOST_CODEX_TIMEOUT_MS || 3600000);
+function normalTimeoutMs() {
+  // team-v48e «нет срока» (§2.6): срок поручения отсутствует безусловно — сроковые тумблеры MOST_*_TIMEOUT_MS/MOST_PRINT_TIMEOUT/
+  // MOST_WATCHDOG_MS удалены, функция всегда возвращает null (таймер-убийца не создаётся). deadline, уже записанный в карточке,
+  // по-прежнему соблюдается через deadlinePassed/runtimeBudget (это данные карточки, а не тумблер возврата).
   return null;
 }
 

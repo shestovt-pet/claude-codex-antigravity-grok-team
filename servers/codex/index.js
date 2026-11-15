@@ -180,16 +180,17 @@ function view(j, offset = 0) {
 }
 
 function fullAccessAllowed(card) {
-  return card.fullAccess === true && card.write === true && ['текст', 'совет'].includes(card.role) &&
-    card.from === 'claude' && !card.parentJob && !card.fallbackWord && !Object.hasOwn(card, 'fromChat');
+  if (!(card.fullAccess === true && card.write === true && ['текст', 'совет'].includes(card.role))) return false;
+  // team-v48e Г4c: полный доступ доступен гостю/подпоручению/чату безусловно (тумблер MOST_GUEST_STRICT удалён); роль и
+  // write=true остаются как намерение.
+  return true;
 }
 
 function fullAccessFolderRefusal(folder) {
-  const paths = require('../../common/paths');
+  // team-v48e Г4a: папочный запрет (связка/клон/релиз) снят безусловно (тумблер MOST_PROTECT_BRIDGE удалён); проверка
+  // «абсолютная существующая папка» остаётся (подлинность пути, не лимит).
   if (!path.isAbsolute(folder) || !fs.statSync(folder).isDirectory())
     return 'Нужна абсолютная существующая папка.';
-  if ([paths.repoRoot, path.resolve(__dirname, '../..')].some(root => paths.isSameOrInsideReal(folder, root) || paths.isSameOrInsideReal(root, folder)))
-    return 'Полный доступ запрещён в папке связки, её рабочей копии или релиза, а также в содержащей их папке.';
   return null;
 }
 
@@ -202,13 +203,18 @@ function chatCardRefusal(card) {
   const chain = require('../../common/job-chain').queuedRefusal(card, undefined, 'codex');
   if (chain) return chain;
   if (!Object.hasOwn(card, 'fromChat')) return null;
-  if (card.fromChat !== 'codex' || card.from !== 'codex' || card.fullAccess === true)
-    return 'Карточка чата Codex отклонена: противоречивые поля fromChat, from или fullAccess.';
+  // team-v48e Г4a: чат вправе ставить полный доступ (папочная защита снята безусловно); согласованность источника fromChat/from — всегда.
+  if (card.fromChat !== 'codex' || card.from !== 'codex')
+    return 'Карточка чата Codex отклонена: противоречивые поля fromChat или from.';
   return card.write ? chatFolderRefusal(card.folder) : null;
 }
 
-function ownChatJob(card, a = {}) {
-  if (!access.guest() || access.client() !== 'codex') return;
+function ownChatJob(card, a = {}, opts = {}) {
+  if (!access.guest()) return;
+  // team-v48 Г4d (§D.3): отмена из поручения-сеанса — только своих потомков (цепочка), образец «только свои» обобщён.
+  // Продолжение (continue) не сужаем — §D.3 про отмену предка.
+  if (opts.cancel && require('../../common/job-chain').fromJob()) { require('../../common/job-chain').assertDescendant(card.id); return; }
+  if (access.client() !== 'codex') return;
   // Codex c9116d5d: подтверждённый дирижёр активного запасного режима сохраняет прежние права (О9) — любые поручения.
   if (require('../../common/fallback').session(a)?.active) return;
   if (card.from !== 'codex' || card.fromChat !== 'codex')
@@ -217,7 +223,7 @@ function ownChatJob(card, a = {}) {
 
 function fullAccessRefusal(a) {
   if (!a.full_access) return null;
-  if (access.guest()) return 'Гостю полный доступ Codex запрещён; изменения не выполнены.';
+  // team-v48e Г4c: полный доступ гостю открыт безусловно (серверная карточка проверяется fullAccessAllowed); тумблер MOST_GUEST_STRICT удалён.
   if (a.write !== true) return 'Полный доступ требует write=true.';
   if (!['текст', 'совет'].includes(a.role)) return 'Для полного доступа явно укажите роль «текст» или «совет»; проверка остаётся в песочнице.';
   return fullAccessFolderRefusal(a.folder);
@@ -403,9 +409,17 @@ async function execute(job, folderLock) {
       c.resultFile = job.resultFile;
     });
     if (require('../../common/chain-deadline').deadlinePassed(job)) throw Error('Срок поручения истёк до запуска.');
+    // team-v48e (ревью п.1): связку «фактическая папка записи ↔ замок» сверяем синхронно после последнего await,
+    // непосредственно перед spawn (без await между сверкой и запуском), и запускаем с cwd = проверенный realpath.
+    let cwd = job.folder;
+    if (job.write) {
+      folderLock = writeLock.reconcile(folderLock, job.folder, { jobId: job.id }); cwd = folderLock.owner.folder;
+      // team-v48e (ревью п.1): все пути запуска — только проверенный канонический путь замка, без повторного разбора job.folder.
+      const i = args.indexOf('--cd'); if (i >= 0) args[i + 1] = cwd;
+    }
     const c = command(currentBinary(), args);
     child = spawn(c.bin, c.args, {
-      cwd: job.folder,
+      cwd,
       env: require('../../common/fallback').jobEnv(job.id),
       windowsHide: true,
       detached: process.platform !== 'win32',
@@ -442,15 +456,18 @@ async function execute(job, folderLock) {
       c.childPid = child.pid; c.childStartedAt = new Date().toISOString();
     });
     if (done) return;
-    timer = setTimeout(
-      guarded(() => stop(job.id, 'timeout')),
-      require('../../common/chain-deadline').runtimeBudget(job, 'codex'),
-    );
+    // team-v48 «нет срока»: три случая остатка. null — таймер-убийца не создаётся (остановка
+    // только отменой/смертью родителя/опросом); >0 — штатный таймер; <=0 (срок истёк между
+    // предпусковой проверкой и установкой таймера) — немедленная остановка, не пропуск.
+    const budget = require('../../common/chain-deadline').runtimeBudget(job, 'codex');
+    if (Number.isFinite(budget) && budget > 0) timer = setTimeout(guarded(() => stop(job.id, 'timeout')), budget);
+    else if (Number.isFinite(budget) && budget <= 0) stop(job.id, 'timeout').catch(logFailure);
     poll = setInterval(
       guarded(function pollJob() {
         const j = load(job.id);
         if (require('../../common/chain-deadline').parentTerminal(j)) stop(job.id, 'parent').catch(logFailure);
         else if (j.status === 'cancelling') stop(job.id, j.stopReason).catch(logFailure);
+        else if (require('../../common/chain-deadline').deadlinePassed(j)) stop(job.id, 'timeout').catch(logFailure);
         else if (job.threadId && j.threadId !== job.threadId)
           mutate(job.id, (c) => {
             c.threadId = job.threadId;
@@ -462,7 +479,7 @@ async function execute(job, folderLock) {
       [
         'Это отдельное поручение пользователя через Claude. Не считай, что знаешь другие чаты.',
         job.fullAccessApplied
-          ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; не изменяй файлы связки (E:\\most, C:\\most, E:\\test-most); удаления запрещены; каждое действие вне папки поручения перечисли в отчёте.'
+          ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; каждое действие вне папки поручения перечисли в отчёте.'
           : job.write
           ? 'Изменения разрешены только в рамках поручения. Перечисли файлы и проверки.'
           : 'Только чтение. Не изменяй файлы.',
@@ -606,8 +623,11 @@ async function send(a) {
       startedAt: new Date().toISOString(),
       owner: access.guest() ? null : locks.owner(),
       ownerLabel: a.owner,
-      // team-v19 К2: запись по поручению дирижёра запасного режима; основной сервер сверит слово при взятии.
-      ...(access.guest() && a.write && require('../../common/user-word').mode().active ? { fallbackWord: require('../../common/user-word').mode().entry.id } : {}),
+      // team-v19 К2 / team-v48e (ревью п.4): метку fallbackWord получает только поручение, подтверждённо поставленное
+      // сеансом дирижёра запасного режима — тем же признаком, которым мост определяет дирижёра (fallback.session: owner
+      // fallback-codex-<…> и совпавший отпечаток из записи слова), независимо от write. Посторонний owner метки не получает
+      // и держится паузой по слову; дирижёр с write=false — получает. Основной сервер сверит слово при взятии (queueHold).
+      ...(require('../../common/fallback').session(a)?.active ? { fallbackWord: require('../../common/user-word').mode().entry.id } : {}),
       threadId: prior?.threadId || null,
       previous: prior?.id || null,
       quotaAttempts: 0,
@@ -675,11 +695,16 @@ async function queue() {
       }
       // Запись: прежнее слово или согласованная карточка чата; слово всегда имеет приоритет.
       if (j.write) {
-        if (!j.fallbackWord && j.fromChat !== 'codex' && !j.parentJob) continue;
+        // team-v48e Г4c: гостевой порог запуска из очереди снят безусловно (пишущее поручение гостя подхватывается очередью;
+        // тумблер MOST_GUEST_STRICT удалён). queueHold ниже — всегда.
         const hold = require('../../common/fallback').queueHold(j);
         if (hold) { if (j.fallbackHold !== hold) await mutate(j.id, (c) => { c.fallbackHold = hold; }).catch(logFailure); continue; }
       }
       if (j.status !== 'queued' && !['self', 'dead'].includes(await locks.ownerState(j.owner))) continue;
+      // team-v48 Г5 (§13.B.5): получатель на паузе (реестр или слово) — карточка остаётся в очереди, не запускается и не падает.
+      // team-v48e (ревью п.4): ручная пауза реестра держит карточку всегда; только слово о недоступности не держит карточку
+      // дирижёра запасного режима (fallbackWord), иначе первый успех не снял бы слово (К2, §13.B.5).
+      if (require('../../common/members').recipientPaused('codex', j.fallbackWord)) continue;
       const l = await locks.tryLock('codex_queue', j.id, { jobId: j.id });
       if (!l.ok) continue;
       let folderLock = null;
@@ -704,6 +729,8 @@ async function queue() {
           }
           const hold = (c.write || c.fallbackWord) && require('../../common/fallback').queueHold(c);
           if (hold) { c.fallbackHold = hold; return; }
+          // team-v48 Г5 (§13.B.5): повторная проверка паузы под замком закрывает гонку «пауза наступила между проверкой и переводом в running».
+          if (require('../../common/members').recipientPaused('codex', c.fallbackWord)) return false;
           admitExecution();
           c.status = 'running';
           c.owner = locks.owner();
@@ -755,7 +782,7 @@ register(
     task: z.string().min(1).describe('Поручение.'),
     text: z.string().optional().describe('Материал для работы.'),
     write: z.boolean().default(false).describe('Разрешить изменения по поручению.'),
-    full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя; только Claude, с записью и ролью текст или совет.'),
+    full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя; при write=true, роли текст или совет и абсолютной существующей папке.'),
     model: z.string().regex(/^[A-Za-z0-9._:-]+$/).optional().describe('Запрошенная модель; продолжение наследует прежнюю, если не задана.'),
     effort: z.enum(['low', 'medium', 'high', 'xhigh']).optional().describe('Запрошенный уровень рассуждения; не меняет доступ.'),
     continue_id: z.string().optional().describe('Номер предыдущего поручения.'),
@@ -792,7 +819,7 @@ register(
   async (a) => {
     const { id } = a;
     const j = await mutate(id, (c) => {
-      ownChatJob(c, a);
+      ownChatJob(c, a, { cancel: true });
       // Общий переход с сервером team (grok_slot): common/job-cancel.js.
       if (require('../../common/job-cancel').cancelWaiting(c)) return;
       if (c.status === 'running') { c.status = 'cancelling'; c.cancellingAt ||= new Date().toISOString(); }

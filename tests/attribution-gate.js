@@ -5,7 +5,8 @@ const gate = require('../common/stage-gate'), p = require('../common/provenance'
 const j = {id:'case',who:'antigravity',modelId:'claude-opus-5-5-high',role:'проверка',from:'codex',task:'Ты Claude — судья консилиума'};
 assert.equal(gate.reviewerFamily(j),'anthropic');
 assert.equal(p.forJob(j,'antigravity').evidence_level,'requested_only');
-assert.throws(()=>require('../common/access').guard('team','team_work',{action:'create',task:j.task}),/запрещено/);
+// team-v48e Г4b: team_work-изменение гостю открыто безусловно (тумблер MOST_GUEST_STRICT удалён) — отказа нет.
+assert.doesNotThrow(()=>require('../common/access').guard('team','team_work',{action:'create',task:j.task}));
 p.observe(j,'antigravity',{source:'structured_provider_model_field',reportedModel:'gemini-3.1-pro-high'});
 assert.throws(()=>gate.reviewerFamily(j),/mismatch/);
 const root=fs.mkdtempSync(path.join(__dirname,'.tmp-attribution-gate-'));

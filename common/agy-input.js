@@ -1,9 +1,7 @@
 'use strict';
-// Предел всего собранного поручения, включая рабочий текст, опоры и инструкции.
-const MAX_MATERIAL_BYTES = 8 * 1024 * 1024;
+// team-v48e Г7: предел размера собранного поручения снят безусловно (тумблер MOST_MAX_MATERIAL_BYTES удалён) — материал
+// любого объёма доставляется целиком; отказа по размеру материала больше нет.
 function userEvent(text) {
-  if (Buffer.byteLength(text, 'utf8') > MAX_MATERIAL_BYTES)
-    throw Error('Материал поручения превышает предел 8 МиБ (8388608 байт UTF-8). Сократите материал.');
   return JSON.stringify({ event: 'user', message: { content: text } }) + '\n';
 }
 function parseResults(raw) {
@@ -57,4 +55,4 @@ function outputLimit(res, text = '') {
   return 'Ответ не поместился — отправьте правку частями по ' + size + ' строк. Автоматическое деление не выполнялось.';
 }
 const INLINE_NOTICE = 'Весь материал приложен, файлы не открывать.';
-module.exports = { MAX_MATERIAL_BYTES, userEvent, parseResults, permission, protocolError, outputLimit, INLINE_NOTICE };
+module.exports = { userEvent, parseResults, permission, protocolError, outputLimit, INLINE_NOTICE };

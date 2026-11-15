@@ -273,7 +273,9 @@ function checkArtifacts(w, s) {
   if (!s.artifact_manifest) return null;
   if (!w.folder) throw Error('artifact_manifest требует папку работы.');
   const artifacts = require('./artifact-manifest');
-  const snapshot = artifacts.readLocal(w.folder, s.artifact_manifest, 8 * 1024 * 1024);
+  // team-v48e Г7 (§2.5, 4a): жёсткий предел манифеста 8 МБ снят безусловно (→ Infinity, без тумблера и слова); маршрут/
+  // существование/валидность манифеста проверяются всегда (это не размер).
+  const snapshot = artifacts.readLocal(w.folder, s.artifact_manifest, Infinity);
   const report = artifacts.validateManifest(JSON.parse(snapshot.bytes.toString('utf8')), w.folder);
   if (!report.ready) throw Error('Артефакты не готовы: ' + report.errors.join('; '));
   return { manifest: s.artifact_manifest, sha256: sha(snapshot.bytes), ready: true };

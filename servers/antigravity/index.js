@@ -43,12 +43,11 @@ const isLinux = process.platform === "linux";
 const agyInput = require('../../common/agy-input');
 // До живой проверки 1.2.12 прежний путь сохраняется; stream-json включается явно.
 const STREAM_INPUT = process.env.MOST_AGY_INPUT_FORMAT !== 'legacy';
-const PRINT_TIMEOUT = process.env.MOST_PRINT_TIMEOUT || "15m";
-const WATCHDOG_MS = Number(process.env.MOST_WATCHDOG_MS || 16 * 60 * 1000);
+// team-v48e (§2.6): сроковые тумблеры MOST_PRINT_TIMEOUT/MOST_WATCHDOG_MS удалены — процесс печати идёт без навязанного срока.
 const MAX_INLINE_CHARS = Number(process.env.MOST_MAX_INLINE || "24000");   // предел командной строки для обычного режима (с учётом экранирования)
 const PORUCHENIE_FILE_THRESHOLD = 6000;                                    // длинное поручение в файловом режиме — тоже файлом
 const MAX_CMDLINE_CHARS = 30000;                                           // жёсткий предел (Windows: 32767)
-const MAX_SOURCE_BYTES = Number(process.env.MOST_MAX_SOURCE_BYTES || 8 * 1024 * 1024);
+// team-v48e Г7 (§2.5): предел размера исходника/опоры снят безусловно (тумблер MOST_MAX_SOURCE_BYTES удалён).
 const DRAFT_NAME = "_antigravity_result.txt";
 const STATE_DIR = require('../../common/paths').stateDir;
 const restartHold = require('../../common/restart-hold');
@@ -227,7 +226,7 @@ function readSource(p) {
   let st, bytes;
   try { st = fs.statSync(p); } catch (e) { throw friendlyFsError(e, p, "чтение"); }
   if (!st.isFile()) throw new Error("это не файл: " + p);
-  if (st.size > MAX_SOURCE_BYTES) throw new Error("файл слишком большой для моста (" + Math.round(st.size / 1024) + " КБ): " + p);
+  // team-v48e Г7 (§2.5): отказ по размеру исходника снят вместе с пределом (размер не ограничивается).
   try { bytes = fs.readFileSync(p); } catch (e) { throw friendlyFsError(e, p, "чтение"); }
   const bom = bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
   const body = bom ? bytes.subarray(3) : bytes;
@@ -269,7 +268,7 @@ function splitLines(text) { return text.replace(/\r\n?/g, "\n").split("\n"); }
 
 // ---------- пути: «внутри проекта» по реальным путям ----------
 // Защищает от уже существующих ссылок и junction; не защищает от одновременной злонамеренной подмены папок.
-const { canon, canonMaybe, isInsideReal, samePath } = require("../../common/paths");
+const { canon, canonMaybe, isInsideReal, isSameOrInsideReal, samePath } = require("../../common/paths");
 // ---------- файлы: безопасная запись ----------
 function tmpNameFor(target) {
   return path.join(path.dirname(target), ".~most-" + path.basename(target) + "-" + crypto.randomBytes(4).toString("hex") + ".tmp");
@@ -296,13 +295,18 @@ function writeTmp(target, data) {
   }
 }
 // Заменить (или создать) файл целиком: временный файл + rename; verify() — перед каждой попыткой.
+// team-v48e (ревью п.2): verify() — ПЕРЕД writeTmp() и синхронно перед каждым rename. Если связка «цель↔замок»
+// сломалась до записи, временный файл вообще не создаётся (не попадает по подменённому пути); далее verify→rename
+// идут без await: внутри процесса между ними нет переключения; действие другого процесса не исключено.
 async function replaceFileAtomic(target, data, verify) {
+  const check = () => { if (verify) { const v = verify(); if (v !== true) { const e = new Error(v || "проверка перед записью не прошла"); e.code = "EVERIFY"; throw e; } } };
+  check();
   const tmp = writeTmp(target, data);
   let delay = 100;
   const deadline = Date.now() + 5000;
   try {
     for (;;) {
-      if (verify) { const v = verify(); if (v !== true) { const e = new Error(v || "проверка перед записью не прошла"); e.code = "EVERIFY"; throw e; } }
+      check();
       try { fs.renameSync(tmp, target); return; }
       catch (e) {
         if (!BUSY_CODES.has(e.code) || Date.now() + delay > deadline) throw friendlyFsError(e, target, "замену");
@@ -798,10 +802,11 @@ function runAgy(args, jobId, onSpawn, cwd, stdin) {
   const card = loadJob(jobId), deadlines = require('../../common/chain-deadline');
   const budget = deadlines.runtimeBudget(card, 'antigravity');
   if (deadlines.parentTerminal(card)) return Promise.resolve({ exitCode: 124, error: 'Родитель завершился; запуск отменён.', cancelled: true, output: '' });
-  if (budget <= 0) return Promise.resolve({ exitCode: 124, error: 'Срок истёк до запуска.', timedOut: true, output: '' });
+  // team-v48 «нет срока»: budget==null — срока нет (не истёк); истёк только конечный budget<=0.
+  if (Number.isFinite(budget) && budget <= 0) return Promise.resolve({ exitCode: 124, error: 'Срок истёк до запуска.', timedOut: true, output: '' });
   args = [...args];
   const timeoutIndex = args.indexOf('--print-timeout');
-  if (timeoutIndex >= 0) args[timeoutIndex + 1] = Math.max(1, Math.ceil(budget / 60000)) + 'm';
+  if (timeoutIndex >= 0 && Number.isFinite(budget)) args[timeoutIndex + 1] = Math.max(1, Math.ceil(budget / 60000)) + 'm';
   return new Promise((resolve) => {
     const outChunks = [], errChunks = [];
     let done = false, proc = null, timedOut = false, inputError = null;
@@ -832,7 +837,10 @@ function runAgy(args, jobId, onSpawn, cwd, stdin) {
         }));
       } else resolve(Object.assign(base, { output: stripAnsi(raw), json: false }));
     };
-    const timer = setTimeout(() => { if (!entry.stopping) { timedOut = true; requestStop(jobId, "предел времени"); } }, budget);
+    // team-v48 «нет срока»: таймер-убийца только при конечном положительном budget; при null не создаётся.
+    const timer = (Number.isFinite(budget) && budget > 0)
+      ? setTimeout(() => { if (!entry.stopping) { timedOut = true; requestStop(jobId, "предел времени"); } }, budget)
+      : null;
     // запрос отмены из любого экземпляра моста — файлом-флагом
     const poll = setInterval(() => {
       if (entry.stopping) return;
@@ -1329,15 +1337,18 @@ register(
     for (const [k, p] of (opora || []).entries()) {
       try {
         if (!fs.existsSync(p) || !fs.statSync(p).isFile()) return fail("файла опоры нет: " + p);
-        if (fs.statSync(p).size > MAX_SOURCE_BYTES) return fail("файл опоры слишком большой: " + p);
+        // team-v48e Г7 (§2.5): отказ по размеру опоры снят вместе с пределом (размер не ограничивается).
         opList.push({ label: path.basename(p), text: readTextLoose(p), copyName: "opora_" + (k + 1) + "_" + path.basename(p).replace(/[^\w.\-]/g, "_") });
       } catch (e) { return fail("не удалось прочитать опору " + p + ": " + errText(e)); }
     }
 
     const id = newJobId();
-    const lock = access.guest() ? { ok: true, release: async () => {} } : await tryLock("gen", papkaCanon, { jobId: id, papka });
+    // team-v48e Г6 (часть 3 A.1): исключительность генерации — на карточку (ключ id), а не на папку, безусловно (тумблер
+    // MOST_ANTIGRAVITY_ONE_PER_FOLDER удалён): параллельные задания в одной папке допускаются; замок id держит только двойной
+    // запуск этой же карточки. Папочный write-lock и замок файла переноса — всегда (часть 3 A.2).
+    const lock = access.guest() ? { ok: true, release: async () => {} } : await tryLock("gen", id, { jobId: id, papka });
     if (!lock.ok) {
-      if (lock.busy) return fail("в этой папке уже идёт задание " + (lock.owner.jobId || "?") + (lock.state === "hung"
+      if (lock.busy) return fail("это задание уже выполняется " + (lock.owner.jobId || "?") + (lock.state === "hung"
         ? " — его держит экземпляр моста, который не отвечает" + (lock.owner.pid ? " (процесс " + lock.owner.pid + ")" : "") + ". Если это не проходит, перезапусти Claude."
         : ". Дождись его итога (antigravity_result) или отмени (antigravity_cancel)."));
       return fail("не удалось захватить папку проекта: " + lock.error);
@@ -1347,7 +1358,9 @@ register(
     const markers = rezhim === "zamechaniya" ? null : makeMarkers();
     const baseArgs = [];
     if (m.id) baseArgs.push("--model", m.id);
-    baseArgs.push("--print-timeout", PRINT_TIMEOUT, "--output-format", STREAM_INPUT ? "stream-json" : "json");
+    // team-v48e «нет срока» (§2.6): --print-timeout больше не передаётся (тумблеры MOST_PRINT_TIMEOUT/MOST_WATCHDOG_MS удалены;
+    // agy без флага ждёт завершения хода).
+    baseArgs.push("--output-format", STREAM_INPUT ? "stream-json" : "json");
     if (STREAM_INPUT) baseArgs.push("--input-format", "stream-json");
     let stdin;
     try {
@@ -1554,10 +1567,13 @@ register(
       // Перезапись необратима: только с дословным ответом пользователя, он хранится в карточке (помощник с чистой памятью, У3).
       if (perezapisat && !(typeof quote === "string" && quote.trim())) return fail("перезапись (overwrite) в запасном режиме — только с дословным ответом пользователя: quote=<его ответ>");
       const m = require('../../common/user-word').mode();
-      await updateJob(nomer, (c) => { c.applyRequest = { kuda: kuda || null, perezapisat: !!perezapisat, ...(perezapisat ? { quote: quote.trim() } : {}), word: m.entry.id, by: access.client(), at: nowIso() }; });
-      return reply("Перенос задания " + nomer + " поставлен в очередь основного сервера (запасной режим, " + m.entry.id + "); итог — antigravity_result " + nomer + ".");
+      // team-v48e Г4c: перенос гостя/подпоручения не привязан к запасному режиму безусловно (тумблер MOST_GUEST_STRICT удалён;
+      // word — опциональный маркер, null вне режима).
+      const word = m.entry?.id || null;
+      await updateJob(nomer, (c) => { c.applyRequest = { kuda: kuda || null, perezapisat: !!perezapisat, ...(perezapisat ? { quote: quote.trim() } : {}), word, by: access.client(), at: nowIso() }; });
+      return reply("Перенос задания " + nomer + " поставлен в очередь основного сервера" + (word ? " (запасной режим, " + word + ")" : "") + "; итог — antigravity_result " + nomer + ".");
     }
-    if (job.from && job.from !== 'claude' && !opts.fallback) return fail('Перенос гостевого поручения запрещён: результат хранится только в хранилище поручений.');
+    // team-v48e Г4c: перенос проверенного гостевого результата разрешён безусловно (тумблер MOST_GUEST_STRICT удалён).
     if (job.textInput && (job.rezhim === 'pravka' || !kuda))
       return fail('Перенос в исходник для переданного текстом материала запрещён; сохраните результат отдельно.');
     if (job.corrupt) return fail("карточка задания повреждена: " + job.error);
@@ -1602,6 +1618,21 @@ register(
     // один перенос в один физический файл за раз — замок по реальному пути цели
     let targetKey;
     try { targetKey = canonMaybe(target); } catch (e) { return fail("не удалось проверить путь: " + errText(e)); }
+    // team-v48e (ревью f9963ea8): фактический путь записи — ровно тот канонический путь, к которому относятся
+    // проверки и файловый замок. Для существующей цели (в т.ч. ссылки на файл с ДРУГИМ именем/в другом каталоге)
+    // это сам targetKey — полный realpath файла; сборка «каталог+basename» дала бы путь к постороннему тёзке.
+    // Для новой цели — канонический каталог + исходное имя, если под этим именем в каноническом каталоге нет
+    // чужого файла (а если есть — это должна быть сама проверенная цель). bindingMismatch ниже сверяет, что
+    // targetKey (ключ замка и, для существующей цели, сам путь записи) не сместился после захвата замков.
+    let canonTarget;
+    try {
+      if (fs.existsSync(target)) canonTarget = targetKey;
+      else {
+        canonTarget = path.join(path.dirname(targetKey), path.basename(target));
+        if (fs.existsSync(canonTarget) && canonMaybe(canonTarget) !== targetKey)
+          return fail("в каноническом каталоге уже есть другой файл с этим именем — перенос отменён");
+      }
+    } catch (e) { return fail("не удалось проверить путь: " + errText(e)); }
     const lock = await waitLock("apply", targetKey, { jobId: nomer }, 10000);
     if (!lock.ok) return fail(lock.busy ? "в этот файл сейчас переносится другое задание (" + (lock.owner.jobId || "?") + "); попробуй чуть позже" : "не удалось захватить файл: " + lock.error);
     APPLYING.add(nomer);
@@ -1639,8 +1670,21 @@ register(
       if (refused) return fail(refused);
       if (noChange) return reply("Изменений нет — " + target + " не тронут.");
 
+      // team-v48e (ревью п.2): перед самой записью сверяем фактический realpath цели и её папки с ОБОИМИ
+      // захваченными замками — папочным (job.papka) и файловым (apply на targetKey). Подмена ссылки между
+      // захватом и записью сместила бы цель в B, оставив замки на A; расхождение → отказ.
+      const bindingMismatch = () => {
+        try {
+          if (canonMaybe(target) !== targetKey) return "цель сместилась после захвата файлового замка — перенос отменён";
+          if (canon(job.papka) !== folderLock.owner.folder) return "папка проекта сместилась после захвата замка — перенос отменён";
+          if (!isSameOrInsideReal(path.dirname(target), folderLock.owner.folder)) return "папка цели вне захваченного замка папки — перенос отменён";
+        } catch (e) { return errText(e); }
+        return null;
+      };
       const stillFresh = () => {
         try {
+          const mismatch = bindingMismatch();
+          if (mismatch) return mismatch;
           const folderRefusal = checkFolders();
           if (folderRefusal) return folderRefusal;
           if (!isInsideReal(target, job.papka)) return "путь теперь ведёт за пределы папки проекта";
@@ -1657,8 +1701,8 @@ register(
         if (!isInsideReal(target, job.papka)) throw new Error("путь после создания папок ведёт за пределы проекта");
         const targetRefusal = checkFolders();
         if (targetRefusal) throw Error(targetRefusal);
-        if (expectedHash == null) { if (TEST_PUBLISH_DELAY_MS) await sleep(TEST_PUBLISH_DELAY_MS); publishNewFile(target, bytes); }
-        else await replaceFileAtomic(target, bytes, stillFresh);
+        if (expectedHash == null) { if (TEST_PUBLISH_DELAY_MS) await sleep(TEST_PUBLISH_DELAY_MS); const mm = bindingMismatch(); if (mm) throw Error(mm); publishNewFile(canonTarget, bytes); }
+        else { if (TEST_PUBLISH_DELAY_MS) await sleep(TEST_PUBLISH_DELAY_MS); await replaceFileAtomic(canonTarget, bytes, stillFresh); }
       } catch (e) {
         await updateJob(nomer, (c) => { if (c.status !== "applying" || !c.apply || c.apply.attempt !== attempt) return false; c.status = "done"; delete c.apply; }).catch(() => {});
         log("задание " + nomer + ": перенос не выполнен (" + (e.code || "ошибка") + ")");
@@ -1803,7 +1847,9 @@ async function resumeQueue() {
     // team-v19 К2: перенос дирижёра запасного режима — основной сервер, под замком задания и файла; без режима ждёт с причиной.
     for (const j of queueJobs().filter((j) => j.applyRequest && !j.applyRequest.done)) {
       const r = j.applyRequest, m = require('../../common/user-word').mode();
-      const hold = !m.active ? 'запасной режим снят — перенос ждёт Claude' : m.entry.id !== r.word ? 'дирижёр сменился — перенос ждёт нового запроса' : '';
+      // team-v48 Г4c (замысел стр.782): удержание по слову — только для переноса, привязанного к запасному режиму (r.word задан);
+      // перенос гостя без слова (по умолчанию) идёт сразу.
+      const hold = !r.word ? '' : !m.active ? 'запасной режим снят — перенос ждёт Claude' : m.entry.id !== r.word ? 'дирижёр сменился — перенос ждёт нового запроса' : '';
       if (hold) { if (r.hold !== hold) await updateJob(j.id, (c) => { if (c.applyRequest) c.applyRequest.hold = hold; }).catch(() => {}); continue; }
       const out = await context.run({ args: { id: j.id } }, () => HANDLERS.most_perenesti({ nomer: j.id, kuda: r.kuda || undefined, perezapisat: r.perezapisat }, { fallback: true }));
       if (heldApplies.has(out)) continue;
@@ -1839,7 +1885,12 @@ async function resumeQueue() {
         });
         continue;
       }
-      const lock = await tryLock('gen', j.papkaCanon, { jobId: j.id, papka: j.papka });
+      // team-v48 Г5 (§13.B.5): получатель на паузе (реестр или слово) — карточка остаётся в очереди, не запускается и не падает.
+      // team-v48e (ревью п.4): ручная пауза держит всегда; только слово не держит карточку дирижёра (fallbackWord), иначе первый успех не снял бы слово (К2).
+      if (require('../../common/members').recipientPaused('antigravity', j.fallbackWord)) continue;
+      // team-v48e Г6 (часть 3 A.1): ключ замка генерации — карточка (j.id) безусловно (тумблер MOST_ANTIGRAVITY_ONE_PER_FOLDER
+      // удалён); !lock.ok теперь «эту карточку подхватил другой экземпляр», а не «папка занята». Параллельные карточки одной папки не блокируют друг друга.
+      const lock = await tryLock('gen', j.id, { jobId: j.id, papka: j.papka });
       if (!lock.ok) continue;
       let claimed = false,
         cur;
@@ -1853,6 +1904,8 @@ async function resumeQueue() {
             return false;
           const chain = require('../../common/job-chain').queuedRefusal(c, undefined, 'antigravity');
           if (chain) { Object.assign(c, { status: 'failed', draftStatus: 'not_attempted', error: chain, finishedAt: nowIso() }); return; }
+          // team-v48 Г5 (§13.B.5): повторная проверка паузы под замком — гонка «пауза между проверкой и переводом в running».
+          if (require('../../common/members').recipientPaused('antigravity', c.fallbackWord)) return false;
           restartHold.assertAdmitted(STATE_DIR, restartServer);
           c.status = 'running';
           c.owner = { instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT };

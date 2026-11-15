@@ -139,8 +139,7 @@ register(
     if (cur.status === 'answered') return 'ответ: ' + cur.answer;
     if (cur.status === 'rejected') return 'отклонено: ' + (cur.reason || 'без причины');
     if (inbox.expired(cur)) return 'просрочен';
-    const mins = Math.max(0, Math.floor((Date.parse(cur.deadline) - Date.now()) / 60000));
-    return 'ждёт дирижёра ' + mins + ' мин';
+    return inbox.waitText(cur);
   },
 );
 register(
@@ -158,7 +157,7 @@ register(
     const inbox = require('../../common/inbox');
     if (a.action === 'list') {
       const p = inbox.pending();
-      return p.map(e => e.id + ' · ' + (e.work ? '[' + e.work + '] ' : '') + e.text.slice(0, 200) + ' · от ' + inbox.whoText(e.author) + ' · до ' + e.deadline).join('\n') || 'Входящих нет.';
+      return p.map(e => e.id + ' · ' + (e.work ? '[' + e.work + '] ' : '') + e.text.slice(0, 200) + ' · от ' + inbox.whoText(e.author) + ' · до ' + inbox.deadlineText(e)).join('\n') || 'Входящих нет.';
     }
     if (!a.id) throw Error('Нужен id запроса.');
     const e = inbox.read(a.id);

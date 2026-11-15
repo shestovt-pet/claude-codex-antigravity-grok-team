@@ -139,9 +139,10 @@ module.exports = ({ test, f, client, text }) => {
     assert.equal(result.status, ['parent', 'cancel'].includes(reason) ? 'cancelled' : 'failed', JSON.stringify(result));
     assert.match(result.problems.join('\n'), reason === 'parent' ? /родитель завершился/i : reason === 'expired' ? /срок истёк до запуска/i : reason === 'timeout' ? /не уложилось|предел времени|срок истёк/i : /отменено/);
   }));
-  test('fix6 #6: antigravity_apply учитывает owner вызова и запрещает ссылку в папке цели', async () => env(async () => {
+  test('fix6 #6: antigravity_apply переносит в папку проекта (в т.ч. через ссылку внутри неё) и отклоняет цель вне папки проекта', async () => env(async () => {
     const root = path.join(f.root, '.work/fix6-apply'); fs.mkdirSync(path.join(root, 'real'), { recursive: true });
     fs.symlinkSync(path.join(root, 'real'), path.join(root, 'alias'), 'junction');
+    const outsideDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'fix6-escape-')); fs.symlinkSync(outsideDir, path.join(root, 'escape'), 'junction');
     f.json(path.join(f.root, 'state/changes/fix6-apply.json'), { owner: 'fix6-owner', status: 'открыто' });
     const api = internals('antigravity', 'server');
     async function apply(id, to, storedOwner, callOwner) {
@@ -150,12 +151,20 @@ module.exports = ({ test, f, client, text }) => {
       f.json(path.join(f.stores.roots().antigravity, id, 'meta.json'), { hash: f.sha(body) });
       return api.server._registeredTools.antigravity_apply.handler({ id, to, owner: callOwner });
     }
-    const bad = path.join(root, 'alias/result.txt');
-    const refused = await apply('fix6-apply-alias', bad, 'fix6-owner');
-    assert(refused.isError, text(refused)); assert(!fs.existsSync(bad));
-    const good = path.join(root, 'real/result.txt');
-    const applied = await apply('fix6-apply-owner', good, 'old-owner', 'fix6-owner');
+    // team-v48e Г4a: папочный запрет (корень связки/.work) снят безусловно (тумблер MOST_PROTECT_BRIDGE удалён) — перенос
+    // в папку проекта проходит, в т.ч. через ссылку ВНУТРИ неё (alias → real по isInsideReal), и не зависит от owner вызова
+    // (прежняя проверка владельца .work была частью снятого папочного запрета). Цели — РАЗНЫЕ файлы (alias/ и real/ — одна
+    // папка через junction), чтобы не было коллизии «файл уже есть».
+    const alias = path.join(root, 'alias/result-alias.txt');
+    const viaAlias = await apply('fix6-apply-alias', alias, 'old-owner', 'fix6-owner');
+    assert(!viaAlias.isError, text(viaAlias)); assert.equal(fs.readFileSync(alias, 'utf8'), 'Результат');
+    const good = path.join(root, 'real/result-good.txt');
+    const applied = await apply('fix6-apply-owner', good, 'old-owner', 'another-owner');
     assert(!applied.isError, text(applied)); assert.equal(fs.readFileSync(good, 'utf8'), 'Результат');
+    // Сохраняемая подлинность пути (не лимит): цель ВНЕ папки проекта через ссылку-побег — отказ isInsideReal.
+    const escaped = await apply('fix6-apply-escape', path.join(root, 'escape/out.txt'), 'old-owner', 'fix6-owner');
+    assert(escaped.isError, text(escaped)); assert.match(text(escaped), /внутри папки проекта/);
+    assert(!fs.existsSync(path.join(outsideDir, 'out.txt')), 'ссылка-побег не записала файл вне папки проекта');
   }));
   test('fix6 #7: срок Claude истёк во время подготовки — spawn не вызывается', async () => {
     await fakeClaude(async (api, spawned) => {

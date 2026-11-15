@@ -35,6 +35,8 @@ async function until(fn, what, ms = 20000) {
   while (Date.now() < end) { try { if (fn()) return; } catch {} await sleep(100); }
   throw Error('Не дождались: ' + what);
 }
+// team-v48e Г4b-2: запреты гостю на изменение работ без дирижёра сняты безусловно (тумблер MOST_GUEST_STRICT удалён) —
+// прежний helper strictly() и его сценарии возврата убраны; снятие проверяется положительными проверками рядом.
 
 // Запись основного сервера team того же релиза; сам процесс 7000 жив, но гостю не предок.
 function ready(patch = {}) { json(path.join(STATE, 'ready', 'team.json'), { release: ROOT, pid: 7000, startedAt: READY_AT, ...patch }); }
@@ -138,9 +140,11 @@ test('3, Р-ж: гость-поручение — слово, поручения
     await assert.rejects(team().word({ action: 'record', who_down: 'claude', quote: 'Claude отвалился', owner: 'fallback-codex-zz99' }),
       /Гостю это действие запрещено: поручение-сеанс этого не делает: слово, поручения и перенос — только из чата; не могу подтвердить, что это чат \(это поручение-сеанс, а не чат\), — скажи это в чате Codex\./, phase);
     assert.match(lib('fallback').chatProof('codex').reason, /это поручение-сеанс, а не чат/);
-    assert.throws(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't', owner: OWNER }), /Подпоручение своему же серверу.*запрещено/i, phase);
+    // team-v48e Г4b-2b: «своему же серверу» снято безусловно — codex_send из поручения идёт в admit (карточки job-1 нет → отказ по отсутствию карточки).
+    assert.throws(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't', owner: OWNER }), /поручение job-1 не найдено/, phase);
     assert.throws(() => acc.guard('antigravity', 'antigravity_send', { owner: OWNER }), /поручение job-1 не найдено/, phase);
-    assert.throws(() => acc.guard('team', 'team_work', { action: 'update', name: 'w', owner: OWNER }), /Гостю это действие запрещено/, phase);
+    // team-v48e Г4b-2: team_work-изменение гостю-поручению открыто безусловно (тумблер MOST_GUEST_STRICT удалён).
+    assert.doesNotThrow(() => acc.guard('team', 'team_work', { action: 'update', name: 'w', owner: OWNER }), 'team_work открыт: ' + phase);
     as('antigravity', { job: 'agy-1', agy: true });
     await assert.rejects(team().word({ action: 'record', who_down: 'claude', quote: 'Claude отвалился', owner: AGY_OWNER }), /Гостю это действие запрещено: поручение-сеанс этого не делает/, phase);
   }
@@ -148,9 +152,9 @@ test('3, Р-ж: гость-поручение — слово, поручения
   fs.renameSync(lib('user-word').file(), lib('user-word').file() + '.bak');
   as('codex');
   assert.doesNotThrow(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't' })); // team-v25: чат, не поручение
-  for (const [fn, what] of [
-    [() => acc.guard('antigravity', 'antigravity_apply', { id: 'x', owner: OWNER }), 'перенос'], [() => acc.guard('team', 'team_work', { action: 'update', owner: OWNER }), 'работа']])
-    assert.throws(fn, /^Error: Гостю это действие запрещено/, what);
+  assert.throws(() => acc.guard('antigravity', 'antigravity_apply', { id: 'x', owner: OWNER }), /^Error: Гостю это действие запрещено/, 'перенос');
+  // team-v48e Г4b-2: team_work-изменение гостю-чату открыто безусловно (тумблер MOST_GUEST_STRICT удалён).
+  assert.doesNotThrow(() => acc.guard('team', 'team_work', { action: 'update', owner: OWNER }), 'работа открыта');
   for (const a of [{ action: 'record', who_down: 'codex', quote: 'Codex отвалился', owner: OWNER }, { action: 'return', quote: 'вернулся', owner: OWNER },
     { action: 'handover', owner: OWNER }, { action: 'rebind', quote: 'x', owner: OWNER }])
     await assert.rejects(team().word(a), /^Error: Гостю это действие запрещено/, a.action);
@@ -192,15 +196,16 @@ test('3, Р-ж: гость-поручение — слово, поручения
 test('4: не-дирижёр (чат Antigravity) — team_work update отказ', async () => {
   ready(); const w = await claudeWork(); await word('codex');
   as('antigravity', { agy: true });
-  await assert.rejects(team().work({ action: 'update', name: 'w', owner: AGY_OWNER, expected_revision: w.revision, next_step: 'x' }), /Гостю это действие запрещено/);
-  await assert.rejects(team().work({ action: 'claim', name: 'w', owner: AGY_OWNER, expected_revision: w.revision }), /Гостю это действие запрещено/);
+  // team-v48e Г4b-2: access открыт безусловно (тумблер MOST_GUEST_STRICT удалён) — не-дирижёра держит не access, а замок владения (работа у claude-sess).
+  await assert.rejects(team().work({ action: 'update', name: 'w', owner: AGY_OWNER, expected_revision: w.revision, next_step: 'x' }), /владение передано|Работа жива/);
 });
 
 test('5, К3: дирижёр забирает работу с живым поручением и свежей активностью; без режима — прежний отказ', async () => {
   ready(); let w = await claudeWork();
   job('codex', { ...bind(w, w.stages[0]), status: 'queued', role: 'текст', owner: null, folder: PROJECT });
   as('codex');
-  await assert.rejects(team().work({ action: 'claim', name: 'w', owner: OWNER, expected_revision: w.revision }), /Гостю это действие запрещено/);
+  // team-v48e Г4b-2: access открыт безусловно (тумблер MOST_GUEST_STRICT удалён) — работу держит замок живости, а не access.
+  await assert.rejects(team().work({ action: 'claim', name: 'w', owner: OWNER, expected_revision: w.revision }), /Работа жива/);
   as('claude');
   await assert.rejects(team().work({ action: 'claim', name: 'w', owner: 'claude-other', expected_revision: w.revision }), /Работа жива/);
   await word('codex'); as('codex');
@@ -360,17 +365,20 @@ test('11, К2: сервер своей семьи — инструменты у 
   const team = await mcp('team', 'codex', guestEnv());
   try { assert.deepEqual(await team.tools(), ['team_ask', 'team_ask_result', 'team_rules', 'team_status', 'team_word', 'team_work']); } finally { await team.close(); }
   const agy = await mcp('antigravity', 'antigravity', guestEnv());
+  // team-v48e Г4b-2b: свой сервер Antigravity открыт гостю безусловно (как Codex) — antigravity_send проходит guard
+  // (упирается в проверку режима review, а не в «только дирижёр»); тумблер MOST_GUEST_STRICT удалён.
   try { assert.deepEqual(await agy.tools(), ['antigravity_apply', 'antigravity_cancel', 'antigravity_result', 'antigravity_send', 'antigravity_status']);
     const r = await agy.call('antigravity_send', { folder: PROJECT, task: 'Проверка', mode: 'review' });
-    assert(r.error); assert.match(r.text, /только у дирижёра запасного режима/); } finally { await agy.close(); }
+    assert(r.error); assert.doesNotMatch(r.text, /только у дирижёра запасного режима/); } finally { await agy.close(); }
   await word('codex');
   s = await mcp('codex', 'codex', guestEnv());
   try {
     const r = await s.call('codex_send', { folder: PROJECT, task: 'Проверка', owner: OWNER });
     assert(!r.error, r.text); assert.match(r.text, /В ОЧЕРЕДИ/);
     const lines = r.text.split('\n'); assert.match(lines[0], /^Запасной режим: дирижёр Codex/); assert(lines.includes('Ты дирижёр: правила — team_rules part=fallback'));
+    // team-v48e Г4b-2b: свой сервер открыт безусловно — codex_send с чужой меткой owner тоже проходит guard (в очередь); тумблер MOST_GUEST_STRICT удалён.
     const other = await s.call('codex_send', { folder: PROJECT, task: 'Проверка', owner: 'fallback-codex-zz99' });
-    assert(other.error); assert.match(other.text, /только у дирижёра/);
+    assert(!other.error, other.text); assert.match(other.text, /В ОЧЕРЕДИ/);
   } finally { await s.close(); }
 });
 
@@ -673,7 +681,9 @@ test('22, К4а: этап Claude — поручение «текст» Codex —
 test('23, К2: сеанс дирижёра — второй чат Codex с другой меткой участник; отпечаток мёртв — rebind по цитате; поручение, потомок основного сервера и другой релиз — не чат', async () => {
   ready(); await word('codex');
   as('codex'); const t = team(), f = lib('fallback');
-  await assert.rejects(t.work({ action: 'create', name: 'x23', owner: 'fallback-codex-zz99', expected_revision: 0, ...workArgs, folder: PROJECT, stages: [] }), /Гостю это действие запрещено/);
+  // team-v48e Г4b-2 (§2.2): второй чат-участник меняет работы безусловно (тумблер MOST_GUEST_STRICT удалён) — access не отклоняет create; карточка валидна (цель/критерий/этап), поэтому прежний отказ «Гостю это действие запрещено» не наступает.
+  await assert.doesNotReject(t.work({ action: 'create', name: 'x23', owner: 'fallback-codex-zz99', expected_revision: 0, ...workArgs, folder: PROJECT,
+    stages: [{ title: 'Код', weight: 100, state: 'идёт', accept_criteria: 'работает', level: 'обычный', author: { family: 'openai', model: 'gpt-6' }, version: 'x23' }] }));
   const other = f.banner({ owner: 'fallback-codex-zz99' });
   assert.match(other, /\nДирижёр — чат Codex с меткой fallback-codex-ab12; если метка не твоя — ты участник\./); assert.doesNotMatch(other, /Ты дирижёр/);
   assert.match(f.banner({ owner: OWNER }), /\nТы дирижёр: правила — team_rules part=fallback/);
@@ -732,8 +742,9 @@ test('24, К2: после return дирижёру — team_work update толь�
   as('codex'); w = read(t.workFile('w'));
   await t.work({ action: 'update', name: 'w', owner: OWNER, expected_revision: w.revision, next_step: 'Итог дирижёра: сделано X' });
   w = read(t.workFile('w')); assert.equal(w.next_step, 'Итог дирижёра: сделано X');
-  await assert.rejects(t.work({ action: 'update', name: 'w', owner: OWNER, expected_revision: w.revision, stages: w.stages }), /Гостю это действие запрещено/);
-  await assert.rejects(t.work({ action: 'close', name: 'w', owner: OWNER, expected_revision: w.revision }), /Гостю это действие запрещено/);
+  // team-v48e Г4b-2: прочие изменения работы после return больше не отклоняются access (тумблер MOST_GUEST_STRICT удалён) —
+  // access guest-strict-отказа нет; обновление stages проходит.
+  await assert.doesNotReject(t.work({ action: 'update', name: 'w', owner: OWNER, expected_revision: w.revision, stages: w.stages }));
   assert.doesNotThrow(() => lib('access').guard('codex', 'codex_send', { folder: PROJECT, task: 't', owner: OWNER }));
   assert.equal(await t.word({ action: 'handover', owner: OWNER }), 'Записал: дирижёр Codex остановился.');
 });
@@ -757,7 +768,8 @@ test('25, К2: разрешения Antigravity и config.toml — team_word и 
   assert.deepEqual(acc.guestTools('team', 'grok'), ['team_status', 'team_rules', 'team_work', 'team_ask', 'team_ask_result']);
   assert.deepEqual(acc.guestTools('codex', 'codex'), ['codex_status', 'codex_send', 'codex_result', 'codex_cancel']);
   assert.deepEqual(acc.guestTools('antigravity', 'codex'), ['antigravity_status', 'antigravity_send', 'antigravity_result', 'antigravity_apply']);
-  assert.deepEqual(acc.guestTools('codex', 'claude'), []);
+  // team-v48e Г4b: свой сервер (claude→codex) открыт безусловно (тумблер MOST_GUEST_STRICT удалён).
+  assert.deepEqual(acc.guestTools('codex', 'claude'), ['codex_status', 'codex_send', 'codex_result', 'codex_cancel']);
   const probe = lib('probe').probe, file = path.join(ROOT, 'servers', 'team', 'index.js');
   const base = { ...process.env, MOST_CLIENT: 'codex', MOST_PROBE_ONLY: '1' };
   const full = (await probe(file, { ...base, MOST_PROBE_GUEST: 'full' })).tools.map(t => t.name).sort();

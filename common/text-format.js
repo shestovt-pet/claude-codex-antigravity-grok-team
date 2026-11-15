@@ -1,7 +1,9 @@
 'use strict';
 // Снимки рабочих байтов, без git и без изменения проверяемых файлов.
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
-const MAX_FILE = 2 * 1024 * 1024, MAX_TOTAL = 50 * 1024 * 1024;
+// team-v48e Г7: предел размера файла и всего снимка снят безусловно (тумблеры MOST_FORMAT_MAX_FILE/MAX_TOTAL удалены) —
+// диагностика формата делается для файла любого размера, отказа по размеру файла/снимка больше нет. Защита стоимости сравнения
+// окончаний строк (maxSteps, предел строк lines()) — отдельная защита ресурса, сохранена ниже.
 const extensions = new Set('.js .cjs .mjs .ts .json .md .txt .yml .yaml .toml .ps1 .cmd .bat .sh .html .css .csv .xml .srt'.split(' '));
 const names = new Set('.gitignore .gitattributes Dockerfile Makefile LICENSE README'.split(' '));
 const textFile = p => extensions.has(path.extname(p).toLowerCase()) || names.has(path.basename(p));
@@ -12,11 +14,8 @@ function snapshot(folder, state, { dir, errors = [] } = {}) {
   const out = { dir, files: new Map(), errors };
   if (!state) return { ...out, skipped: 'список файлов не составлен' };
   const files = [...state].filter(([p]) => textFile(p));
-  if (files.reduce((n, [, v]) => n + size(v), 0) > MAX_TOTAL)
-    return { ...out, skipped: 'больше 50 МБ текста' };
   if (!dir) throw Error('Не задан каталог format-before');
   for (const [p, v] of files) {
-    if (size(v) > MAX_FILE) { out.files.set(p, { error: 'больше 2 МБ до поручения' }); continue; }
     try {
       const target = path.join(dir, p);
       fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -37,7 +36,7 @@ function lines(text) {
   const result = []; let start = 0;
   for (const m of text.matchAll(/\r\n|\n|\r/g)) {
     result.push({ text: text.slice(start, m.index), end: m[0] }); start = m.index + m[0].length;
-    if (result.length > 200000) throw Error('сравнение слишком дорогое');
+    if (result.length > 200000) throw Error('сравнение слишком дорогое: больше 200000 строк (предел строк проверки формата)');
   }
   if (start < text.length) result.push({ text: text.slice(start), end: '' });
   return result;
@@ -45,7 +44,7 @@ function lines(text) {
 // Майерс: фронт и цепочки совпавших участков; и время, и число узлов ограничены шагами.
 function endings(a, b, maxSteps = 200000) {
   let steps = 0, frontier = new Map([[1, { x: 0, node: null }]]);
-  const step = () => { if (++steps > maxSteps) throw Error('сравнение слишком дорогое'); };
+  const step = () => { if (++steps > maxSteps) throw Error('сравнение слишком дорогое: больше ' + maxSteps + ' шагов Майерса (maxSteps)'); };
   for (let d = 0; d <= a.length + b.length; d++) {
     const next = new Map();
     for (let k = -d; k <= d; k += 2) {
@@ -84,16 +83,13 @@ function compare(folder, snap, before, writes, { errors = [], maxSteps = 200000 
     const issues = [];
     try {
       const file = path.join(folder, entry.path);
-      if (fs.statSync(file).size > MAX_FILE) throw Error('больше 2 МБ после поручения');
       const buf = fs.readFileSync(file);
-      if (buf.length > MAX_FILE) throw Error('больше 2 МБ после поручения');
       if (sha(buf) !== entry.sha256) throw Error('файл изменился после поручения');
       const after = decode(buf); let old = { utf8: true, fffd: 0 };
       if (before.has(entry.path)) {
         const saved = snap.files.get(entry.path);
         if (!saved?.saved) throw Error(saved?.error || 'исходник недоступен');
         const original = fs.readFileSync(path.join(snap.dir, entry.path));
-        if (original.length > MAX_FILE) throw Error('больше 2 МБ до поручения');
         old = decode(original);
         if (old.bom !== after.bom) issues.push(old.bom ? 'BOM пропал' : 'BOM появился');
       } else if (snap.errors?.length) throw Error('новизна неизвестна: обход папки до поручения с ошибками');

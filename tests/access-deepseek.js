@@ -49,18 +49,34 @@ run([
       assert.equal(access.allowed('team', 'team_change'), false);
     });
   }],
-  ['П3: deepseek не ставит поручения, не пишет работы и не воротит изменение связки', () => {
+  ['П3: deepseek (только чтение) не ставит поручения, не пишет и не воротит изменение связки; team_work открыт безусловно', () => {
     withClient('deepseek', () => {
       assert.throws(() => access.guard('team', 'team_change', { action: 'merge' }), /запрещено/);
-      assert.throws(() => access.guard('team', 'team_work', { action: 'update' }), /запрещено/);
+      // team-v48e Г4b: team_work-изменение гостю открыто безусловно (тумблер MOST_GUEST_STRICT удалён).
+      assert.doesNotThrow(() => access.guard('team', 'team_work', { action: 'update' }), 'team_work открыт');
+      assert.doesNotThrow(() => access.guard('team', 'team_work', { action: 'create' }));
+      // deepseek — семья только для чтения (roles.sends=false): *_send недоступны (нет в guestTools), а не из-за тумблера.
       assert.throws(() => access.guard('codex', 'codex_send', { write: true }), /запрещено/);
       assert.throws(() => access.guard('codex', 'codex_send', { role: 'совет' }), /запрещено/);
       assert.throws(() => access.guard('antigravity', 'antigravity_send', { task: 't' }), /запрещено/);
-      assert.throws(() => access.guard('team', 'team_work', { action: 'create' }), /запрещено/);
       assert.doesNotThrow(() => access.guard('team', 'team_work', { action: 'list' }));
       assert.doesNotThrow(() => access.guard('team', 'team_work', { action: 'get' }));
       assert.doesNotThrow(() => access.guard('team', 'team_status', {}));
     });
+  }],
+  ['П2б (04be41a §2.2/4e): Claude-исполнитель (claude-print) отменяет codex/deepseek/antigravity-потомков, свой сервер claude — нет', () => {
+    // Вне поручения-сеанса: claude-print разрешается в участника claude (без MOST_JOB_ID, иначе ищется карточка поручения).
+    const prevJob = process.env.MOST_JOB_ID; delete process.env.MOST_JOB_ID;
+    try {
+      withClient('claude-print', () => {
+        // claude-print отменяет своих потомков на серверах-пирах через *_cancel (регистрируется в guestTools).
+        assert(access.guestTools('codex', 'claude-print').includes('codex_cancel'), 'claude-print→codex_cancel зарегистрирован');
+        assert(access.guestTools('deepseek', 'claude-print').includes('deepseek_cancel'), 'claude-print→deepseek_cancel зарегистрирован');
+        assert(access.guestTools('antigravity', 'claude-print').includes('antigravity_cancel'), 'claude-print→antigravity_cancel зарегистрирован');
+        // Свой сервер claude исключён: своих claude-потомков нет (claude→claude ловит lineageRefusal), claude_cancel НЕ выдаётся.
+        assert(!access.guestTools('claude', 'claude-print').includes('claude_cancel'), 'claude-print→claude_cancel НЕ зарегистрирован');
+      });
+    } finally { if (prevJob === undefined) delete process.env.MOST_JOB_ID; else process.env.MOST_JOB_ID = prevJob; }
   }],
   ['П4: старый путь пробы (legacy) у deepseek тоже только чтение', () => {
     withClient('deepseek', () => {

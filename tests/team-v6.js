@@ -55,10 +55,14 @@ test('Р1: CLI операции доставляет правила, фикси�
     files.forEach((f, i) => assert.equal(fs.readFileSync(f, 'utf8'), before[i]));
   } finally { savedState === undefined ? delete process.env.MOST_STATE_DIR : process.env.MOST_STATE_DIR = savedState; }
 });
-test('Р2: числовой предел 8 МиБ, UTF-8; только последний result', () => {
+test('Р2: материал без предела (тумблер MOST_MAX_MATERIAL_BYTES удалён); UTF-8; только последний result', () => {
   const a = require('../common/agy-input');
   assert.equal(JSON.parse(a.userEvent('я'.repeat(4194304))).message.content.length, 4194304);
-  assert.throws(() => a.userEvent('я'.repeat(4194305)), /8388608/);
+  // team-v48e Г7: материал >8 МиБ проходит безусловно (content сохраняется целиком; отказа по размеру нет).
+  assert.equal(JSON.parse(a.userEvent('я'.repeat(4194305))).message.content.length, 4194305);
+  // Даже при выставленной прежней переменной отказа нет — тумблер удалён, не читается.
+  process.env.MOST_MAX_MATERIAL_BYTES = '8388608';
+  try { assert.equal(JSON.parse(a.userEvent('я'.repeat(4194305))).message.content.length, 4194305); } finally { delete process.env.MOST_MAX_MATERIAL_BYTES; }
   assert.equal(a.parseResults('{"event":"step_update","step_update":{"text_delta":"мимо"}}').obj, null);
   assert.equal(a.parseResults('{"event":"result","result":{"status":"SUCCESS","response":"первый"}}\n{"event":"result","result":{"status":"ERROR","response":"последний"}}').obj.status, 'ERROR');
 });

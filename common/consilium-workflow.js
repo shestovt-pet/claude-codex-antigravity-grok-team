@@ -1,8 +1,10 @@
 'use strict';
 // Local workflow evidence checker. This is not an authority or an authentication service.
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
-const LIMITS = Object.freeze({ json: 8 * 1024 ** 2, text: 16 * 1024 ** 2,
-  count: 4096, file: 512 * 1024 ** 2, total: 32 * 1024 ** 3, chunk: 1024 ** 2 });
+// team-v48e Г7: размерные/числовые лимиты материалов консилиума (json/text/count/file/total) сняты безусловно (Infinity;
+// тумблеры MOST_CONSILIUM_MAX_* удалены). chunk (буфер чтения потока, 1 МБ) — физический буфер чтения, не кап общего объёма,
+// сохранён. v2 читает через общий LIMITS.text.
+const LIMITS = Object.freeze({ json: Infinity, text: Infinity, count: Infinity, file: Infinity, total: Infinity, chunk: 1024 ** 2 });
 const QUORUM = require('./members').seatIds;
 const HEX = /^[a-f0-9]{64}$/;
 const sha = value => crypto.createHash('sha256').update(value).digest('hex');

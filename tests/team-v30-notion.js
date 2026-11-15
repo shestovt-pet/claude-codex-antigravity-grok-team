@@ -3,6 +3,8 @@ const assert = require('assert'), fs = require('fs'), path = require('path');
 const f = require('./team-v16-fixture'), d = require('../common/deploy'), p = require('../common/agy-mcp-permissions');
 const a = require('../common/agy-tools'), members = require('../common/members');
 // Независимый эталон разрешений Antigravity: прежний набор поручений + Notion (замысел 3.8).
+// team-v48e (§2.2): расширение масок Antigravity (codex/*, deepseek/*, claude/*, antigravity/*) ВЫНЕСЕНО В ВЫПУСК 1б —
+// members-default.js остаётся узким как в 7bc3e980; эталон разрешений = прежний набор поручений + Notion (замысел 3.8).
 const ALLOW = ['mcp(team/team_status)', 'mcp(team/team_rules)', 'mcp(team/team_work)', 'mcp(codex/codex_status)', 'mcp(codex/codex_result)', 'mcp(codex/codex_send)', 'mcp(notion/*)'];
 const release = path.join(f.root, 'live', 'a'.repeat(40)), base = path.join(f.root, 'live', 'b'.repeat(40));
 f.write(path.join(release, 'common/agy-mcp-permissions.js'), '// поддержка 3.8');
@@ -24,7 +26,10 @@ for (const server of ['notion', 'team', 'codex', 'antigravity', 'comfyui', 'pbta
     { name: 'mcp_' + server + '_API-get-self' }, { name: 'mcp__' + server + '__API-get-self' },
     { name: server + '/API-get-self' }, { name: 'list_resources', args: { server } }, { name: 'read_resource', args: { server_name: server, uri: 'anything' } },
   ];
-  for (const call of calls) { assert.equal(a.allowed(call), server === 'notion', JSON.stringify(call)); assert.equal(a.forbidden(call), server !== 'notion'); }
+  // team-v48e (§2.2): маски Antigravity узкие (расширение — выпуск 1б). Произвольный tool API-get-self проходит только по
+  // шаблону notion/*; точные маски codex (codex_status/result/send) и team (team_status/rules/work) его не допускают.
+  const okServer = server === 'notion';
+  for (const call of calls) { assert.equal(a.allowed(call), okServer, JSON.stringify(call)); assert.equal(a.forbidden(call), !okServer); }
 }]);
 cases.push(
   ['Н2: пустой реестр разрешений запрещает все формы MCP и меняет текст поручения', () => {

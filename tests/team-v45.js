@@ -85,11 +85,18 @@ if (process.argv.includes('--team-server')) {
     result = tf.compare(dir, snap, before, [tracked, 'private.js'].map(p => ({ path: p, sha256: sha(fs.readFileSync(path.join(dir, p))) })));
     assert.equal(result.formatSuspicions.length, 2);
   });
-  test('П1 предел 50 МБ считается до любого чтения', () => {
+  test('team-v48e Г7: общий размер снимка не ограничен (тумблер MOST_FORMAT_MAX_TOTAL удалён)', () => {
     const old = fs.copyFileSync, oldRead = fs.readFileSync; let calls = 0;
     fs.copyFileSync = fs.readFileSync = () => { calls++; throw Error('чтение запрещено'); };
-    try { const snap = tf.snapshot(project, new Map([['big.md', (51 * 1024 * 1024) + ':0']])); assert.match(snap.skipped, /50 МБ/); assert.equal(calls, 0); }
-    finally { fs.copyFileSync = old; fs.readFileSync = oldRead; }
+    try {
+      // Общий размер снимка не ограничен — 51 МБ не пропускается по размеру (снимок читает/копирует).
+      const def = tf.snapshot(project, new Map([['big.md', (51 * 1024 * 1024) + ':0']]), { dir: path.join(temp(), 'fmt-def') });
+      assert(!def.skipped, '51 МБ не пропускается по размеру'); assert(calls > 0, 'копирование предпринято'); calls = 0;
+      // Даже при выставленной прежней переменной снимок не пропускается по размеру — тумблер удалён.
+      process.env.MOST_FORMAT_MAX_TOTAL = String(50 * 1024 * 1024);
+      try { const snap = tf.snapshot(project, new Map([['big.md', (51 * 1024 * 1024) + ':0']]), { dir: path.join(temp(), 'fmt-env') }); assert(!snap.skipped, 'MOST_FORMAT_MAX_TOTAL не ограничивает'); assert(calls > 0); }
+      finally { delete process.env.MOST_FORMAT_MAX_TOTAL; }
+    } finally { fs.copyFileSync = old; fs.readFileSync = oldRead; }
   });
   test('П1 ошибка копирования не означает новый файл', () => {
     const dir = temp(); write(path.join(dir, 'a.js'), 'x\n'); const before = fb.folderState(dir), copy = fs.copyFileSync;
@@ -136,11 +143,19 @@ if (process.argv.includes('--team-server')) {
   });
   test('П1 гонка, пропавший файл, размер, предел шагов, нет списков', () => {
     let x = sample('a\n', 'b\n'); write(x.file, 'changed'); assert.match(x.compare().formatCheck, /файл изменился/);
-    x = sample('a\n', 'b\n'); const old = fs.statSync;
-    fs.statSync = (...args) => { if (String(args[0]) === x.file) throw Object.assign(Error('gone'), { code: 'ENOENT' }); return old(...args); };
-    try { assert.match(x.compare().formatCheck, /ENOENT/); } finally { fs.statSync = old; }
-    x = sample('a\n', 'b'.repeat(2 * 1024 * 1024 + 1)); assert.match(x.compare().formatCheck, /2 МБ/);
-    x = sample('a'.repeat(2 * 1024 * 1024 + 1), 'x'); assert.match(x.compare().formatCheck, /2 МБ до/);
+    // team-v48e Г7: кеп размера файла снят — compare больше не делает statSync размера, а читает файл readFileSync; гонка
+    // «файл исчез при сравнении» воспроизводится ошибкой чтения (ENOENT), которая так же попадает в formatCheck.
+    x = sample('a\n', 'b\n'); const old = fs.readFileSync;
+    fs.readFileSync = (...args) => { if (String(args[0]) === x.file) throw Object.assign(Error('gone'), { code: 'ENOENT' }); return old(...args); };
+    try { assert.match(x.compare().formatCheck, /ENOENT/); } finally { fs.readFileSync = old; }
+    // team-v48e Г7: размер файла не ограничен (тумблер MOST_FORMAT_MAX_FILE удалён) — большой файл проверяется без отказа «2 МБ».
+    x = sample('a\n', 'b'.repeat(2 * 1024 * 1024 + 1)); assert(!/2 МБ/.test(x.compare().formatCheck), '>2 МБ без отказа');
+    // Даже при выставленной прежней переменной отказа «2 МБ» нет — тумблер удалён.
+    process.env.MOST_FORMAT_MAX_FILE = String(2 * 1024 * 1024);
+    try {
+      x = sample('a\n', 'b'.repeat(2 * 1024 * 1024 + 1)); assert(!/2 МБ/.test(x.compare().formatCheck), 'MOST_FORMAT_MAX_FILE не ограничивает (после)');
+      x = sample('a'.repeat(2 * 1024 * 1024 + 1), 'x'); assert(!/2 МБ/.test(x.compare().formatCheck), 'MOST_FORMAT_MAX_FILE не ограничивает (до)');
+    } finally { delete process.env.MOST_FORMAT_MAX_FILE; }
     x = sample('a\nb\nc\n', 'x\ny\nz\n'); assert.match(x.compare({ maxSteps: 2 }).formatCheck, /слишком дорогое/);
     assert.match(tf.compare(x.dir, x.snap, x.state, null).formatCheck, /пропущено/);
     assert.match(tf.snapshot(x.dir, null).skipped, /список файлов/);
@@ -189,7 +204,8 @@ child.on('close', code => { process.exitCode = code; });
       };
       let released = false;
       try {
-        await bridge.execute(j, { release: async () => { released = true; } });
+        // team-v48e (ревью п.1): замок несёт owner.folder фактической папки — reconcile видит совпадение и не переснимает замок.
+        await bridge.execute(j, { ok: true, owner: { folder: require('../common/paths').canon(dir) }, release: async () => { released = true; } });
         for (let i = 0; i < 200 && !released; i++) await new Promise(r => setTimeout(r, 50));
         assert(released, 'замок папки освобождён');
         const card = bridge.load(id); assert.equal(card.status, 'done', card.error);

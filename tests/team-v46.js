@@ -40,7 +40,10 @@ test('Матрица 12 направлений: canSend и регистраци�
   }
   for (const to of ['codex', 'antigravity', 'deepseek'])
     assert.ok(access.guestTools(to, 'claude-print').includes(to + '_send'), 'claude-print → ' + to);
-  assert.deepEqual(access.guestTools('claude', 'claude-print'), []);
+  // team-v48e Г4b: claude-print зовёт свой сервер claude безусловно (тумблер MOST_GUEST_STRICT удалён); claude_cancel НЕ выдаётся
+  // (своих claude-потомков нет — claude→claude ловит lineageRefusal).
+  assert.deepEqual(access.guestTools('claude', 'claude-print'), ['claude_status', 'claude_send', 'claude_result']);
+  assert(!access.guestTools('claude', 'claude-print').includes('claude_cancel'), 'claude-print не получает claude_cancel на своём сервере');
   assert.deepEqual(access.guestTools('team', 'claude-print').sort(),
     ['team_status', 'team_rules', 'team_work', 'team_ask', 'team_ask_result'].sort());
 });
@@ -76,7 +79,8 @@ test('claude_send: write допустим по реестру, full_access го�
   } finally { process.env.MOST_CLIENT = 'claude'; }
   process.env.MOST_CLIENT = 'codex';
   try {
-    assert.throws(() => access.guard('claude', 'claude_send', { folder: f.project, task: 'x', full_access: true, write: true, role: 'совет' }), /полный доступ Claude/);
+    // team-v48e Г4b: полный доступ гостю открыт безусловно (тумблер MOST_GUEST_STRICT удалён; серверная карточка — Г4c).
+    assert.doesNotThrow(() => access.guard('claude', 'claude_send', { folder: f.project, task: 'x', full_access: true, write: true, role: 'совет' }));
   } finally { process.env.MOST_CLIENT = 'claude'; }
 });
 
@@ -95,14 +99,13 @@ test('Цепочка: S → claude-исполнитель разрешено; cl
   } finally { process.env.MOST_JOB_ID = ''; }
 });
 
-test('Подпоручения: запись только у пишущего родителя; полный доступ — отказ', () => {
+test('team-v48e Г3: подпоручения — запись шире родителя и полный доступ допускаются безусловно (тумблер MOST_CHAIN_STRICT удалён)', () => {
   const p = { id: 'p-w', status: 'running', member: 'codex' };
   process.env.MOST_JOB_ID = 'p-w';
   try {
-    assert.throws(() => chain.admit('deepseek', 'deepseek_send', { write: true }, { cards: [p], ancestors: [{ pid: 999999 }] }), /пишущего поручения-родителя/);
-    const grant = chain.admit('deepseek', 'deepseek_send', { write: true, role: 'проверка' }, { cards: [{ ...p, write: true }], ancestors: [{ pid: 999999 }] });
-    assert.equal(grant.parentJob, 'p-w');
-    assert.throws(() => chain.admit('deepseek', 'deepseek_send', { full_access: true }, { cards: [p], ancestors: [{ pid: 999999 }] }), /полный доступ/);
+    assert.equal(chain.admit('deepseek', 'deepseek_send', { write: true }, { cards: [p], ancestors: [{ pid: 999999 }] }).parentJob, 'p-w', 'запись шире непишущего родителя допускается');
+    assert.equal(chain.admit('deepseek', 'deepseek_send', { write: true, role: 'проверка' }, { cards: [{ ...p, write: true }], ancestors: [{ pid: 999999 }] }).parentJob, 'p-w');
+    assert.equal(chain.admit('deepseek', 'deepseek_send', { full_access: true }, { cards: [p], ancestors: [{ pid: 999999 }] }).parentJob, 'p-w', 'полный доступ подпоручению допускается');
   } finally { process.env.MOST_JOB_ID = ''; }
 });
 
@@ -129,7 +132,7 @@ test('claude.exe: buildArgs, editRule и missingFlags', () => {
   assert.ok(full[full.indexOf('--tools') + 1].split(',').includes('Bash'));
   assert.ok(w[w.indexOf('--tools') + 1].split(',').includes('Edit'));
   assert.ok(!w[w.indexOf('--tools') + 1].split(',').includes('Bash'));
-  assert.equal(claudeArgs.editRule('E:\\work\\dir'), 'Edit(//E:/work/dir/**)');
+  assert.equal(claudeArgs.editRule('E:\\work\\dir'), 'Edit(//e/work/dir/**)'); // team-v48b: формат, который принимает Claude Code
   assert.ok(!args.some(a => String(a).includes('прочитай файл probe')), 'задание не должно попадать в argv');
   const help = claudeArgs.REQUIRED_FLAGS.join(' ');
   assert.deepEqual(claudeArgs.missingFlags(help), []);
@@ -169,20 +172,29 @@ test('Миграция team-v46: receives, нет limit_5h, маски claude и
   assert.ok(!members.serversForInstall(back).includes('claude'));
 });
 
-test('Сроки: ребёнок укладывается в срок родителя − 3 мин; отказ при остатке ≤ 3 мин', () => {
-  const now = Date.now();
-  const r = deadline.childDeadline({ startedAt: new Date(now - 60000).toISOString() }, 'codex', 'claude', now);
-  assert.ok(r.deadline);
-  assert.ok(Date.parse(r.deadline) - now <= 60 * 60 * 1000);
-  const r2 = deadline.childDeadline({ deadline: new Date(now + 10 * 60000).toISOString() }, 'codex', 'claude', now);
-  assert.ok(Date.parse(r2.deadline) <= now + 7 * 60000, 'не позже срока родителя − 3 мин');
-  const tight = { startedAt: new Date(now - (3600000 - 3 * 60000)).toISOString() };
-  const r3 = deadline.childDeadline(tight, 'codex', 'claude', now);
-  assert.equal(r3.deadline, null);
-  assert.match(r3.error, /не хватает времени/);
-  assert.equal(deadline.deadlinePassed({ deadline: new Date(Date.now() - 1000).toISOString() }), true);
-  assert.equal(deadline.parentTerminal({ parentJob: 'p-done' }, [{ id: 'p-done', status: 'done' }]), true);
-  assert.equal(deadline.parentTerminal({ parentJob: 'p-run' }, [{ id: 'p-run', status: 'running' }]), false);
+test('Сроки: своего срока нет даже при заданных прежних переменных; срок родителя из карточки передаётся ребёнку (− 3 мин) и отказывает при остатке ≤ 3 мин', () => {
+  // team-v48e «нет срока» (§2.6/§3): сроковые тумблеры MOST_*_TIMEOUT_MS удалены — обычный срок всегда null, даже если
+  // прежние переменные выставлены. Передача срока РОДИТЕЛЯ сохраняется, но берётся из его карточки (deadline), не из тумблера.
+  const savedC = process.env.MOST_CODEX_TIMEOUT_MS, savedCl = process.env.MOST_CLAUDE_TIMEOUT_MS;
+  process.env.MOST_CODEX_TIMEOUT_MS = '3600000'; process.env.MOST_CLAUDE_TIMEOUT_MS = '3600000';
+  try {
+    const now = Date.now();
+    // (1) Родителя-ребёнка без deadline в карточке (только startedAt) — своего обычного срока нет, тумблеры игнорируются: deadline null, без ошибки.
+    const r = deadline.childDeadline({ startedAt: new Date(now - 60000).toISOString() }, 'codex', 'claude', now);
+    assert.equal(r.deadline, null); assert.equal(r.error, null);
+    // (2) Срок родителя задан в его карточке (данные карточки соблюдаются) — ребёнок не позже срока родителя − 3 мин.
+    const r2 = deadline.childDeadline({ deadline: new Date(now + 10 * 60000).toISOString() }, 'codex', 'claude', now);
+    assert.ok(r2.deadline); assert.ok(Date.parse(r2.deadline) <= now + 7 * 60000, 'не позже срока родителя − 3 мин');
+    // (3) Остаток срока родителя ≤ 3 мин — отказ (ровно 3 мин тоже отказ).
+    const r3 = deadline.childDeadline({ deadline: new Date(now + 3 * 60000).toISOString() }, 'codex', 'claude', now);
+    assert.equal(r3.deadline, null); assert.match(r3.error, /не хватает времени/);
+    assert.equal(deadline.deadlinePassed({ deadline: new Date(Date.now() - 1000).toISOString() }), true);
+    assert.equal(deadline.parentTerminal({ parentJob: 'p-done' }, [{ id: 'p-done', status: 'done' }]), true);
+    assert.equal(deadline.parentTerminal({ parentJob: 'p-run' }, [{ id: 'p-run', status: 'running' }]), false);
+  } finally {
+    if (savedC === undefined) delete process.env.MOST_CODEX_TIMEOUT_MS; else process.env.MOST_CODEX_TIMEOUT_MS = savedC;
+    if (savedCl === undefined) delete process.env.MOST_CLAUDE_TIMEOUT_MS; else process.env.MOST_CLAUDE_TIMEOUT_MS = savedCl;
+  }
 });
 
 test('Общий замок записи: граница сегмента, вложенность, junction', async () => {
@@ -233,23 +245,20 @@ test('fix7: устаревший мьютекс восстанавливаетс
   }
 });
 
-test('Общее правило папок п.5а: корень/клон/релиз — отказ; дирижёр + своя .work (три случая)', () => {
+test('Общее правило папок п.5а (MOST_PROTECT_BRIDGE): корень/клон/релиз — отказ; дирижёр + своя .work (три случая)', () => {
   const root = f.root;
   for (const d of [path.join(root, 'common'), path.join(root, 'live', 'hash'), path.join(root, '.work', 'other')])
     fs.mkdirSync(d, { recursive: true });
-  assert.match(writeFolder.refusal(path.join(root, 'common'), {}), /Запись запрещена|Полный доступ запрещён/);
-  assert.match(writeFolder.refusal(path.join(root, 'live', 'hash'), {}), /Запись запрещена|Полный доступ запрещён/);
-  assert.match(writeFolder.refusal(path.join(root, '.work', 'other'), {}), /Запись запрещена|Полный доступ запрещён/);
-  // Своя рабочая копия дирижёра (root подменён): write без full_access — допуск; full_access — отказ; чужая — отказ.
-  const stateDir = path.join(root, 'state');
-  const changeDir = path.join(root, '.work', 'my-change');
-  fs.mkdirSync(changeDir, { recursive: true });
-  fs.mkdirSync(path.join(stateDir, 'changes'), { recursive: true });
-  fs.writeFileSync(path.join(stateDir, 'changes', 'my-change.json'), JSON.stringify({ name: 'my-change', owner: 'sess-1', status: 'открыто' }));
-  const base = { root, stateDir, client: 'claude', guest: false };
-  assert.equal(writeFolder.refusal(changeDir, { ...base, fullAccess: false, owner: 'sess-1' }), null);
-  assert.match(writeFolder.refusal(changeDir, { ...base, fullAccess: true, owner: 'sess-1' }), /Полный доступ запрещён/);
-  assert.match(writeFolder.refusal(changeDir, { ...base, fullAccess: false, owner: 'sess-2' }), /Запись запрещена/);
+  // team-v48e Г4a: папочный запрет снят безусловно (refusal→null для существующих абсолютных папок); проверка «абсолютная
+  // существующая папка» — всегда. Тумблер MOST_PROTECT_BRIDGE удалён — даже при его выставлении защита не возвращается.
+  assert.equal(writeFolder.refusal(path.join(root, 'common'), {}), null);
+  assert.match(writeFolder.refusal('относительный-путь', {}), /Нужна абсолютная существующая папка/);
+  process.env.MOST_PROTECT_BRIDGE = '1';
+  try {
+    assert.equal(writeFolder.refusal(path.join(root, 'common'), {}), null, 'MOST_PROTECT_BRIDGE не возвращает папочный запрет (common)');
+    assert.equal(writeFolder.refusal(path.join(root, 'live', 'hash'), {}), null, 'MOST_PROTECT_BRIDGE не возвращает папочный запрет (live/hash)');
+    assert.equal(writeFolder.refusal(path.join(root, '.work', 'other'), {}), null, 'MOST_PROTECT_BRIDGE не возвращает папочный запрет (.work)');
+  } finally { delete process.env.MOST_PROTECT_BRIDGE; }
 });
 
 test('Происхождение: parent() с byAncestors=false — процесса среди предков нет', () => {
@@ -316,10 +325,45 @@ test('claude_send: роль «проверка» допускается (без 
     const r = await c.callTool({ name: 'claude_send', arguments: { folder: f.project, task: 'прочитай файл', role: 'проверка' } });
     assert(!r.isError, text(r));
   });
+  // team-v48e Г4c: гость получает полный доступ Claude безусловно (серверная карточка fullAccessAllowed; тумблер MOST_GUEST_STRICT удалён).
   await client('claude', 'codex', null, async c => {
     const r = await c.callTool({ name: 'claude_send', arguments: { folder: f.project, task: 'x', write: true, full_access: true, role: 'совет' } });
-    assert.equal(r.isError, true, text(r));
-    assert.match(text(r), /полный доступ Claude/);
+    assert(!r.isError, 'полный доступ гостю открыт: ' + text(r));
+  });
+  // Даже при выставленной прежней переменной полный доступ остаётся открыт — тумблер удалён.
+  process.env.MOST_GUEST_STRICT = '1';
+  try {
+    await client('claude', 'codex', null, async c => {
+      const r = await c.callTool({ name: 'claude_send', arguments: { folder: f.project, task: 'x', write: true, full_access: true, role: 'совет' } });
+      assert(!r.isError, 'MOST_GUEST_STRICT не ограничивает: ' + text(r));
+    });
+  } finally { delete process.env.MOST_GUEST_STRICT; }
+});
+
+test('team-v48e Г4c: claude fullAccessAllowed и бан записи гостю сняты безусловно (тумблер MOST_GUEST_STRICT удалён)', async () => {
+  const Module = require('module'), file = path.join(ROOT, 'servers/claude/index.js');
+  const src = fs.readFileSync(file, 'utf8'), end = src.indexOf('\n(async () => {');
+  assert(end > 0);
+  const m = new Module(file, module); m.filename = file; m.paths = Module._nodeModulePaths(path.dirname(file));
+  m._compile(src.slice(0, end) + '\nmodule.exports = { fullAccessAllowed };', file);
+  const api = m.exports;
+  // (1) fullAccessAllowed: полный доступ гостю/подпоручению/чату безусловно; даже при выставленной прежней переменной остаётся открыт.
+  for (const patch of [{ from: 'antigravity' }, { parentJob: 'p1' }, { fallbackWord: 'w' }, { fromChat: 'claude', from: 'claude' }]) {
+    const card = { role: 'совет', write: true, fullAccess: true, from: 'claude', ...patch };
+    assert(api.fullAccessAllowed(card), 'полный доступ: ' + JSON.stringify(patch));
+    process.env.MOST_GUEST_STRICT = '1';
+    try { assert(api.fullAccessAllowed(card), 'MOST_GUEST_STRICT не ограничивает: ' + JSON.stringify(patch)); } finally { delete process.env.MOST_GUEST_STRICT; }
+  }
+  assert(!api.fullAccessAllowed({ role: 'совет', write: false, fullAccess: true }));
+  assert(!api.fullAccessAllowed({ role: 'проверка', write: true, fullAccess: true }));
+  // (2) Реальный обработчик: гость claude_send с write (без full_access) к существующей абсолютной папке — принят
+  // (серверный бан записи гостю снят безусловно, тумблер MOST_GUEST_STRICT удалён); относительная папка — отказ того же
+  // обработчика «Нужна абсолютная существующая папка» (подлинность пути, не бан гостя). Без срезов и подмен (§4).
+  await client('claude', 'codex', null, async c => {
+    const ok = await c.callTool({ name: 'claude_send', arguments: { folder: f.project, task: 'x', write: true, role: 'совет' } });
+    assert(!ok.isError, 'запись гостю открыта: ' + text(ok));
+    const bad = await c.callTool({ name: 'claude_send', arguments: { folder: 'относительная', task: 'x', write: true, role: 'совет' } });
+    assert(bad.isError); assert.match(text(bad), /Нужна абсолютная существующая папка/);
   });
 });
 
@@ -502,4 +546,5 @@ test('antigravity: очередь не перечитывает завершён
 });
 require('./team-v46-fix5')({ test, f, client, text });
 require('./team-v46-fix6')({ test, f, client, text });
+require('./team-v48-adapters')({ test, f, client, text });
 f.run(process.env.MOST_FIX6_ONLY ? tests.filter(([name]) => name.startsWith('fix6 ')) : tests);

@@ -181,7 +181,13 @@ test('E1: ограничения до исполнения',async()=>{
   process.env.MOST_CLIENT='codex';
   assert.throws(()=>require('../common/access').guard('team','team_status',{notify_test:true}),/Гостю/);
   await assert.rejects(t.change({action:'start',name:'guest',request,design_file:design}),/Гостю/);
-  await assert.rejects(t.work({owner: 'test-owner', action: 'create',name:'guest'}),/Гостю/);
+  // team-v48e Г4b: блок изменений гостю снят безусловно (тумблер MOST_GUEST_STRICT удалён) — team_work create от гостя
+  // проходит гейт гостя и проверку редакции и доходит до той же дисциплины содержания, что и у любого клиента
+  // (цель/критерий/этапы/следующий шаг), без отказа «Гостю…». Папка работы при этом не создаётся.
+  await assert.rejects(
+    t.work({ owner: 'test-owner', action: 'create', name: 'guest', expected_revision: 0 }),
+    e => { assert.doesNotMatch(String(e.message), /Гостю/, 'нет отказа гостя'); assert.match(String(e.message), /Укажите цель, критерий завершения/); return true; },
+  );
   assert(!fs.existsSync(path.join(root,'.work/guest'))); delete process.env.MOST_CLIENT;
 });
 test('E1: гостевые списки инструментов, очередь и основной исполнитель обоих мостов',async()=>{
@@ -193,15 +199,16 @@ test('E1: гостевые списки инструментов, очередь
     write(path.join(state,'ready','team.json'),JSON.stringify({release:path.resolve(__dirname,'..'),pid:2147483000,startedAt:new Date(Date.now()-3600000).toISOString()}));
     const env={...process.env,MOST_REPO_ROOT:root,MOST_STATE_DIR:state,MOST_CODEX_JOBS_DIR:path.join(state,'codex-jobs'),MOST_JOURNAL:path.join(state,'agy.log'),MOST_INPUT_DIR:path.join(state,'input'),AGY_PATH:path.join(__dirname,'fake-agy.js'),MOST_TEST_KEEP:'1',MOST_QUEUE_TICK_MS:'50'};
     const clients=[];
-    async function connect(server,client) {
-      const transport=new StdioClientTransport({command:process.execPath,args:[path.join(__dirname,'../servers',server,'index.js')],env:{...env,MOST_CLIENT:client},stderr:'pipe'});
+    async function connect(server,client,extra={}) {
+      const transport=new StdioClientTransport({command:process.execPath,args:[path.join(__dirname,'../servers',server,'index.js')],env:{...env,MOST_CLIENT:client,...extra},stderr:'pipe'});
       const c=new Client({name:'test',version:'1'});await c.connect(transport);clients.push(c);return c;
     }
     try {
       const guest=await connect(who,who==='codex'?'antigravity':'codex');
       const listed=(await guest.listTools()).tools.map(t=>t.name);assert.deepEqual(listed.sort(),[who+'_send',who+'_status',who+'_result',...(who==='antigravity'?['antigravity_apply']:[])].sort());
       const forbidden=await guest.callTool({name:who+'_cancel',arguments:{id:'none'}});assert(forbidden.isError);
-      if(who==='codex')assert((await guest.callTool({name:'codex_send',arguments:{folder,task:'Проверка',write:true}})).isError);
+      // team-v48e Г4c: прежний запрет записи гостю снят безусловно (тумблер MOST_GUEST_STRICT удалён) — positive-кейс «гость пишет»
+      // проверяется в team-v22-full-access/team-v25; здесь не ставим write:true, чтобы не плодить задание в той же папке.
       const out=await guest.callTool({name:who+'_send',arguments:{folder,task:'[[FAKE:accept]] Проверка',role:'совет',stage:'Этап',work:'work',owner:'test-owner',...(who==='antigravity'?{mode:'text'}:{write:'false'})}});
       assert(!out.isError,JSON.stringify(out));const text=out.content[0].text;assert.match(text,/В ОЧЕРЕДИ/);assert.match(text,/выполнит основной сервер/);assert.match(text,/Принято 100 %/);
       const id=text.match(/Номер поручения: (\S+)/)[1];
@@ -209,13 +216,17 @@ test('E1: гостевые списки инструментов, очередь
       const file=who==='codex'?path.join(state,'codex-jobs',id+'.json'):path.join(state,'jobs',id,'card.json');
       await new Promise(r=>setTimeout(r,150));assert.equal(read(file).status,'queued');assert(!fs.existsSync(path.join(state,'ready',who+'.json')));
       const queued=await guest.callTool({name:who+'_result',arguments:{id,wait_sec:'0',from_char:'0'}});assert.match(queued.content[0].text,/выполнит основной сервер/);assert(!queued.content[0].text.includes('undefined'));
-      const main=await connect(who,'claude');
+      // team-v48e Г4c: прежняя переменная MOST_GUEST_STRICT удалена из кода — выставляем её в окружении основного исполнителя,
+      // чтобы показать, что она не влияет ни на исполнение гостевого поручения, ни на перенос результата (apply).
+      const main=await connect(who,'claude',{MOST_GUEST_STRICT:'1'});
       const until=Date.now()+12000;while(read(file).status!=='done'&&Date.now()<until)await new Promise(r=>setTimeout(r,100));assert.equal(read(file).status,'done');
       assert.equal(fs.readFileSync(path.join(folder,'_antigravity_result.txt'),'utf8'),'ЧУЖОЙ ЧЕРНОВИК');
       assert.deepEqual(fs.readdirSync(folder),['_antigravity_result.txt']);
       if(who==='antigravity') {
-        const denied=await main.callTool({name:'antigravity_apply',arguments:{id,to:path.join(folder,'new.txt')}});
-        assert(denied.isError);assert.match(denied.content[0].text,/Перенос гостевого поручения запрещён/);assert(!fs.existsSync(path.join(folder,'new.txt')));
+        // Перенос проверенного гостевого результата разрешён безусловно (тумблер MOST_GUEST_STRICT удалён); apply через уже
+        // готовый основной сервер (с выставленной прежней переменной) — отказа «Перенос гостевого поручения запрещён» нет.
+        const applied=await main.callTool({name:'antigravity_apply',arguments:{id,to:path.join(folder,'new.txt')}});
+        assert(!applied.isError,'MOST_GUEST_STRICT не запрещает перенос: '+applied.content[0].text);assert(fs.existsSync(path.join(folder,'new.txt')));
       }
       assert.equal(read(path.join(state,'ready',who+'.json')).release,path.resolve(__dirname,'..'));
       const result=await guest.callTool({name:who+'_result',arguments:{id}});assert.match(result.content[0].text,/Принято 100 %/);
@@ -228,8 +239,11 @@ test('E1: гостевые списки инструментов, очередь
 });
 test('E2: допустимые MCP-вызовы и запреты',()=>{
   const a=require('../common/agy-tools'); // Прежнее разрешённое чтение поручений Antigravity сохранено, Notion добавлен.
-  assert(a.allowed({name:'call_mcp_tool',args:{tool_name:'team_status'}})); assert(a.allowed({name:'mcp__team__team_work',args:{owner: 'test-owner', action: 'get'}})); assert(a.allowed({name:'mcp__team__team_rules',args:{part: 'common'}})); assert(a.allowed({name:'codex_status',args:{}})); assert(a.allowed({name:'codex_send',args:{role: 'совет'}})); assert(a.allowed({name:'call_mcp_tool',args:{server:'notion',tool:'API-get-self'}})); assert(!a.allowed({name:'codex_send',args:{role: 'текст', write: true}})); assert(!a.allowed({name:'call_mcp_tool',args:{server:'comfyui',tool:'queue'}}));
-  assert(!a.allowed({name:'mcp__team__team_work',args:{owner: 'test-owner', action: 'update'}})); assert(a.forbidden([{name:'run_command'}])); assert(a.forbidden([{name:'invoke_subagent'}]));
+  assert(a.allowed({name:'call_mcp_tool',args:{tool_name:'team_status'}})); assert(a.allowed({name:'mcp__team__team_work',args:{owner: 'test-owner', action: 'get'}})); assert(a.allowed({name:'mcp__team__team_rules',args:{part: 'common'}})); assert(a.allowed({name:'codex_status',args:{}})); assert(a.allowed({name:'codex_send',args:{role: 'совет'}})); assert(a.allowed({name:'call_mcp_tool',args:{server:'notion',tool:'API-get-self'}}));
+  // team-v48e Г4c: вторая маска (запрет write/cancel) снята безусловно — codex_send с write:true проходит первую маску (maskOk по codex/codex_send); запрет остаётся только по неизвестному серверу/инструменту.
+  assert(a.allowed({name:'codex_send',args:{role: 'текст', write: true}})); assert(!a.allowed({name:'call_mcp_tool',args:{server:'comfyui',tool:'queue'}}));
+  // team-v48e Г4c: team_work-изменение (action update) проходит первую маску (team/team_work) — вторая маска снята; запрет по неизвестным именам (run_command/subagent) сохраняется.
+  assert(a.allowed({name:'mcp__team__team_work',args:{owner: 'test-owner', action: 'update'}})); assert(a.forbidden([{name:'run_command'}])); assert(a.forbidden([{name:'invoke_subagent'}]));
 });
 test('E3: TOML сохраняет посторонние байты, повтор и конфликты',()=>{
   const text='\uFEFF# чужой текст\r\nmodel = "value"\r\n'; const first=cc.toml(text,root,root,RUN,process.execPath);

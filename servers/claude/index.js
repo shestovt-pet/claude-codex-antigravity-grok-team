@@ -166,12 +166,14 @@ function taskFiles(job) {
   return { mcpConfig, settings };
 }
 function fullAccessAllowed(card) {
-  return card.fullAccess === true && card.write === true && ['текст', 'совет'].includes(card.role) &&
-    card.from === 'claude' && !card.parentJob && !card.fallbackWord && !Object.hasOwn(card, 'fromChat');
+  if (!(card.fullAccess === true && card.write === true && ['текст', 'совет'].includes(card.role))) return false;
+  // team-v48e Г4c: полный доступ доступен гостю/подпоручению/чату безусловно (тумблер MOST_GUEST_STRICT удалён); роль и
+  // write=true остаются как намерение.
+  return true;
 }
 function fullAccessRefusal(a) {
   if (!a.full_access) return null;
-  if (access.guest()) return 'Гостю полный доступ Claude запрещён; изменения не выполнены.';
+  // team-v48e Г4c: полный доступ гостю открыт безусловно (серверная карточка проверяется fullAccessAllowed); тумблер MOST_GUEST_STRICT удалён.
   if (a.write !== true) return 'Полный доступ требует write=true.';
   if (!['текст', 'совет'].includes(a.role)) return 'Для полного доступа явно укажите роль «текст» или «совет»; проверка остаётся в песочнице.';
   return writeFolder.refusal(a.folder, { fullAccess: true });
@@ -322,8 +324,16 @@ async function execute(job, folderLock) {
       if (folderLock) await folderLock.release();
       return;
     }
+    // team-v48e (ревью п.1): связку «фактическая папка записи ↔ замок» сверяем синхронно после последнего await,
+    // непосредственно перед spawn (без await между сверкой и запуском), и запускаем с cwd = проверенный realpath.
+    let cwd = job.folder;
+    if (job.write) {
+      folderLock = writeLock.reconcile(folderLock, job.folder, { jobId: job.id }); cwd = folderLock.owner.folder;
+      // team-v48e (ревью п.1): правило Edit и cwd — только проверенный канонический путь замка, без повторного разбора job.folder.
+      claudeArgs.retargetEditRule(args, job.folder, cwd);
+    }
     child = spawn(currentBinary(), args, {
-      cwd: job.folder,
+      cwd,
       env: require('../../common/fallback').jobEnv(job.id),
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -342,17 +352,20 @@ async function execute(job, folderLock) {
     child.on('close', guarded((code) => finish(code)));
     await mutate(job.id, (c) => { c.childPid = child.pid; c.childStartedAt = new Date().toISOString(); });
     if (done) return;
-    // Срок процесса при запуске = deadline − сейчас (если задан), иначе обычные 60 мин.
+    // Срок процесса при запуске = deadline − сейчас (если задан), иначе «нет срока» (null).
+    // team-v48 три случая остатка (см. codex/index.js): null → таймер не создаётся.
     const budget = require('../../common/chain-deadline').runtimeBudget(job, 'claude');
-    timer = setTimeout(guarded(() => stop(job.id, 'timeout')), budget);
+    if (Number.isFinite(budget) && budget > 0) timer = setTimeout(guarded(() => stop(job.id, 'timeout')), budget);
+    else if (Number.isFinite(budget) && budget <= 0) stop(job.id, 'timeout').catch(logFailure);
     poll = setInterval(guarded(function pollJob() {
       const j = load(job.id);
       if (require('../../common/chain-deadline').parentTerminal(j)) stop(job.id, 'parent').catch(logFailure);
       else if (j.status === 'cancelling') stop(job.id, j.stopReason).catch(logFailure);
+      else if (require('../../common/chain-deadline').deadlinePassed(j)) stop(job.id, 'timeout').catch(logFailure);
     }), 200);
     child.stdin.end(['Это отдельное поручение пользователя через Claude. Не считай, что знаешь другие чаты.',
       job.fullAccessApplied
-        ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; не изменяй файлы связки; удаления запрещены; каждое действие вне папки поручения перечисли в отчёте.'
+        ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; каждое действие вне папки поручения перечисли в отчёте.'
         : job.write ? 'Изменения разрешены только в рамках поручения. Перечисли файлы и проверки.'
         : 'Только чтение. Не изменяй файлы.',
       'Не обходи ограничения. Отвечай по-русски.', job.task, job.textFile ? 'Материал в файле: ' + job.textFile : ''].join('\n'));
@@ -392,9 +405,8 @@ async function send(a) {
   access.guard('claude', 'claude_send', a);
   const refusal = fullAccessRefusal(a);
   if (refusal) throw Error(refusal);
-  // Запись по поручению: дирижёр или пишущее поручение с writer по реестру; иначе — отказ.
-  if (a.write && access.guest() && !(process.env.MOST_JOB_ID && require('../../common/members').canWrite(access.client()) && parentJob()?.write === true))
-    throw Error('Запись Claude-исполнителя может просить только дирижёр Claude или пишущее поручение участника с writer=true.');
+  // team-v48e Г4c: запись по поручению допускается гостю/подпоручению безусловно (тумблер MOST_GUEST_STRICT удалён);
+  // серверная карточка проверяется отдельно, замок записи — всегда.
   const support = require('../../common/brief-support');
   const extra = support.text(support.support(a.folder, a.opora));
   if (extra) a.text = (a.text || '') + extra;
@@ -477,6 +489,9 @@ async function queue() {
         await mutate(j.id, c => { if (c.status !== 'queued') return false; c.status = 'cancelled'; c.error = 'Срок родителя истёк, пока поручение ждало очереди; запуск отменён.'; c.finishedAt = new Date().toISOString(); });
         continue;
       }
+      // team-v48 Г5 (§13.B.5): получатель на паузе (реестр или слово) — карточка остаётся в очереди, не запускается и не падает.
+      // team-v48e (ревью п.4): ручная пауза держит всегда; только слово не держит карточку дирижёра (fallbackWord), иначе первый успех не снял бы слово (К2).
+      if (require('../../common/members').recipientPaused('claude', j.fallbackWord)) continue;
       const l = await locks.tryLock('claude_queue', j.id, { jobId: j.id });
       if (!l.ok) continue;
       let folderLock = null;
@@ -496,6 +511,8 @@ async function queue() {
           let reason;
           try { reason = require('../../common/job-chain').queuedRefusal(c, undefined, 'claude'); } catch (e) { reason = e.message; }
           if (reason) { c.status = 'failed'; c.error = reason; c.finishedAt = new Date().toISOString(); return; }
+          // team-v48 Г5 (§13.B.5): повторная проверка паузы под замком — гонка «пауза между проверкой и переводом в running».
+          if (require('../../common/members').recipientPaused('claude', c.fallbackWord)) return false;
           admitExecution();
           c.status = 'running';
           c.owner = locks.owner();
@@ -530,13 +547,13 @@ function register(name, title, description, inputSchema, fn) {
     }
   });
 }
-register('claude_send', 'Поручить Claude-исполнителю', 'Начать отдельное разовое поручение Claude Code (отдельный сеанс, не чат). Запись — как у Codex; Bash — только с полным доступом от дирижёра.', {
+register('claude_send', 'Поручить Claude-исполнителю', 'Начать отдельное разовое поручение Claude Code (отдельный сеанс, не чат). Запись — как у Codex; Bash — только с полным доступом.', {
   folder: z.string().describe('Абсолютная папка проекта.'),
   ...require('../../common/stage-schema').send,
   task: z.string().min(1).describe('Поручение.'),
   text: z.string().optional().describe('Материал для работы.'),
   write: z.boolean().default(false).describe('Разрешить изменения по поручению (Edit в папке поручения).'),
-  full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя (Bash); только Claude-дирижёр, с записью и ролью текст или совет.'),
+  full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя (Bash); при write=true, роли текст или совет и абсолютной существующей папке.'),
   continue_id: z.string().optional().describe('Номер предыдущего поручения.'),
   stage: z.string().optional().describe('Этап.'),
   owner: z.string().optional().describe('Метка сеанса владельца работы.'),

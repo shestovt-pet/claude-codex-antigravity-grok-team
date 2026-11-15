@@ -165,14 +165,17 @@ test("свой результат у каждого задания: перено
   ok(pb.isError && /изменился после отправки/.test(pb.text), "перенос B после A — отказ (файл изменился)", pb.text);
 });
 
-test("одно идущее задание на папку; отмена своего задания с потомками", async () => {
+test("исключительность генерации на карточку (часть 3 A): параллельные задания в папке; отмена с потомками", async () => {
   const dir = project({ "d.txt": "текст\n" });
   const f = path.join(dir, "d.txt");
   const childPidFile = path.join(RUN, "child-" + projN + ".pid");
   const a = await poruchit(B, { folder: dir, file: f, task: "[[FAKE:child:" + childPidFile + "]] [[FAKE:hang]]" });
   ok(a.id, "первое задание запущено", a.r.text);
+  // team-v48 Г6: по умолчанию замок генерации — на карточку (id), а не на папку: второе задание в той же папке идёт параллельно.
   const b = await poruchit(B, { folder: dir, file: f, task: "[[FAKE:replace:т=>Т]]" });
-  ok(b.r.isError && /уже идёт задание/.test(b.r.text), "второе в той же папке — отказ", b.r.text);
+  ok(b.id && !b.r.isError, "второе задание в той же папке идёт параллельно (не «уже идёт задание»)", b.r.text);
+  const itB = await waitDone(B, b.id);
+  ok(/Изменённых мест/.test(itB.text), "второе задание дало результат, пока первое висит", itB.text);
   await sleep(1200);
   const childPid = Number(fs.existsSync(childPidFile) ? fs.readFileSync(childPidFile, "utf8") : 0);
   const c = await call(B, "antigravity_cancel", { id: a.id });
@@ -183,9 +186,28 @@ test("одно идущее задание на папку; отмена сво�
   if (childPid && pidAlive(childPid)) hardKill(childPid);
   const it = await call(B, "antigravity_result", { id: a.id });
   ok(/отменено/.test(it.text), "итог: отменено", it.text);
-  const d = await poruchit(B, { folder: dir, file: f, task: "[[FAKE:replace:т=>Т]]" });
-  ok(d.id, "после отмены папка свободна", d.r.text);
-  await waitDone(B, d.id);
+});
+
+test("team-v48e Г6 §5: два задания Antigravity в одной папке идут параллельно (тумблер ONE_PER_FOLDER удалён)", async () => {
+  const childPidFile = path.join(RUN, "one-child-" + projN + ".pid");
+  let childPid = 0, aId = null, bId = null;
+  try {
+    const dir = project({ "o.txt": "текст\n" });
+    const f = path.join(dir, "o.txt");
+    // Первое задание «висит» (держит свой замок id), второе в той же папке больше не отвергается — параллельно принимается.
+    const a = await poruchit(B, { folder: dir, file: f, task: "[[FAKE:child:" + childPidFile + "]] [[FAKE:hang]]" });
+    ok(a.id, "первое задание запущено", a.r.text); aId = a.id;
+    const b = await poruchit(B, { folder: dir, file: f, task: "[[FAKE:replace:т=>Т]]" });
+    ok(b.id && !b.r.isError, "второе задание в той же папке принято (параллельно, без отказа «уже идёт»)", b.r.text); bId = b.id;
+    ok(aId !== bId, "у двух заданий разные jobId", aId + " / " + bId);
+    await sleep(1000);
+    childPid = Number(fs.existsSync(childPidFile) ? fs.readFileSync(childPidFile, "utf8") : 0);
+  } finally {
+    if (bId) await call(B, "antigravity_cancel", { id: bId }).catch(() => {});
+    if (aId) await call(B, "antigravity_cancel", { id: aId }).catch(() => {});
+    await sleep(800);
+    if (childPid && pidAlive(childPid)) hardKill(childPid);
+  }
 });
 
 test("исходник изменён после отправки → отказ; правленый черновик не мешает", async () => {
@@ -347,6 +369,28 @@ test("ссылки и junction не выводят за пределы прое�
   ok(!fs.existsSync(path.join(outside, "novyi.txt")), "снаружи ничего не создано");
 });
 
+test("ссылка на файл с другим именем: пишется realpath цели, тёзка в каталоге не тронут", async () => {
+  const dir = project({ "sub/real.txt": "РЕАЛ\n", "sub/alias.txt": "ЧУЖОЙ\n" });
+  const link = path.join(dir, "alias.txt");
+  try { fs.symlinkSync(path.join(dir, "sub", "real.txt"), link, "file"); }
+  catch (e) { skip("ссылку на файл создать нельзя: " + e.code); return; }
+  // существующая цель: project/alias.txt → project/sub/real.txt; рядом тёзка project/sub/alias.txt
+  const { id } = await poruchit(B, { folder: dir, task: "[[FAKE:literal:" + b64("НОВОЕ") + "]]" });
+  await waitDone(B, id);
+  const p = await call(B, "antigravity_apply", { id: id, to: link, overwrite: true });
+  ok(!p.isError, "перенос по ссылке на файл выполнен", p.text);
+  ok(fs.readFileSync(path.join(dir, "sub", "real.txt"), "utf8") === "НОВОЕ", "записан реальный файл real.txt",
+    fs.readFileSync(path.join(dir, "sub", "real.txt"), "utf8"));
+  ok(fs.readFileSync(path.join(dir, "sub", "alias.txt"), "utf8") === "ЧУЖОЙ\n", "тёзка sub/alias.txt не тронут",
+    fs.readFileSync(path.join(dir, "sub", "alias.txt"), "utf8"));
+  // новая цель: to на несуществующий файл создаётся ровно по своему пути
+  const { id: id2 } = await poruchit(B, { folder: dir, task: "[[FAKE:literal:" + b64("СВЕЖЕЕ") + "]]" });
+  await waitDone(B, id2);
+  const np = path.join(dir, "sub", "newfile.txt");
+  const p2 = await call(B, "antigravity_apply", { id: id2, to: np });
+  ok(!p2.isError && fs.readFileSync(np, "utf8") === "СВЕЖЕЕ", "новая цель создана по своему пути", p2.text);
+});
+
 test("длинный текст и длинное поручение — файлами; временные копии удаляются", async () => {
   const big = Array.from({ length: 600 }, (_, i) => "Строка номер " + i + " с текстом для проверки файлового режима.").join("\n") + "\n";
   const dir = project({ "m.txt": big });
@@ -477,18 +521,26 @@ test("закрытие связи Claude: мост останавливает ag
   ok(/НЕ УДАЛОСЬ[\s\S]*мост остановлен/.test(it.text), "задание помечено", it.text);
 });
 
-test("предел времени", async () => {
+test("team-v48e §2.6: срок не навязывается даже при заданном MOST_WATCHDOG_MS — задание не падает «не уложилось»", async () => {
+  // Сроковый тумблер MOST_WATCHDOG_MS удалён — процесс печати идёт без навязанного срока, HANG не останавливается по пределу.
   const B5 = await startBridge({ MOST_WATCHDOG_MS: "1500" });
+  let agyPid = 0, jobId = null;
   try {
     const dir = project({ "u.txt": "т\n" });
     const pidFile = path.join(RUN, "agy-u.pid");
     const { id } = await poruchit(B5, { folder: dir, file: path.join(dir, "u.txt"), task: "[[FAKE:pidfile:" + pidFile + "]] [[FAKE:hang]]" });
-    const it = await waitDone(B5, id, 30);
-    ok(/НЕ УДАЛОСЬ[\s\S]*не уложилось/.test(it.text), "задание остановлено по пределу", it.text);
-    const agyPid = Number(fs.readFileSync(pidFile, "utf8"));
-    ok(!pidAlive(agyPid), "agy остановлен по пределу", agyPid);
-    if (pidAlive(agyPid)) hardKill(agyPid);
-  } finally { await B5.client.close(); }
+    jobId = id;
+    await sleep(3500); // дольше прежнего watchdog 1500 мс
+    const it = await call(B5, "antigravity_result", { id, wait_sec: 0 });
+    ok(!/не уложилось/.test(it.text), "задание не остановлено по пределу (срок снят)", it.text);
+    agyPid = Number(fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8") : 0);
+    ok(agyPid && pidAlive(agyPid), "agy по-прежнему идёт без навязанного срока", agyPid);
+  } finally {
+    if (jobId) await call(B5, "antigravity_cancel", { id: jobId }).catch(() => {});
+    await sleep(500);
+    if (agyPid && pidAlive(agyPid)) hardKill(agyPid);
+    await B5.client.close();
+  }
 });
 
 test("Windows: занятый файл — отказ без порчи, повтор после освобождения", async () => {
@@ -599,7 +651,7 @@ test("длинные замечания читаются частями (from_ch
   ok(/номер 1999\./.test(it3.text) && !/Продолжение: antigravity_result/.test(it3.text), "последняя часть без указателя", it3.text.slice(-300));
 });
 
-test("одновременный запуск из двух экземпляров в одной папке — проходит один", async () => {
+test("два разных задания в одной папке из двух экземпляров — по умолчанию идут оба (замок на карточку)", async () => {
   const B2 = await startBridge();
   try {
     const dir = project({ "cc.txt": "т\n" });
@@ -608,10 +660,9 @@ test("одновременный запуск из двух экземпляро
       poruchit(B, { folder: dir, file: f, task: "[[FAKE:sleep:1500]]" }),
       poruchit(B2, { folder: dir, file: f, task: "[[FAKE:sleep:1500]]" }),
     ]);
-    ok((a.id ? 1 : 0) + (b.id ? 1 : 0) === 1, "запущено ровно одно задание", a.r.text + " | " + b.r.text);
-    const loser = a.id ? b : a;
-    ok(/уже идёт задание/.test(loser.r.text), "второй получил отказ", loser.r.text);
-    await waitDone(a.id ? B : B2, a.id || b.id);
+    // team-v48 Г6: исключительность генерации на карточку — разные задания одной папки не блокируют друг друга.
+    ok(a.id && b.id && !a.r.isError && !b.r.isError, "оба задания в одной папке запущены", a.r.text + " | " + b.r.text);
+    await Promise.all([waitDone(B, a.id), waitDone(B2, b.id)]);
   } finally { await B2.client.close(); }
 });
 
@@ -664,6 +715,50 @@ test("новый файл появился в последний момент �
     ok(p.isError && /появился/.test(p.text), "отказ: файл появился", p.text);
     ok(fs.readFileSync(target, "utf8") === "ЧУЖОЕ", "чужой файл не перезаписан");
   } finally { await B7.client.close(); }
+});
+
+test("team-v48e (ревью п.2): цель перенаправлена между захватом замков и записью — перенос отменён", async () => {
+  const B9 = await startBridge({ MOST_TEST_PUBLISH_DELAY_MS: "3000" });
+  try {
+    const A = project({}), Bdir = project({});
+    const sub = path.join(A, "sub"); // mkdirSync создаст его перед задержкой; в окне публикации подменим на junction→Bdir
+    const target = path.join(sub, "out.txt");
+    const { id } = await poruchit(B9, { folder: A, task: "[[FAKE:literal:" + b64("НАШ ТЕКСТ") + "]]" });
+    await waitDone(B9, id);
+    const pending = call(B9, "antigravity_apply", { id: id, to: target });
+    // Ждём, пока перенос создаст sub и войдёт в окно публикации (задержка), затем перенаправляем sub в чужой проект Bdir.
+    for (let i = 0; i < 400; i++) { try { if (fs.existsSync(sub) && fs.lstatSync(sub).isDirectory() && !fs.lstatSync(sub).isSymbolicLink()) break; } catch (e) {} await sleep(25); }
+    let swapped = false;
+    try { fs.rmdirSync(sub); fs.symlinkSync(Bdir, sub, isWindows ? "junction" : "dir"); swapped = true; } catch (e) {}
+    const p = await pending;
+    if (!swapped) { skip("junction создать нельзя — подмену пути не проверить"); return; }
+    // Замки держат A и A\sub\out.txt; фактический путь ушёл в Bdir — запись отклонена, чужой проект не тронут.
+    ok(p.isError && /сместилась|перенос отменён|не изменён/.test(p.text), "перенаправление цели — отказ", p.text);
+    ok(!fs.existsSync(path.join(Bdir, "out.txt")), "в чужой проект Bdir ничего не записано", fs.readdirSync(Bdir).join(","));
+  } finally { await B9.client.close(); }
+});
+
+test("team-v48e (ревью п.2): перезапись перенаправлена между проверкой и записью — ни временный, ни итоговый файл в B", async () => {
+  const B10 = await startBridge({ MOST_TEST_PUBLISH_DELAY_MS: "3000" });
+  try {
+    const A = project({}), Bdir = project({});
+    const sub = path.join(A, "sub"); fs.mkdirSync(sub);
+    const target = path.join(sub, "out.txt"); fs.writeFileSync(target, "ИСХОДНОЕ"); // существующий файл → ветка replaceFileAtomic
+    const { id } = await poruchit(B10, { folder: A, task: "[[FAKE:literal:" + b64("НОВОЕ") + "]]" });
+    await waitDone(B10, id);
+    const pending = call(B10, "antigravity_apply", { id: id, to: target, overwrite: true });
+    // Ждём фазу записи (applying), затем перенаправляем sub в чужой проект Bdir (rename непустой папки + junction).
+    const cardFile = path.join(STATE, "jobs", id, "card.json");
+    for (let i = 0; i < 400; i++) { let s; try { s = JSON.parse(fs.readFileSync(cardFile, "utf8")).status; } catch (e) {} if (s === "applying") break; await sleep(25); }
+    let swapped = false;
+    try { fs.renameSync(sub, sub + "_bak"); fs.symlinkSync(Bdir, sub, isWindows ? "junction" : "dir"); swapped = true; } catch (e) {}
+    const p = await pending;
+    if (!swapped) { skip("junction создать нельзя — подмену пути не проверить"); return; }
+    // verify() идёт ПЕРЕД writeTmp(): связка «цель↔замок» сломана — временный файл не создаётся, перенос отклонён.
+    ok(p.isError && /сместилась|перенос отменён|не изменён/.test(p.text), "перенаправление перезаписи — отказ", p.text);
+    ok(fs.readdirSync(Bdir).length === 0, "в чужой проект Bdir ничего не записано (ни временный, ни итоговый)", fs.readdirSync(Bdir).join(","));
+    ok(fs.readFileSync(path.join(sub + "_bak", "out.txt"), "utf8") === "ИСХОДНОЕ", "исходный файл не тронут");
+  } finally { await B10.client.close(); }
 });
 
 test("в журнал не попадают тексты ответа, stderr и ошибки", async () => {

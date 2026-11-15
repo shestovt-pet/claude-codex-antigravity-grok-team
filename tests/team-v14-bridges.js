@@ -94,13 +94,14 @@ test('12н: замена необязательного помощника от�
   }
   assert(!require('../common/team-store').list('grok', false).jobs.some(j => j.work === w.name));
 });
-test('13: origin, realpath, 100/200 КБ, битый JSON, пустой список и отключение', () => {
+test('13: origin, realpath, битый JSON, пустой список, отключение; пределы 100/200 КБ сняты (team-v48e Г7 §2.5/4a)', () => {
   const file = path.join(project, '.most/opora.json');
   json(file, [{ path: 'canon.txt', section: 'канон' }]); assert.throws(() => support.support(project), /origin/);
   write(file, '{'); assert.throws(() => support.support(project), /JSON/); assert.deepEqual(support.support(project, false), []);
   json(file, []); assert.deepEqual(support.support(project), []);
-  write(path.join(project, 'large'), Buffer.alloc(100 * 1024 + 1)); json(file, [{ path: 'large', section: 'канон', origin: 'x' }]); assert.throws(() => support.support(project), /100 КБ/);
-  write(path.join(project, 'small'), Buffer.alloc(80 * 1024)); json(file, Array.from({ length: 3 }, () => ({ path: 'small', section: 'свобода', origin: 'x' }))); assert.throws(() => support.support(project), /200 КБ/);
+  // team-v48e Г7 (§2.5, 4a): жёсткие пределы опоры 100 КБ/файл и 200 КБ/сумма сняты безусловно — большие опоры принимаются без отказа по размеру, материал доставляется.
+  write(path.join(project, 'large'), Buffer.alloc(100 * 1024 + 1)); json(file, [{ path: 'large', section: 'канон', origin: 'x' }]); assert.equal(support.support(project).length, 1);
+  write(path.join(project, 'small'), Buffer.alloc(80 * 1024)); json(file, Array.from({ length: 3 }, () => ({ path: 'small', section: 'свобода', origin: 'x' }))); assert.equal(support.support(project).length, 3);
   const outside = path.join(RUN, 'outside'); fs.mkdirSync(outside); write(path.join(outside, 'x'), 'outside'); fs.symlinkSync(outside, path.join(project, 'link'), process.platform === 'win32' ? 'junction' : 'dir');
   json(file, [{ path: 'link/x', section: 'канон', origin: 'x' }]); assert.throws(() => support.support(project), /вне папки/); json(file, []);
 });

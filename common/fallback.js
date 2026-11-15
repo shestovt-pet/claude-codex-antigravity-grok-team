@@ -157,17 +157,23 @@ function guard(server, tool, a = {}) {
   if ((tool === 'team_word' && a.action !== 'list') || send || tool === 'antigravity_apply' || /_cancel$/.test(tool)) {
     const proof = jobProof();
     // team-v36: из поручения-сеанса — только подпоручение *_send по правилам job-chain (только чтение, глубина и бюджет).
-    if (!proof.ok && proof.job && send && client === server) throw Error(deny('Подпоручение своему же серверу из поручения запрещено.'));
+    // team-v48e Г4b-2b: запрет «подпоручение своему же серверу» снят безусловно — цикл A→A ловит lineageRefusal в admit
+    // (ниже, §D). jobProof (подлинность сеанса) — всегда.
     if (!proof.ok && proof.job && send && tool !== 'team_word') { require('./job-chain').admit(server, tool, a); return; }
+    // team-v48 Г4d (§D.3): отмена из поручения-сеанса допустима только для своих потомков (parentJob-путь ведёт к MOST_JOB_ID);
+    // отмена предка/чужой карточки — отказ (защита stop-confirm родителя). Прежде *_cancel из поручения вовсе не проходил.
+    if (!proof.ok && proof.job && /_cancel$/.test(tool)) { require('./job-chain').assertDescendant(a.id || a.nomer); return; }
     if (!proof.ok) throw Error(proofRefusal(proof, 'Поручение-сеанс этого не делает: слово, поручения и перенос — только из чата; '));
   }
   // team-v25: jobProof выше обязателен для каждой отправки и отмены.
   // В активном запасном режиме сохраняются прежние права дирижёра.
+  // Чат Codex управляет своим сервером и вне запасного режима (team-v25); codex_cancel своих поручений — тоже (Г4d обобщит на цепочку).
   if (client === 'codex' && server === 'codex' &&
       ['codex_send', 'codex_status', 'codex_result', 'codex_cancel'].includes(tool) &&
       (!words().mode().active || ['codex_status', 'codex_result'].includes(tool))) return;
-  const own = SEATS.includes(client) && client === server;
-  if (own || tool === 'antigravity_apply' || /_cancel$/.test(tool)) {
+  // team-v48e Г4b-2b: запрет «свой сервер — только у дирижёра» снят безусловно — гость пользуется сервером своей семьи.
+  // Перенос и отмена (antigravity_apply/_cancel) остаются у дирижёра запасного режима всегда (§D/Г4d).
+  if (tool === 'antigravity_apply' || /_cancel$/.test(tool)) {
     const s = session(a);
     if (!s?.active) throw Error(deny('Сервер своей семьи, перенос и отмена — только у дирижёра запасного режима (rules/fallback.md).'));
   }
@@ -530,9 +536,11 @@ function continuation(w, old, a, jobs) {
   return { stages, plan_change: 'продолжение этапа Claude в запасном режиме, снимок ' + s0.word.id + '; снят этап ' + id };
 }
 // Состояние папки для списка записанных файлов поручения Codex с записью: путь → размер и время; .git и node_modules — мимо.
-// Больше 50 000 файлов — список не ведётся (null): такие файлы считаются тронутыми (отказ по умолчанию).
-function folderState(folder, limit = 50000) { return folderStateDetailed(folder, limit).state; }
-function folderStateDetailed(folder, limit = 50000) {
+// team-v48e Г7 (§2.5/§2.10, круг 2): предел 50 000 файлов снят безусловно — учёт всех файлов без предела (прежде >50 000
+// давало state=null → файлы считались тронутыми → отказ по умолчанию для большой папки). Подлинность путей (.git/node_modules
+// мимо, симлинки мимо) сохранена.
+function folderState(folder) { return folderStateDetailed(folder).state; }
+function folderStateDetailed(folder) {
   const out = new Map(), stack = [''], errors = [];
   while (stack.length) {
     const rel = stack.pop();
@@ -544,7 +552,6 @@ function folderStateDetailed(folder, limit = 50000) {
       if (e.isDirectory()) { stack.push(r); continue; }
       if (!e.isFile()) continue;
       try { const st = fs.statSync(path.join(folder, r)); out.set(r, st.size + ':' + st.mtimeMs); } catch (e) { errors.push({ path: r, op: 'statSync', code: e.code || e.message }); }
-      if (out.size > limit) return { state: null, errors };
     }
   }
   return { state: out, errors };
@@ -575,8 +582,11 @@ function queueHold(card) {
   // Слово имеет приоритет: fromChat никогда не снимает удержание запасного режима.
   if (!card.fallbackWord) {
     if (card.parentJob) return require('./job-chain').queuedRefusal(card, undefined, 'codex') || '';
-    if (card.fromChat === 'codex' && card.from === 'codex' && card.fullAccess !== true) return '';
-    return 'запись из очереди — только по поручению дирижёра запасного режима или чата Codex';
+    // team-v48e Г4a: папочная защита снята безусловно — карточка чата Codex подхватывается очередью независимо от fullAccess.
+    if (card.fromChat === 'codex' && card.from === 'codex') return '';
+    // team-v48e Г4c: пишущее поручение гостя подхватывается очередью безусловно (тумблер MOST_GUEST_STRICT удалён).
+    // Ветка запасного режима ниже (слово) — всегда, не под переменной.
+    return '';
   }
   if (!m.active) return 'запасной режим снят — запись по поручению дирижёра ждёт Claude';
   if (m.entry.id !== card.fallbackWord) return 'дирижёр запасного режима сменился — запись ждёт нового поручения';

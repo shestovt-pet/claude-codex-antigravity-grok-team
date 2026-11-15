@@ -70,7 +70,7 @@ run([
       assert.equal(card.model, 'deepseek-v4-flash');
       const rr = await c.callTool({ name: 'deepseek_result', arguments: { id, wait_sec: 5 } });
       assert.match((rr.content || []).map(x => x.text || '').join('\n'), /ОК/, 'ответ через deepseek_result');
-      // Гость (Codex) не может просить запись.
+      // Гость-чат без доказательства (Codex) не проходит fallback.guard (подпись места — всегда); серверный бан записи — Г4c-2, проверяется юнитом.
       const gTransport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/deepseek/index.js')], stderr: 'pipe',
         env: { ...process.env, MOST_CLIENT: 'codex', MOST_REPO_ROOT: runDir, MOST_STATE_DIR: state, MOST_DEEPSEEK_JOBS_DIR: path.join(state, 'deepseek-jobs'), MOST_DSH_NO_PROFILES: '1', MOST_PROBE_ONLY: '1' } });
       const gc = new Client({ name: 'v31g', version: '1' });
@@ -80,6 +80,45 @@ run([
         assert(wr.isError); assert.match((wr.content || []).map(x => x.text || '').join('\n'), /Гостю это действие запрещено|Запись DeepSeek может просить/);
       } finally { await gc.close(); }
     } finally { await c.close(); }
+  }],
+  ['team-v48e Г4c: deepseek fullAccessAllowed и бан записи гостю сняты безусловно (тумблер MOST_GUEST_STRICT удалён)', async () => {
+    const ROOT = path.resolve(__dirname, '..'), Module = require('module'), file = path.join(ROOT, 'servers/deepseek/index.js');
+    const src = fs.readFileSync(file, 'utf8'), end = src.indexOf('\n(async () => {');
+    assert(end > 0);
+    const m = new Module(file, module); m.filename = file; m.paths = Module._nodeModulePaths(path.dirname(file));
+    m._compile(src.slice(0, end) + '\nmodule.exports = { fullAccessAllowed };', file);
+    const api = m.exports;
+    // (1) fullAccessAllowed: полный доступ гостю/подпоручению/чату безусловно; даже при выставленной прежней переменной остаётся открыт.
+    for (const patch of [{ from: 'antigravity' }, { parentJob: 'p1' }, { fallbackWord: 'w' }, { fromChat: 'deepseek', from: 'deepseek' }]) {
+      const card = { role: 'совет', write: true, fullAccess: true, from: 'claude', ...patch };
+      assert(api.fullAccessAllowed(card), 'полный доступ: ' + JSON.stringify(patch));
+      process.env.MOST_GUEST_STRICT = '1';
+      try { assert(api.fullAccessAllowed(card), 'MOST_GUEST_STRICT не ограничивает: ' + JSON.stringify(patch)); } finally { delete process.env.MOST_GUEST_STRICT; }
+    }
+    // Намерение (write=true, роль текст/совет) остаётся всегда — без него полного доступа нет и по умолчанию.
+    assert(!api.fullAccessAllowed({ role: 'совет', write: false, fullAccess: true }));
+    assert(!api.fullAccessAllowed({ role: 'проверка', write: true, fullAccess: true }));
+    // (2) Реальный обработчик: гость deepseek_send с write к существующей абсолютной папке — поручение принято
+    // (серверный бан записи гостю снят безусловно, тумблер MOST_GUEST_STRICT удалён); относительная папка — отказ того же
+    // обработчика «Нужна абсолютная существующая папка» (подлинность пути, не бан гостя). Без срезов и подмен (§4).
+    const { Client } = require('@modelcontextprotocol/sdk/client/index.js'), { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
+    const runDir = tmp(), state = path.join(runDir, 'state'), folder = path.join(runDir, 'work');
+    fs.mkdirSync(folder, { recursive: true }); fs.mkdirSync(path.join(state, 'ready'), { recursive: true });
+    // Доказанный чат-гость: запись основного сервера team и фейковое дерево процессов (без pid основного сервера) — jobProof.ok.
+    fs.writeFileSync(path.join(state, 'ready', 'team.json'), JSON.stringify({ pid: 7000, release: ROOT, startedAt: new Date(Date.now() - 3600000).toISOString() }));
+    const transport = new StdioClientTransport({ command: process.execPath, args: [file], stderr: 'pipe',
+      env: { ...process.env, NODE_ENV: 'test', MOST_CLIENT: 'codex', MOST_PROBE_ONLY: '1', MOST_PROBE_GUEST: 'full',
+        MOST_TEST_PROCESS_TREE: JSON.stringify([{ pid: 'self', ppid: 4100, name: 'node.exe' }, { pid: 4100, ppid: 1, name: 'codex.exe' }]),
+        MOST_REPO_ROOT: runDir, MOST_STATE_DIR: state, MOST_DEEPSEEK_JOBS_DIR: path.join(state, 'deepseek-jobs'), MOST_DSH_NO_PROFILES: '1' } });
+    const gc = new Client({ name: 'v31w', version: '1' }); await gc.connect(transport);
+    try {
+      const txt = r => (r.content || []).map(x => x.text || '').join('\n');
+      const ok = await gc.callTool({ name: 'deepseek_send', arguments: { folder, task: 'Пиши', write: true } });
+      assert(!ok.isError, 'запись гостю открыта: ' + txt(ok));
+      assert.match(txt(ok), /очередь|Запросите deepseek_result/i);
+      const bad = await gc.callTool({ name: 'deepseek_send', arguments: { folder: 'относительная', task: 'Пиши', write: true } });
+      assert(bad.isError); assert.match(txt(bad), /Нужна абсолютная существующая папка/);
+    } finally { await gc.close(); }
   }],
   ['Профили: most-read/most-review/most-write/most-full из реестра, без MCP', () => {
     const dir = tmp(), profiles = require('../common/dsh-profiles');
@@ -274,13 +313,20 @@ run([
     // Решение пользователя: fail-fast — rollback бросает, CLI выходит ненулевым кодом (замысел team-v47, разд. 13.4).
     await assert.rejects(() => d.rollback({ root, configs: [file], configOnly: true }), /Откат невозможен.*новых ворот.*deepseek/);
   }],
-  ['agy-tools: маски deepseek_send/result/status/cancel и запрет write', () => {
+  ['team-v48e agy-tools: маски deepseek_send/result/status/cancel; вторая маска (write/cancel) снята безусловно', () => {
     const a = require('../common/agy-tools');
     assert(a.allowed({ name: 'deepseek_send', args: { folder: 'x' } }, ['deepseek/deepseek_send']));
     assert(a.allowed({ name: 'deepseek_result', args: { id: 'x' } }, ['deepseek/deepseek_result']));
-    assert(!a.allowed({ name: 'deepseek_cancel', args: { id: 'x' } }, ['deepseek/deepseek_cancel']), 'deepseek_cancel из Antigravity запрещён');
     assert(a.allowed({ name: 'deepseek_status', args: {} }, ['deepseek/deepseek_status']));
-    assert(!a.allowed({ name: 'deepseek_send', args: { write: true } }, ['deepseek/deepseek_send']), 'write из Antigravity запрещён');
+    // team-v48e Г4e: вторая маска (пишущий send, deepseek_cancel) снята безусловно — решает только mcp_allow; тумблер MOST_STRICT_REGISTRY удалён.
+    assert(a.allowed({ name: 'deepseek_cancel', args: { id: 'x' } }, ['deepseek/deepseek_cancel']), 'deepseek_cancel по маске допустим');
+    assert(a.allowed({ name: 'deepseek_send', args: { write: true } }, ['deepseek/deepseek_send']), 'write по маске допустим');
+    // Даже при выставленной прежней переменной вторая маска не возвращается — тумблер удалён.
+    process.env.MOST_STRICT_REGISTRY = '1';
+    try {
+      assert(a.allowed({ name: 'deepseek_cancel', args: { id: 'x' } }, ['deepseek/deepseek_cancel']), 'MOST_STRICT_REGISTRY не ограничивает deepseek_cancel');
+      assert(a.allowed({ name: 'deepseek_send', args: { write: true } }, ['deepseek/deepseek_send']), 'MOST_STRICT_REGISTRY не ограничивает write');
+    } finally { delete process.env.MOST_STRICT_REGISTRY; }
     assert(!a.allowed({ name: 'mcp_team_team_change' })); assert(a.forbidden({ name: 'mcp_team_team_change' }));
     assert(a.allowed({ name: 'call_mcp_tool', args: { server: 'deepseek', tool: 'deepseek_status' } }, ['deepseek/deepseek_status']));
   }],
@@ -370,7 +416,7 @@ run([
       await f.accept(a); assert.equal(a.s.state, 'принят', 'отказ закрыт собственным ПРИНЯТО, пауза его не поднимает');
     } finally { reset(); }
   }],
-  ['Очередь: отказ по вложенной папке освобождает замок codex_folder', async () => {
+  ['Очередь: замок записи вложенной папки держит поручение в очереди; снятие замка — запускает (team-v48e Г4a: папочный запрет корня снят, но физический замок записи сохранён)', async () => {
     const ROOT = path.resolve(__dirname, '..'), runDir = tmp(), state = path.join(runDir, 'state');
     fs.mkdirSync(path.join(state, 'deepseek-jobs'), { recursive: true });
     fs.mkdirSync(path.join(state, 'codex-jobs'), { recursive: true });
@@ -378,25 +424,31 @@ run([
     f.json(path.join(state, 'codex-jobs', 'cx.json'), { id: 'cx', status: 'running', write: true, folder: A, startedAt: new Date().toISOString() });
     f.json(path.join(state, 'deepseek-jobs', 'ds.json'), { id: 'ds', status: 'queued', write: true, folder: B, task: 'пиши', from: 'claude', startedAt: new Date().toISOString() });
     fs.writeFileSync(path.join(runDir, 'fake.cmd'), '@echo off\r\n');
+    // Физический замок записи папки A удерживается живым процессом (эмулируем running-писателя cx): вложенная папка B
+    // конфликтует по realpath в обе стороны. Г4a снял папочный запрет корня связки, но замок записи (защита от двух
+    // одновременных писателей в пересекающихся папках) — сохраняемая гарантия, не лимит: поручение ждёт в очереди, не падает.
+    const canon = require('../common/paths').canon;
+    const lockDir = path.join(state, 'locks', 'write'); fs.mkdirSync(lockDir, { recursive: true });
+    const lockFile = path.join(lockDir, crypto.createHash('sha256').update(canon(A)).digest('hex').slice(0, 40) + '.json');
+    fs.writeFileSync(lockFile, JSON.stringify({ folder: canon(A), jobId: 'cx', instance: crypto.randomUUID(), pid: process.pid, since: new Date().toISOString() }));
     const store = require('../common/members-store').create(state); store.read();
     store.update(store.read().rev, n => { const d = n.members.find(m => m.id === 'deepseek'); d.adapter_params = { path: path.join(runDir, 'fake.cmd'), models: { read: 'deepseek-v4-flash', review: 'deepseek-v4-pro' }, auth: 'saved' }; d.roles = { ...d.roles, receives: true, sends: true, writer: true, voter: true }; }, meta, { phase: 'B' });
     const { Client } = require('@modelcontextprotocol/sdk/client/index.js'), { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
     const transport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/deepseek/index.js')], stderr: 'pipe',
-      env: { ...process.env, NODE_ENV: 'test', MOST_CLIENT: 'claude', MOST_REPO_ROOT: runDir, MOST_STATE_DIR: state, MOST_DEEPSEEK_JOBS_DIR: path.join(state, 'deepseek-jobs'), MOST_DSH_NO_PROFILES: '1', MOST_DSH_VERSION: '0.2.1-rc.2' } });
+      env: { ...process.env, NODE_ENV: 'test', MOST_CLIENT: 'claude', MOST_REPO_ROOT: runDir, MOST_STATE_DIR: state, MOST_DEEPSEEK_JOBS_DIR: path.join(state, 'deepseek-jobs'), MOST_DSH_NO_PROFILES: '1', MOST_DSH_VERSION: '0.2.1-rc.2', MOST_QUEUE_TICK_MS: '150' } });
     const c = new Client({ name: 'v31lock', version: '1' });
     await c.connect(transport);
     await serverReady(state, transport.pid);
+    const read = () => JSON.parse(fs.readFileSync(path.join(state, 'deepseek-jobs', 'ds.json'), 'utf8'));
     try {
-      let card = {};
-      for (let i = 0; i < 50; i++) {
-        card = JSON.parse(fs.readFileSync(path.join(state, 'deepseek-jobs', 'ds.json'), 'utf8'));
-        if (card.status !== 'queued') break;
-        await new Promise(res => setTimeout(res, 100));
-      }
-      assert.equal(card.status, 'failed', 'конфликт вложенной папки');
-      const l = await require('../common/locks').tryLock('codex_folder', require('../common/paths').canon(B), { jobId: 'test' });
-      assert.equal(l.ok, true, 'замок codex_folder освобождён после отказа');
-      if (l.ok) await l.release();
+      // Пока замок записи A держится — ds остаётся queued (не running, не failed): конфликт пересекающихся папок удерживает очередь.
+      for (let i = 0; i < 10; i++) await new Promise(res => setTimeout(res, 100));
+      assert.equal(read().status, 'queued', 'замок записи вложенной папки держит поручение в очереди, не роняя его');
+      // Снятие замка записи — та же карточка запускается очередью (status покидает queued).
+      fs.unlinkSync(lockFile);
+      let card = read();
+      for (let i = 0; i < 60 && card.status === 'queued'; i++) { await new Promise(res => setTimeout(res, 100)); card = read(); }
+      assert.notEqual(card.status, 'queued', 'после снятия замка записи поручение покидает очередь (запускается)');
     } finally { await c.close(); }
   }],
   ['Схемы: reconsider_by_other принимается в этапе, у team_change есть действие reconsider с review_job_id', () => {

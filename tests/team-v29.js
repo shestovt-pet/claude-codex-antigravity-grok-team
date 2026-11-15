@@ -557,6 +557,32 @@ test('О5: Antigravity send и перенос отказывают после р
   finally { word.mode = original; }
   await unlocked(state); const l = await locks.tryLock('apply', require('../common/paths').canonMaybe(target), {}, state); assert(l.ok); await l.release(); await clearJobs(h, 'antigravity');
 });
+test('team-v48e Г4c: перенос гостевого результата и очередь переноса без слова — безусловно (тумблер MOST_GUEST_STRICT удалён)', async () => {
+  const h = executorHarness('antigravity'), state = path.join(RUN, 'state'); await clearJobs(h, 'antigravity');
+  const mk = (id, extra) => { const folder = (fs.mkdirSync(process.env.MOST_TEST_OUTSIDE || require('os').tmpdir(), { recursive: true }), fs.mkdtempSync(path.join(process.env.MOST_TEST_OUTSIDE || require('os').tmpdir(), 'v29-g4c-'))); const file = path.join(state, 'jobs', id, 'card.json'); json(file, { id, status: 'done', papka: folder, draftPath: path.join(folder, '_draft.txt'), rezhim: 'tekst', from: 'codex', startedAt: ago(1), ...extra }); write(path.join(path.dirname(file), 'result.txt'), 'результат ' + id); return { folder, file }; };
+  // (1) Основной сервер переносит проверенный гостевой результат (from=codex) безусловно — даже при выставленной прежней переменной.
+  { const { folder } = mk('g4c-guest'); const target = path.join(folder, 'out.txt');
+    process.env.MOST_GUEST_STRICT = '1';
+    let out; try { out = await h.apply({ nomer: 'g4c-guest', kuda: target }); } finally { delete process.env.MOST_GUEST_STRICT; }
+    assert(!out.isError, 'MOST_GUEST_STRICT не запрещает перенос гостевого результата: ' + out.content[0].text);
+    assert(fs.existsSync(target)); assert.equal(fs.readFileSync(target).toString(), 'результат g4c-guest'); }
+  // (2) Очередь переноса без слова (word=null) идёт сразу, без активного запасного режима.
+  { const { folder, file } = mk('g4c-queue', { from: 'claude' }); const target = path.join(folder, 'q.txt');
+    json(file, { ...read(file), applyRequest: { kuda: target, word: null, at: new Date().toISOString() } });
+    await h.queue(); assert.equal(read(file).status, 'applied'); assert(read(file).applyRequest.done); assert.equal(fs.readFileSync(target).toString(), 'результат g4c-queue'); }
+  // (3) Гость/подпоручение переносит вне запасного режима безусловно: applyRequest без слова, даже при выставленной переменной.
+  { const { file } = mk('g4c-branch'); const before = process.env.MOST_CLIENT; process.env.MOST_CLIENT = 'codex';
+    try {
+      const r = await h.apply({ nomer: 'g4c-branch', kuda: null });
+      assert(!r.isError, r.content[0].text); assert.match(r.content[0].text, /поставлен в очередь основного сервера/); assert.equal(read(file).applyRequest.word, null);
+      // Даже при выставленной прежней переменной отказа «только в запасном режиме» нет — тумблер удалён.
+      process.env.MOST_GUEST_STRICT = '1';
+      try { const s = await h.apply({ nomer: 'g4c-branch', kuda: null }); assert.doesNotMatch(s.content?.[0]?.text || '', /только в запасном режиме/); }
+      finally { delete process.env.MOST_GUEST_STRICT; }
+    } finally { if (before === undefined) delete process.env.MOST_CLIENT; else process.env.MOST_CLIENT = before; }
+  }
+  await clearJobs(h, 'antigravity');
+});
 test('О4–О5: очередь Antigravity — гостевые queued, квота и transient без потери карточки', async () => {
   const h = executorHarness('antigravity'), state = path.join(RUN, 'state');
   for (const [status, retryKind] of [['queued', null], ['waiting_quota', 'quota'], ['waiting_quota', 'transient']]) {
@@ -565,6 +591,69 @@ test('О4–О5: очередь Antigravity — гостевые queued, кво�
     const p = await hold.begin(state, { runId: id }); await h.queue(); assert.equal(read(file).status, status); await hold.abort(state, p); await h.queue(); assert.equal(read(file).status, 'running');
     if (retryKind) assert.equal(read(file)[retryKind === 'quota' ? 'quotaAttempts' : 'transientAttempts'], 1);
     await clearJobs(h, 'antigravity'); await unlocked(state);
+  }
+});
+test('Г5 (§13.B.5): пауза получателя (слово или реестр) держит карточку queued; снятие — запускает', async () => {
+  const members = require('../common/members'), word = require('../common/user-word'), locks = require('../common/locks');
+  const state = path.join(RUN, 'state');
+  // (1) recipientPaused по слову пользователя о недоступности.
+  { const o = word.active; word.active = who => who === 'codex' ? { who_down: 'codex', at: new Date().toISOString() } : null;
+    try { assert(members.recipientPaused('codex'), 'слово — пауза'); assert(!members.recipientPaused('antigravity')); } finally { word.active = o; } }
+  // (2) recipientPaused по ручной паузе реестра в фазе B.
+  { const store = require('../common/members-store').create(state); store.read();
+    store.update(members.rev(), () => {}, { action: 'phase', who: 'claude', reason: 'B' }, { phase: 'B' });
+    store.update(members.rev(), n => { const m = n.members.find(x => x.id === 'codex'); m.state = 'paused'; m.pause = { kind: 'manual', scope: 'participant', since: new Date().toISOString(), until: null, next_probe: null }; }, { action: 'pause', who: 'claude', reason: 'пауза' });
+    try { assert(members.recipientPaused('codex'), 'ручная пауза B'); } finally {
+      store.update(members.rev(), n => { const m = n.members.find(x => x.id === 'codex'); m.state = 'active'; m.pause = null; }, { action: 'resume', who: 'claude', reason: 'снято' });
+      store.update(members.rev(), () => {}, { action: 'phase', who: 'claude', reason: 'A' }, { phase: 'A' });
+    } }
+  // (3) Очередь codex: пауза по слову держит queued, снятие — running.
+  { const h = executorHarness('codex'); await clearJobs(h, 'codex'); const folder = fresh('g5-codex'), id = 'g5-codex';
+    json(path.join(state, 'codex-jobs', id + '.json'), { id, folder, write: false, from: 'claude', status: 'queued', task: 'тест', startedAt: ago(1) });
+    const o = word.active; word.active = who => who === 'codex' ? { who_down: 'codex' } : null;
+    try { await h.queue(); assert.equal(h.load(id).status, 'queued', 'codex на паузе — queued'); } finally { word.active = o; }
+    await h.queue(); assert.equal(h.load(id).status, 'running', 'codex после снятия — running');
+    await clearJobs(h, 'codex'); }
+  // (4) Очередь antigravity: то же.
+  { const h = executorHarness('antigravity'); await clearJobs(h, 'antigravity'); const folder = fresh('g5-agy'), id = 'g5-agy', file = path.join(state, 'jobs', id, 'card.json');
+    json(file, { id, status: 'queued', retryKind: null, papka: folder, papkaCanon: require('../common/paths').canon(folder), from: 'codex', owner: locks.owner(), startedAt: ago(1), nextAttemptAt: ago(1), retry: { args: [] } });
+    const o = word.active; word.active = who => who === 'antigravity' ? { who_down: 'antigravity' } : null;
+    try { await h.queue(); assert.equal(read(file).status, 'queued', 'antigravity на паузе — queued'); } finally { word.active = o; }
+    await h.queue(); assert.equal(read(file).status, 'running', 'antigravity после снятия — running');
+    await clearJobs(h, 'antigravity'); }
+});
+test('team-v48e (ревью п.3): пауза получателя определяется по адаптеру сервера, а не по совпадению id==сервер', async () => {
+  const members = require('../common/members'), state = path.join(RUN, 'state');
+  const store = require('../common/members-store').create(state); store.read();
+  store.update(members.rev(), () => {}, { action: 'phase', who: 'claude', reason: 'B' }, { phase: 'B' });
+  // Переименованный участник: id 'codex-cli-2' при адаптере codex-cli (сервер codex). Прежний paused('codex') дал бы TypeError в B.
+  store.update(members.rev(), n => { const m = n.members.find(x => x.id === 'codex'); m.id = 'codex-cli-2'; m.state = 'paused'; m.pause = { kind: 'manual', scope: 'participant', since: new Date().toISOString(), until: null, next_probe: null }; }, { action: 'pause', who: 'claude', reason: 'пауза' });
+  try {
+    assert.doesNotThrow(() => members.recipientPaused('codex'), 'нет TypeError при id≠сервер');
+    assert(members.recipientPaused('codex'), 'пауза найдена по адаптеру codex-cli');
+  } finally {
+    store.update(members.rev(), n => { const m = n.members.find(x => x.id === 'codex-cli-2'); m.id = 'codex'; m.state = 'active'; m.pause = null; }, { action: 'resume', who: 'claude', reason: 'снято' });
+    store.update(members.rev(), () => {}, { action: 'phase', who: 'claude', reason: 'A' }, { phase: 'A' });
+  }
+});
+test('team-v48e (ревью п.4): ручная пауза держит карточку даже при fallbackWord; слово о недоступности — нет', async () => {
+  const members = require('../common/members'), word = require('../common/user-word'), locks = require('../common/locks'), state = path.join(RUN, 'state');
+  // Предикат: ручная пауза держит и при fallbackWord; слово о недоступности при fallbackWord — не держит (восстановление дирижёра).
+  { const o = word.active; word.active = who => who === 'codex' ? { who_down: 'codex' } : null;
+    try { assert(members.recipientPaused('codex'), 'слово держит без fallbackWord'); assert(!members.recipientPaused('codex', 'w1'), 'слово снимается fallbackWord'); } finally { word.active = o; } }
+  const store = require('../common/members-store').create(state); store.read();
+  store.update(members.rev(), () => {}, { action: 'phase', who: 'claude', reason: 'B' }, { phase: 'B' });
+  store.update(members.rev(), n => { const m = n.members.find(x => x.id === 'codex'); m.state = 'paused'; m.pause = { kind: 'manual', scope: 'participant', since: new Date().toISOString(), until: null, next_probe: null }; }, { action: 'pause', who: 'claude', reason: 'пауза' });
+  try {
+    assert(members.recipientPaused('codex', 'w1'), 'ручная пауза держит и при fallbackWord');
+    // Очередь codex: карточка дирижёра (fallbackWord) при РУЧНОЙ паузе остаётся queued.
+    const h = executorHarness('codex'); await clearJobs(h, 'codex'); const folder = fresh('p4-codex'), id = 'p4-codex';
+    json(path.join(state, 'codex-jobs', id + '.json'), { id, folder, write: false, from: 'claude', status: 'queued', task: 'тест', fallbackWord: 'w1', startedAt: ago(1) });
+    await h.queue(); assert.equal(h.load(id).status, 'queued', 'fallbackWord + ручная пауза — карточка остаётся queued');
+    await clearJobs(h, 'codex');
+  } finally {
+    store.update(members.rev(), n => { const m = n.members.find(x => x.id === 'codex'); m.state = 'active'; m.pause = null; }, { action: 'resume', who: 'claude', reason: 'снято' });
+    store.update(members.rev(), () => {}, { action: 'phase', who: 'claude', reason: 'A' }, { phase: 'A' });
   }
 });
 test('О6т: все входы закрытия проходят протокол, включая CLI без --result и запасной режим', async () => {

@@ -11,7 +11,8 @@ const write = (f, s) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs
 const json = (f, v) => write(f, JSON.stringify(v, null, 2));
 const read = f => JSON.parse(fs.readFileSync(f, 'utf8'));
 const LINE = 'Доступ: полный (от имени пользователя, без песочницы); изменения вне папки поручения в список изменённых файлов не попадают';
-const BRIEF = 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; не изменяй файлы связки (E:\\most, C:\\most, E:\\test-most); удаления запрещены; каждое действие вне папки поручения перечисли в отчёте.';
+// team-v48 Г4a: оговорка «не изменяй файлы связки (…); удаления запрещены» снята из брифа полного доступа.
+const BRIEF = 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; каждое действие вне папки поручения перечисли в отчёте.';
 let RUN, REPO, STATE, PROJECT, JOBS, LOG, RELEASE;
 if (CASE !== undefined) {
   RUN = fs.mkdtempSync(path.join(__dirname, '.tmp-v22-'));
@@ -109,35 +110,49 @@ test('О2: равенство, вложенность, регистр, .., др�
     assert(fs.existsSync(other), 'Для проверки другого диска нужен существующий корень ' + other);
     assert(!paths.isSameOrInsideReal(other, REPO));
   }
+  // team-v48e Г4a: папочный запрет снят безусловно — полный доступ в папки связки/релиза теперь проходит; остаётся только
+  // подлинность пути («абсолютная существующая папка»).
   await withMcp(async c => {
     for (const folder of [REPO, path.join(REPO, '.work/x'), path.join(REPO, 'live/hash'), RELEASE, path.join(RELEASE, 'common')]) {
-      fs.mkdirSync(folder, { recursive: true }); await refuse(c, { folder }, /Полный доступ запрещён/);
+      fs.mkdirSync(folder, { recursive: true }); const j = await send(c, { folder }); await settled(c, j.id);
+      assert.equal(card(j.id).status, 'done', text(j.response)); assert.equal(card(j.id).fullAccessApplied, true);
     }
-    await refuse(c, { folder: path.join(REPO, '..', 'repo') }, /Полный доступ запрещён/);
-    if (process.platform === 'win32') await refuse(c, { folder: REPO.toUpperCase() }, /Полный доступ запрещён/);
     await refuse(c, { folder: '.' }, /Нужна абсолютная существующая папка/);
-    // RELEASE — отдельная копия релиза тестируемого сервера. Внешний к нему путь моделируется
-    // новым repoRoot; разрешение другого диска проверяется функцией пути без запуска в корне диска.
     const j = await send(c, { folder: cache }); await settled(c, j.id);
   });
 });
 
-test('О2: настоящая junction в корень и вложенную папку (Windows без пропуска)', async () => {
+test('О2: настоящая junction в корень и вложенную папку — путь распознаётся; папочный запрет снят (team-v48e Г4a)', async () => {
   const link = path.join(RUN, 'alias'); junction(link, REPO);
   fs.mkdirSync(path.join(REPO, 'child'));
   const paths = require('../common/paths'); assert(paths.isSameOrInsideReal(link, REPO));
-  await withMcp(async c => { for (const folder of [link, path.join(link, 'child')]) await refuse(c, { folder }, /Полный доступ запрещён/); });
+  // Папочная защита снята — полный доступ по junction в связку теперь проходит (подлинность пути сохранена отдельно).
+  await withMcp(async c => { for (const folder of [link, path.join(link, 'child')]) { const j = await send(c, { folder }); await settled(c, j.id); assert.equal(card(j.id).status, 'done', text(j.response)); } });
 });
+
+test('team-v48 Г4a: по умолчанию полный доступ в папку связки/релиз допускается (MOST_PROTECT_BRIDGE снят)', async () => withMcp(async c => {
+  for (const folder of [REPO, path.join(REPO, 'live/hash'), RELEASE]) {
+    fs.mkdirSync(folder, { recursive: true });
+    const j = await send(c, { folder }); await settled(c, j.id);
+    assert.equal(card(j.id).status, 'done', text(j.response)); assert.equal(card(j.id).fullAccessApplied, true);
+  }
+  // Проверка пути «абсолютная существующая папка» остаётся всегда.
+  await refuse(c, { folder: '.' }, /Нужна абсолютная существующая папка/);
+}));
 
 test('О3, О9: гости, включая запасного дирижёра, не получают флаг', async () => {
   const access = require('../common/access'), fallback = require('../common/fallback');
   const original = fallback.conductorAllows;
   fallback.conductorAllows = () => { throw Error('До разрешения дирижёра доходить нельзя'); };
+  // team-v48e Г4b: полный доступ гостю открыт безусловно (тумблер MOST_GUEST_STRICT удалён) — access.guard не отклоняет гостя по
+  // полному доступу и не обращается к conductorAllows (ветка блока изменений удалена). Серверная карточка решает отдельно (Г4c).
   try {
     for (const client of ['codex', 'antigravity']) {
       process.env.MOST_CLIENT = client;
-      assert.throws(() => access.guard('codex', 'codex_send', defaults()), /Гостю полный доступ Codex запрещён/);
-      await withMcp(async c => { await refuse(c, {}, /Гостю полный доступ Codex запрещён/); await refuse(c, { full_access: 'true' }, /Гостю полный доступ Codex запрещён/); });
+      // Полный доступ гостю больше не отклоняется (Г4b) и не обращается к conductorAllows. Guard может ещё отказать по
+      // СОХРАНЁННОЙ проверке «это чат» (неподтверждённый чат/поручение-сеанс), но не по полному доступу гостю.
+      let err = null; try { access.guard('codex', 'codex_send', defaults()); } catch (e) { err = e; }
+      assert(!err || !/полный доступ[^]*запрещ/i.test(err.message), 'нет отказа по полному доступу гостю (' + client + '): ' + (err && err.message));
     }
   } finally { fallback.conductorAllows = original; process.env.MOST_CLIENT = 'claude'; }
 });
@@ -198,7 +213,8 @@ test('О10: отказ раньше work, heartbeat, владельца и за�
     const lockDir = path.join(STATE, 'locks');
     const snapshot = () => fs.existsSync(lockDir) ? fs.readdirSync(lockDir).sort().map(n => [n, fs.readFileSync(path.join(lockDir, n), 'utf8')]) : [];
     const locks = snapshot();
-    for (const patch of [{ write: false }, { role: 'проверка' }, { folder: REPO }]) {
+    // team-v48e Г4a: случай { folder: REPO } (папочный запрет) снят — остаются только отказы по намерению (write=false, роль проверка).
+    for (const patch of [{ write: false }, { role: 'проверка' }]) {
       await refuse(c, { work: 'w', owner: 'new-owner', stage: 'stage', ...patch }, /Полный доступ|полного доступа/);
       assert(fs.readFileSync(file).equals(before)); assert.deepEqual(snapshot(), locks);
     }
@@ -212,10 +228,21 @@ test('О11: квота без автоповтора, явное продолж�
   assert.equal(mode(logs().at(-1)), 'danger-full-access'); assert.equal(card(next.id).status, 'done');
 }));
 
-test('О12: подложенные карточки — единый отказ для аргументов, брифа, отчёта и продолжения', async () => {
+test('О12: отказ по намерению всегда; гость/подпоручение/чат получают полный доступ безусловно (team-v48e Г4c)', async () => {
   const api = internals();
-  const patches = [{ from: 'codex' }, { from: 'antigravity' }, { fallbackWord: 'word' },
-    { write: false }, { role: undefined }, { role: 'проверка' }];
+  // team-v48e Г4c: карточки гостя/подпоручения/чата (from codex/antigravity, fallbackWord) получают полный доступ безусловно
+  // (тумблер MOST_GUEST_STRICT удалён). Отказ по намерению (write=false, нет роли текст/совет) остаётся всегда — это не лимит гостя.
+  const guestPatches = [{ from: 'codex' }, { from: 'antigravity' }, { fallbackWord: 'word' }];
+  for (const patch of guestPatches) {
+    // Проверяем чистые функции карточки без записи в очередь (иначе снятый порог их же и запустит).
+    const j = { folder: PROJECT, role: 'совет', write: true, fullAccess: true, from: 'claude', ...patch };
+    assert(api.fullAccessAllowed(j)); assert.equal(api.sandboxMode(j), 'danger-full-access');
+    // Даже при выставленной прежней переменной полный доступ остаётся — тумблер удалён.
+    process.env.MOST_GUEST_STRICT = '1';
+    try { assert(api.fullAccessAllowed(j)); assert.equal(api.sandboxMode(j), 'danger-full-access'); }
+    finally { delete process.env.MOST_GUEST_STRICT; }
+  }
+  const patches = [{ write: false }, { role: undefined }, { role: 'проверка' }];
   for (const [i, patch] of patches.entries()) for (const status of ['queued', 'waiting_quota']) {
     const j = seeded('bad-' + i + '-' + status, { fullAccess: true, write: true, ...patch, status,
       nextAttemptAt: '2000-01-01T00:00:00Z', threadId: 'test-thread' });
@@ -254,20 +281,38 @@ test('О13б: строка, число и null в карточке полног�
   }
 });
 
-test('О14: повторный realpath после замка — failed, без исполнителя, все замки свободны', async () => {
-  const api = internals(), locks = require('../common/locks'), paths = require('../common/paths');
+test('team-v48e Г4a/ревью п.1 О14: подмена realpath папки записи — замок следует за фактической папкой, исключительность держится', async () => {
+  const api = internals(), locks = require('../common/locks'), writeLock = require('../common/write-lock');
   const link = path.join(RUN, 'changed-folder'); junction(link, REPO);
+  // Папочный запрет снят безусловно (тумблер MOST_PROTECT_BRIDGE удалён) — полный доступ по подменённому пути в связку проходит.
   assert.equal(api.fullAccessRefusal(defaults()), null);
-  const j = seeded('swapped', { fullAccess: true, write: true, status: 'running' });
-  const folderKey = paths.canon(PROJECT), folderLock = await locks.tryLock('codex_folder', folderKey, { jobId: j.id }); assert(folderLock.ok);
-  // Детерминированная подмена сохранённого пути между проверкой send и execute;
-  // сама junction настоящая. Каталоги пользователя не удаляются и не переименовываются.
-  j.folder = link; api.save(j); await api.execute(j, folderLock);
-  assert.equal(card(j.id).status, 'failed'); assert.match(card(j.id).error, /Полный доступ запрещён/);
-  assert.equal(card(j.id).fullAccessApplied, false); assert.equal(logs().length, 0);
-  for (const [kind, key] of [['codex_folder', folderKey], ['codex_execution', j.id], ['codex_job', j.id]]) {
-    const l = await locks.tryLock(kind, key, {}); assert(l.ok, kind); await l.release();
+  // (а) Карточка держит замок прежнего места (PROJECT); перед запуском realpath папки = REPO (junction).
+  // reconcile сверяет фактическую папку с замком и перехватывает замок REPO — поручение доходит до done.
+  {
+    const j = seeded('swapped', { fullAccess: true, write: true, status: 'running', folder: link });
+    const prior = await writeLock.acquire(PROJECT, { jobId: j.id }); assert(prior.ok);
+    await api.execute(j, prior);
+    await until(() => card(j.id).status === 'done', j.id); await until(() => !api.active.has(j.id), 'освобождение замков');
+    assert.equal(card(j.id).status, 'done', card(j.id).error); assert.equal(card(j.id).fullAccessApplied, true);
+    // Прежний замок PROJECT снят reconcile, замок фактической папки REPO снят по завершению — обе свободны.
+    for (const folder of [PROJECT, REPO]) { const l = await writeLock.acquire(folder, { jobId: 'probe' }); assert(l.ok, folder); await l.release(); }
   }
+  // (б) Исключительность фактической папки: второй писатель держит REPO — поручение с подменой пути туда не запускается
+  // (прежний замок PROJECT не считался бы замком REPO), а отказывает, не трогая чужую папку.
+  {
+    const other = await writeLock.acquire(REPO, { jobId: 'other-writer' }); assert(other.ok);
+    try {
+      const j = seeded('swapped2', { fullAccess: true, write: true, status: 'running', folder: link });
+      const prior = await writeLock.acquire(PROJECT, { jobId: j.id }); assert(prior.ok);
+      await api.execute(j, prior);
+      await until(() => ['failed', 'needs_decision'].includes(card(j.id).status), 'отказ по занятой фактической папке');
+      assert.match(card(j.id).error || '', /сместилась|занята другим/, 'не пишет в папку второго писателя');
+      // Прежний замок PROJECT освобождён отказом; REPO остаётся у второго писателя.
+      const p = await writeLock.acquire(PROJECT, { jobId: 'probe' }); assert(p.ok); await p.release();
+      assert(!(await writeLock.acquire(REPO, { jobId: 'probe' })).ok, 'второй писатель держит REPO');
+    } finally { await other.release(); }
+  }
+  for (const key of ['swapped', 'swapped2']) { const l = await locks.tryLock('codex_execution', key, {}); assert(l.ok); await l.release(); }
 });
 
 test('О15а: явная отмена, нет автоповтора', async () => withMcp(async c => {
@@ -277,12 +322,14 @@ test('О15а: явная отмена, нет автоповтора', async () 
   await sleep(500); assert.equal(logs().length, 1);
 }));
 
-test('О15б: таймаут — состояние базы, нет автоповтора', async () => withMcp(async c => {
-  const j = await send(c, { task: 'HANG' }); await settled(c, j.id);
-  assert.equal(card(j.id).status, 'needs_decision'); assert.match(card(j.id).error, /Истёк предел времени/);
-  await sleep(500); assert.equal(logs().length, 1);
-  // Срок отсчитывается от начала задания; на медленном ПК запуск сервера и очереди съедает сотни мс до spawn,
-  // поэтому 800 мс не хватало fake-codex даже записать строку запуска до kill. 3000 мс оставляет запас, HANG всё равно истекает.
+test('team-v48e §2.6 О15б: даже при заданном MOST_CODEX_TIMEOUT_MS срок не навязывается — HANG не падает по таймауту', async () => withMcp(async c => {
+  const j = await send(c, { task: 'HANG' }); await until(() => logs().length === 1, 'старт');
+  // Тумблер MOST_CODEX_TIMEOUT_MS удалён (§2.6): карточка без deadline, таймер-убийца не создаётся — задание не уходит в needs_decision по сроку.
+  assert.equal(card(j.id).deadline, undefined, 'срок не записан');
+  await sleep(3500);
+  assert.equal(card(j.id).status, 'running', 'без срока HANG по-прежнему идёт (не needs_decision по таймауту)');
+  await c.call('codex_cancel', { id: j.id }); await settled(c, j.id);
+  assert.equal(card(j.id).status, 'cancelled');
 }, { MOST_CODEX_TIMEOUT_MS: '3000' }));
 
 test('О15в: остановка и перезапуск — только явное продолжение; неподтверждённая остановка блокирует', async () => {
@@ -332,13 +379,15 @@ test('О16: правило одного поручения на программ
   const quote = 'У поручения появляется переключатель „полный доступ“. Я сам включаю его, когда Codex должен запускать ваши программы (дубляж, GPU, сборки). Тогда Codex работает от вашего имени, как в своём чате. Правка кода связки и проверки остаются в песочнице.';
   for (const f of ['rules/claude.md']) {
     const s = fs.readFileSync(path.join(ROOT, f), 'utf8'); assert(s.includes(quote));
-    for (const line of ['не больше одного', 'что можно менять вне папки', '`whoami`', '«проверка»', 'только Claude']) assert(s.includes(line), f + ': ' + line);
+    // team-v48e (ревью п.6): полный доступ не «только Claude» — любое поручение при write=true, роли текст/совет и абсолютной папке.
+    for (const line of ['не больше одного', 'что можно менять вне папки', '`whoami`', '«проверка»', 'Полный доступ получает любое поручение']) assert(s.includes(line), f + ': ' + line);
   }
 });
 
 test('О16а: краткая памятка отсылает к полному правилу Claude', () => {
   const s = fs.readFileSync(path.join(ROOT, 'rules/brief.md'), 'utf8');
-  assert(s.includes('полный доступ — только Claude, rules/claude.md'));
+  // team-v48e (ревью п.6): полный доступ — при write=true и роли текст/совет (не «только Claude»).
+  assert(s.includes('полный доступ — при write=true и роли текст/совет (rules/claude.md)'));
   assert(s.length <= 7587); assert(s.split('\n').length <= 64);
 });
 

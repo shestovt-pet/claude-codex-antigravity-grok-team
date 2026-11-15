@@ -174,7 +174,10 @@ f.run([
     const files = ['AGENTS.md', 'README.md', 'docs/consilium-workflow.md', 'rules/fallback.md',
       'rules/antigravity.md', 'rules/common.md', 'rules/brief.md', 'skill/helpers/SKILL.md', 'skill/vtm-hronika/SKILL.md'];
     for (const file of files) {
-      const text = fs.readFileSync(path.resolve(__dirname, '..', file), 'utf8');
+      const full = path.resolve(__dirname, '..', file);
+      // Личный скилл исключён из публичной выгрузки (tools/export-public.js): там файла нет, проверять нечего.
+      if (file === 'skill/vtm-hronika/SKILL.md' && !fs.existsSync(full)) continue;
+      const text = fs.readFileSync(full, 'utf8');
       assert(!/другая из двух семей|У пользователя два помощника|всем троим|обоих помощников|с двумя помощниками|Claude — дирижёр\. Помощники:/.test(text), file);
       assert(text.includes('team_status'), file);
     }
