@@ -183,7 +183,10 @@ test('Р4: сухой прогон ничего не удаляет и пере�
   const f = cleanupFixture('dry');
   const r = cl.cleanup({ root: f.root }, f.deps), text = cl.cleanupText(r);
   const removes = r.plan.remove.map(x => path.relative(f.root, x.path).replace(/\\/g, '/')).sort();
-  assert.deepEqual(removes, ['../temp/most-part2-old', '.work/closed/tests/.tmp-old', '.work/merged', '.work/stale-main', 'live/.archive-old.tar', 'live/.stale-free-1', 'live/' + path.basename(f.rel.free)].sort());
+  // team-v62: team-v58 (task5 п.2) — сохранённый (закрытый) клон держит свои tests\.tmp-* ЦЕЛИКОМ; поштучного перечисления
+  // .tmp-* внутри клона больше нет (оно и вешало уборку на 18 минут). Поэтому .work/closed/tests/.tmp-old больше не удаляется
+  // отдельно — он остаётся внутри сохранённого клона.
+  assert.deepEqual(removes, ['../temp/most-part2-old', '.work/merged', '.work/stale-main', 'live/.archive-old.tar', 'live/.stale-free-1', 'live/' + path.basename(f.rel.free)].sort());
   assert.match(text, /^Уборка — сухой прогон, ничего не удалено/);
   for (const x of r.plan.remove) assert(exists(x.path), x.path);
   const reason = p => r.plan.keep.find(x => x.path === p)?.reason || '';
@@ -198,10 +201,11 @@ test('Р4: сухой прогон ничего не удаляет и пере�
   assert.match(reason(f.clones.busy), /живые поручения/);
   assert.match(reason(f.clones.closed), /закрыто без слияния/);
   assert.match(reason(f.clones.open), /«открыто»/);
-  assert.match(reason(path.join(f.clones.closed, 'tests/.tmp-tracked')), /отслеживается git/);
+  // team-v62: tests\.tmp-* внутри сохранённого клона поштучно не перечисляются (team-v58 task5 п.2) — клон держится/удаляется
+  // целиком. Прежние проверки причин по отдельным .tmp-* (отслеживаемый git в closed, junction в linked) сняты как устаревшие;
+  // целостность клонов проверяется на уровне клона (closed/open выше, несохранённые изменения trackedTmp ниже).
   assert.match(reason(path.join(f.work, 'no-card')), /нет карточки/);
   assert.match(reason(f.clones.trackedTmp), /несохранённые изменения: .*tests\/\.tmp-v6-tracked\.ps1/);
-  if (f.linkMade) assert.match(reason(path.join(f.clones.linked, 'tests', '.tmp-old')), /ссылка или junction/);
   assert(!r.plan.keep.concat(r.plan.remove).some(x => x.path.includes(path.join('open', 'tests'))), 'tmp идущего изменения не трогается');
 });
 test('Р4: apply удаляет только разрешённое', () => {
@@ -210,8 +214,8 @@ test('Р4: apply удаляет только разрешённое', () => {
   const r = cl.cleanup({ root: f.root, apply: true, owner: 'cowork-test' }, { ...f.deps, logFile: log });
   assert.equal(r.failed.length, 0, JSON.stringify(r.failed));
   const entry = JSON.parse(fs.readFileSync(log, 'utf8').trim());
-  assert.equal(entry.owner, 'cowork-test'); assert.equal(entry.removed.length, 7);
-  assert.equal(r.removed.length, 7);
+  assert.equal(entry.owner, 'cowork-test'); assert.equal(entry.removed.length, 6); // team-v62: .work/closed/tests/.tmp-old больше не удаляется поштучно (team-v58 task5 п.2) — было 7
+  assert.equal(r.removed.length, 6);
   for (const x of r.removed) assert(!exists(x.path), x.path);
   for (const k of ['cur', 'prev', 'cfg', 'bak', 'proc', 'exe']) assert(exists(f.rel[k]), k);
   for (const k of ['dirty', 'ahead', 'busy', 'closed', 'open', 'trackedTmp', 'linked']) assert(exists(f.clones[k]), k);
@@ -220,7 +224,7 @@ test('Р4: apply удаляет только разрешённое', () => {
   assert(exists(path.join(f.clones.closed, 'tests/.tmp-tracked')) && exists(path.join(f.clones.closed, 'tests/.tmp-new')));
   assert(exists(path.join(f.clones.dirty, 'notes.txt')) && exists(path.join(f.temp, 'most-part2-new')) && exists(path.join(f.temp, 'other-old')));
   assert(exists(path.join(f.live, '.archive-new.tar')));
-  assert.match(cl.cleanupText(r), /^Уборка выполнена · cowork-test\.\nУдалено 7:/);
+  assert.match(cl.cleanupText(r), /^Уборка выполнена · cowork-test\.\nУдалено 6:/);
 });
 test('Р4: недоступная командная строка, относительный путь или непрочитанный источник — ни одного релиза', () => {
   for (const [label, patch] of [
@@ -312,7 +316,9 @@ test('Р7: результат Antigravity читается без этапа, п
     const folder = path.join(RUN, 'agy'); fs.mkdirSync(folder);
     await new Team(RUN, path.join(RUN, 'state/team')).work({ owner: 'o', action: 'create', name: 'w', title: 'Р7', expected_revision: 0, goal: 'Цель', done_criteria: 'Итог', next_step: 'Шаг',
       stages: [{ title: 'Этап', weight: 100, accept_criteria: 'Критерий', state: 'идёт' }] });
-    assert.match(text(await client.callTool({ name: 'antigravity_send', arguments: { folder, task: 'Напиши строку', work: 'w', owner: 'o' } })), /укажите этап/);
+    // team-v62: ранняя проверка приведена к виду остальных адаптеров (роль по умолчанию «совет» её не триггерит); этап
+    // ЗАРЕГИСТРИРОВАННОЙ работы теперь требует prepareJob — отказ сохраняется, но с его сообщением о выборе этапа.
+    assert.match(text(await client.callTool({ name: 'antigravity_send', arguments: { folder, task: 'Напиши строку', work: 'w', owner: 'o' } })), /укажите этап|укажите постоянный id|уникальное название этапа/i);
     const sent = text(await client.callTool({ name: 'antigravity_send', arguments: { folder, task: 'Напиши строку' } }));
     const id = /Задание (\S+) (?:запущено|в очереди)/.exec(sent)?.[1]; assert(id, sent);
     const result = text(await client.callTool({ name: 'antigravity_result', arguments: { id, work: 'w', owner: 'o', wait_sec: 1 } }));

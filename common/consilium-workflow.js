@@ -103,6 +103,7 @@ function bridgeAdapter() {
   };
 }
 function validateJob(j, who) {
+  if (require('./members').adapterOf(who) === 'kimi-cli') { require('./kimi-review').evidence(j); require('./kimi-review').eligibility(who); }
   need(j.status === 'done' && !j.cancelled && !j.cancel_requested && !j.lateHash && !j.archived, 'Нет действующего завершённого голоса: ' + j.id);
   need(j.role === 'проверка', 'У поручения нет роли проверка: ' + j.id);
   if (who === 'codex') need(!j.write && !j.previous && !j.continue_id, 'Codex-ревью должно быть новым и без записи.');

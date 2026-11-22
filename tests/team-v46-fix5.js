@@ -278,6 +278,7 @@ module.exports = ({ test, f, client, text }) => {
     const root = path.join(f.RUN, 'rollback-modern'), state = path.join(root, 'state'), release = path.join(root, 'live', 'a'.repeat(40));
     const store = require('../common/members-store').create(state); store.read(); require('../common/members-v46').apply(state, 'forward');
     for (const n of ['members-store', 'members-v46']) f.write(path.join(release, 'common', n + '.js'), '');
+    f.write(path.join(release, 'common/members-store.js'), fs.readFileSync(path.join(__dirname, '../common/members-store.js'), 'utf8'));
     const server = path.join(release, 'servers/team/index.js'); f.write(server, '');
     const file = path.join(root, 'config.json'); f.json(file, { mcpServers: {} });
     f.json(file + '.prev', { mcpServers: { team: { command: process.execPath, args: [server], env: { MOST_REPO_ROOT: root } } } });

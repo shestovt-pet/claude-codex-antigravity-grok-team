@@ -95,9 +95,13 @@ const tree = parent => JSON.stringify([{ pid: 'self', ppid: parent || 4100, name
 function ready() { json(path.join(STATE, 'ready/team.json'), { pid: 7000, release: RELEASE, startedAt: new Date().toISOString() }); }
 const chatEnv = extra => ({ MOST_CLIENT: 'codex', MOST_TEST_PROCESS_TREE: tree(), ...extra });
 function asChat(extra = {}) { Object.assign(process.env, chatEnv(extra)); lib('fallback').reset(); }
-async function freeLocks(id, folder = PROJECT, thread) {
+async function freeLocks(id, folder = PROJECT, thread, waitForRelease = false) {
   for (const [kind, key] of [['codex_folder', lib('paths').canon(folder)], ['codex_execution', id], ['codex_queue', id], ['codex_job', id], ...(thread ? [['codex_session', thread]] : [])]) {
-    const l = await lib('locks').tryLock(kind, key, {}); assert(l.ok, kind); await l.release();
+    let l;
+    const acquire = async () => { l = await lib('locks').tryLock(kind, key, {}); return l.ok; };
+    if (waitForRelease) await until(acquire, 'освобождение ' + kind, 2000);
+    else assert(await acquire(), kind);
+    await l.release();
   }
 }
 
@@ -289,7 +293,9 @@ test('О6: несогласованные карточки (fromChat/from) не 
     for (const [i] of bad.entries()) { const c = card('bad-' + i); assert(c.error); assert.equal(c.fullAccessApplied, false); await freeLocks(c.id, c.folder); }
     assert.match(card('word').fallbackHold, /запасной режим снят/);
     const j = seeded('consistent', { from: 'codex', fromChat: 'codex', write: true, task: 'Проба' });
-    await until(() => card(j.id).status === 'done', 'согласованная карточка'); await freeLocks(j.id, PROJECT);
+    await until(() => card(j.id).status === 'done', 'согласованная карточка');
+    // done сохраняется до finally исполнителя: ждём освобождения, но удержанный замок всё равно проваливает тест.
+    await freeLocks(j.id, PROJECT, undefined, true);
   });
 });
 
@@ -326,9 +332,9 @@ test('О7: своя отмена; чужие продолжение и отме�
 
 test('О8, О10: Antigravity закрыт своей семье; чужие полномочия закрыты', async () => {
   ready(); asChat(); const access = lib('access');
-  // team_change (за словом через allowed()) и antigravity_apply (канал дирижёра) закрыты гостю всегда.
+  // team-v58: чат участника получает полный набор дирижёра — team_change (все действия) и antigravity_apply открыты.
   for (const [server, tool, args] of [['team', 'team_change', { action: 'start' }], ['antigravity', 'antigravity_apply', { id: 'x' }]])
-    assert.throws(() => access.guard(server, tool, args), /Гостю это действие запрещено/);
+    assert.doesNotThrow(() => access.guard(server, tool, args), tool + ' открыт чату участника');
   // team-v48e Г4b-2: team_work-изменение гостю открыто безусловно (тумблер MOST_GUEST_STRICT удалён).
   for (const action of ['create', 'update']) assert.doesNotThrow(() => access.guard('team', 'team_work', { action }), 'team_work открыт');
   // team-v48e Г4b-2b: свой сервер Antigravity открыт гостю безусловно — antigravity_send проходит guard (упирается в проверку review),
@@ -443,11 +449,13 @@ test('team-v48e Г4c: пишущее поручение гостя подхва�
 test('О11: правила согласованы и доставляются; О12: адресная регрессия team-v19', async () => {
   const helper = fs.readFileSync(path.join(ROOT, 'rules/helpers/codex-section.md'), 'utf8');
   // team-v48e Г9: новое поведение кода выпуска 1 — проверяем наличие новых формулировок и отсутствие снятых пределов/запретов.
-  for (const phrase of ['Чат Codex может сам ставить поручения', 'codex_cancel', 'только свои', 'может отправлять другому участнику подпоручения', 'полный доступ — в любой существующей папке', 'глубина и число подпоручений не ограничены', 'отменять только своих потомков']) assert(helper.includes(phrase), phrase);
-  for (const gone of ['Полного доступа у гостя нет', 'Отмена из поручения запрещена', 'глубина до 2', 'на корень', 'без полного доступа', 'Поручение-сеанс поручений не ставит и не отменяет', 'не разрешение самостоятельно отправлять задания']) assert(!helper.includes(gone), 'снятая фраза осталась: ' + gone);
+  // team-v58 (часть А, пункт 2): новый порядок — чат любого участника = полный набор дирижёра; поручение = права исполнителя.
+  for (const phrase of ['Чат Codex — полный набор дирижёра', 'Признак поручения проверяется первым', 'по доказанному происхождению', 'codex_cancel', 'только свои', 'может отправлять другому участнику подпоручения', 'полный доступ — в любой существующей папке', 'глубина и число подпоручений не ограничены', 'отменять только своих потомков']) assert(helper.includes(phrase), phrase);
+  for (const gone of ['Полного доступа у гостя нет', 'Отмена из поручения запрещена', 'глубина до 2', 'на корень', 'без полного доступа', 'Поручение-сеанс поручений не ставит и не отменяет', 'не разрешение самостоятельно отправлять задания', 'Чат Codex может сам ставить поручения', 'team_change и antigravity_apply вне запасного режима закрыты']) assert(!helper.includes(gone), 'снятая фраза осталась: ' + gone);
   const common = fs.readFileSync(path.join(ROOT, 'rules/common.md'), 'utf8');
   assert(!common.includes('себя никто не получает')); assert(!common.includes('Codex на запись и перенос Antigravity — нельзя'));
-  assert(common.includes('для своего поручения из чата Codex — чат Codex'));
+  // team-v58: решение по needs_decision Codex-write принимает чат любого участника (не только Codex).
+  assert(common.includes('решает чат любого участника связки'));
   for (const gone of ['глубина до 2', 'в цепочке до 6', 'дочернее не шире родителя', 'Поручение-сеанс не отменяет поручений']) assert(!common.includes(gone), 'common: снятая фраза осталась: ' + gone);
   // team-v48e (ревью п.6): доставляемые тексты не содержат снятых фраз (полный доступ — любой участник; роль «проверка» допускается; team_work-изменение открыто).
   for (const gone of ['кроме роли «проверка»', 'изменение team_work', 'только по поручению Claude', 'не изменяй файлы связки'])
@@ -469,12 +477,17 @@ test('О11: правила согласованы и доставляются; �
     const s = fs.readFileSync(path.join(ROOT, 'rules/helpers/' + section), 'utf8');
     assert(!s.includes('кроме роли «проверка»'), section + ': «кроме роли проверка» снято');
     assert(s.includes('роль «проверка» тоже'), section + ': роль проверка допускается');
+    // team-v58 (пункт 2): чат участника = полный набор дирижёра; поручение = права исполнителя (проверяется первым).
+    assert(s.includes('полный набор дирижёра') && s.includes('Признак поручения проверяется первым'), section + ': новый порядок чат/поручение');
+    assert(!s.includes('не разрешение самостоятельно отправлять задания'), section + ': «не разрешение самостоятельно отправлять» снято');
   }
+  assert(fs.readFileSync(path.join(ROOT, 'rules/helpers/antigravity-section.md'), 'utf8').includes('Чат Antigravity — полный набор дирижёра'), 'antigravity-section: чат = полный набор');
+  assert(fs.readFileSync(path.join(ROOT, 'rules/helpers/member-section.md'), 'utf8').includes('Чат любого участника связки — полный набор дирижёра'), 'member-section: чат = полный набор');
   assert(fs.readFileSync(path.join(ROOT, 'AGENTS.md'), 'utf8').includes('чат Codex для своего поручения'));
   assert(fs.readFileSync(path.join(ROOT, 'rules/fallback.md'), 'utf8').includes('Поручение-сеанс'));
   const rules = lib('client-rules'), target = path.join(RUN, 'delivered.md'); write(target, 'Личные правила\r\n<!-- most:begin -->\r\nСтарый раздел\r\n<!-- most:end -->\r\n');
   const plans = rules.plans([{ file: target, role: 'codex' }]); await rules.configure({ files: [{ file: target, role: 'codex' }] });
-  assert(rules.evidence(plans, 'team-v25')[0].contentVerified); assert(fs.readFileSync(target, 'utf8').includes('Чат Codex может сам ставить поручения'));
+  assert(rules.evidence(plans, 'team-v25')[0].contentVerified); assert(fs.readFileSync(target, 'utf8').includes('Чат Codex — полный набор дирижёра'));
   const old = fs.readFileSync(path.join(ROOT, 'tests/team-v19-claude-word.js'), 'utf8');
   assert(old.includes("as('codex', { job: 'job-1' })")); assert(old.includes("agy.call('antigravity_send'"));
   assert(old.includes("['codex_cancel', 'codex_result', 'codex_send', 'codex_status']"));

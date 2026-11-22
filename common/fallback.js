@@ -95,8 +95,10 @@ function jobProof() {
   return { ok: true, fingerprint: { pid: chain[0].pid, startedAt: chain[0].startedAt || null }, parent_name: chain[0].name || null };
 }
 // Чат, а не поручение, — для слова о Claude и прав дирижёра: те же три условия, запись ready обязательна; Antigravity — после пробы.
-function chatProof(client = access().client()) {
-  if (!SEATS.includes(client)) return { ok: false, reason: 'слово о Claude записывает чат Codex или Antigravity' };
+// team-v59: opts.anyChat снимает ограничение мест codex/antigravity для ЗАПИСИ participant-слова (замысел §3). Остальные
+// условия подлинности (поручение, проба Antigravity, релиз, отпечаток процесса) сохраняются — дирижёра это не меняет.
+function chatProof(client = access().client(), opts = {}) {
+  if (!opts.anyChat && !SEATS.includes(client)) return { ok: false, reason: 'слово о Claude записывает чат Codex или Antigravity' };
   if (process.env.MOST_JOB_ID) return { ok: false, job: true, reason: 'это поручение-сеанс, а не чат' };
   if (client === 'antigravity' && !probe.agy) return { ok: false, reason: 'способ отличить чат Antigravity от поручения не подтверждён пробой' };
   const main = readyRecord('team');
@@ -146,8 +148,15 @@ function guard(server, tool, a = {}) {
   if (!acc.guest()) {
     const m = words().mode();
     if (!m.active) return;
+    // team-v58 (часть А, слово владельца 18.11.2026): чат самого Claude при активном запасном режиме больше не уступает
+    // дирижёру до team_word return — он получает тот же полный набор, что и чаты остальных участников. От двойного ведения
+    // одной работы защищает владение работой (owner), а не режим. Поручение-исполнитель claude-print — гость (ветка ниже,
+    // chatSession там false), сюда не попадает; недоказанное происхождение (chatSession false) сохраняет прежний запрет.
+    if (acc.chatSession()) return;
+    // team-v57 (ред.8): team_change deploy (установка по слову пользователя) допустим и в запасном режиме — слово владельца
+    // главнее всего из любого участника; действительную проверку слова/отпечатка ведёт team.js, доступ — access.allowed.
     const read = tool === 'team_status' || tool === 'team_rules' || /_(status|result)$/.test(tool) ||
-      (tool === 'team_work' && ['get', 'list'].includes(a.action)) || (tool === 'team_change' && ['diff', 'precheck', 'list'].includes(a.action)) ||
+      (tool === 'team_work' && ['get', 'list'].includes(a.action)) || (tool === 'team_change' && ['diff', 'precheck', 'list', 'deploy'].includes(a.action)) ||
       (tool === 'team_word' && ['list', 'return'].includes(a.action));
     // Перенос и отмена — тоже изменения (Codex 1c35bf39 п. 1); очередь дирижёра основной сервер исполняет без guard.
     if ((['team_work', 'team_change', 'team_word'].includes(tool) && !read) || (send && a.work) || (tool === 'codex_send' && a.write) ||
@@ -165,6 +174,9 @@ function guard(server, tool, a = {}) {
     if (!proof.ok && proof.job && /_cancel$/.test(tool)) { require('./job-chain').assertDescendant(a.id || a.nomer); return; }
     if (!proof.ok) throw Error(proofRefusal(proof, 'Поручение-сеанс этого не делает: слово, поручения и перенос — только из чата; '));
   }
+  // team-v58: чат любого зарегистрированного участника получает полный набор дирижёра — подлинность чата (jobProof выше)
+  // проверена, запасной режим его не ограничивает. Цикл «сам себе» ловит lineage/job-chain при вызове (не здесь).
+  if (acc.chatSession()) return;
   // team-v25: jobProof выше обязателен для каждой отправки и отмены.
   // В активном запасном режиме сохраняются прежние права дирижёра.
   // Чат Codex управляет своим сервером и вне запасного режима (team-v25); codex_cancel своих поручений — тоже (Г4d обобщит на цепочку).
@@ -303,13 +315,19 @@ async function word(a, deps = {}) {
   if (a.action === 'record') {
     if (!acc.guest() || client === 'claude') throw Error('О себе Claude слово не записывает.');
     const proof = chatProof(client);
-    if (!proof.ok) throw Error(proofRefusal(proof));
+    // team-v59: при АКТИВНОМ режиме participant-запись «Claude отвалился» принимает доказанный чат ЛЮБОГО участника (в т.ч.
+    // Kimi/DeepSeek) — проверка мест codex/antigravity для ЗАПИСИ снята и заменена подлинностью чата (jobProof); дирижёр не
+    // меняется. СТАРТ режима (mode не активен) по-прежнему только с места codex/antigravity (chatProof): кто ведёт запасной
+    // режим, это изменение не меняет. Подлинность (отпечаток процесса-чата, проба Antigravity, релиз) обязательна всегда.
+    const authentic = proof.ok ? proof : chatProof(client, { anyChat: true });
     const out = await W.transact(({ mode, write }) => {
       const m = mode();
       if (m.active) {
-        write({ kind: 'record', who_down: 'claude', quote: a.quote, source: 'chat-' + client, recorded_by: client, owner: a.owner || null, fingerprint: proof.fingerprint, participant: true });
+        if (!authentic.ok) throw Error(proofRefusal(authentic));
+        write({ kind: 'record', who_down: 'claude', quote: a.quote, source: 'chat-' + client, recorded_by: client, owner: a.owner || null, fingerprint: authentic.fingerprint || null, participant: true });
         return { m };
       }
+      if (!proof.ok) throw Error(proofRefusal(proof));
       if (!LABEL.test(a.owner || '') || !a.owner.toLowerCase().startsWith('fallback-' + client + '-')) throw Error('Нужна метка сеанса owner=fallback-' + client + '-<4 буквы>.');
       return { r: write({ kind: 'record', who_down: 'claude', quote: a.quote, source: 'chat-' + client, recorded_by: client, owner: a.owner,
         fingerprint: proof.fingerprint, parent_name: proof.parent_name, release: path.basename(release()) }) };
@@ -379,6 +397,13 @@ async function helperWord(a) {
     if (m.active) throw Error(refusalText(m));
     return null; // чат Claude вне режима — правила team-v18
   }
+  // team-v58: вне запасного режима чат любого участника пишет слово о помощнике как чат Claude (слово человека) —
+  // record запишет с source chat-<клиент>.
+  // team-v59: и при АКТИВНОМ запасном режиме доказанный чат любого участника (в т.ч. Kimi/DeepSeek) записывает слово
+  // «X отвалился» как слово человека (plain record) — проверка «только места codex/antigravity для записи» снята. Исключение —
+  // слово о текущем дирижёре запасного режима от другого гостя: это прежний переход дирижёра (место дирижёра v59 не меняет).
+  const m0 = W.mode();
+  if (acc.chatSession() && !(m0.active && m0.conductor === a.who_down && SEATS.includes(client) && client !== m0.conductor)) return null;
   const proof = SEATS.includes(client) ? chatProof(client) : { ok: false, reason: 'не чат Codex или Antigravity' };
   return W.transact(({ mode, write }) => {
     const m = mode();

@@ -264,7 +264,10 @@ async function evaluate(w, s, old, jobs, snapshot) {
     const regular = applicable.filter(j => j.who !== 'fresh' && j.role === 'проверка' && seats[j.who] === j.family && candidates.includes(j.family) && materialSeen(w, s, p, j));
     for (const j of applicable.filter(j => j.who === 'grok' && !materialSeen(w, s, p, j))) messages.push(label + ': Grok совещательный — в поручении нет sha256 каждого файла части');
     const latest = new Map();
-    for (const j of regular) latest.set(j.family, j);
+    for (const j of regular) {
+      if (require('./members').adapterOf(j.who) === 'kimi-cli') require('./kimi-review').eligibility(j.who);
+      latest.set(j.family, j);
+    }
     const savedHelpers = applicable.filter(j => j.who === 'fresh');
     const helpers = byConductor ? [] : savedHelpers;
     const replacements = [];

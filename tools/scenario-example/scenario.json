@@ -1,0 +1,13 @@
+{
+  "id": "стол-образец",
+  "title": "Стол: ведущий и три игрока",
+  "turns": 3,
+  "summary_every": 4,
+  "parallel": 4,
+  "gm_members": ["deepseek", "kimi", "codex"],
+  "player_members": ["kimi", "codex"],
+  "hook": {
+    "interp": "ЗАМЕНИТЕ_НА_АБСОЛЮТНЫЙ_ПУТЬ\\node.exe",
+    "script": "ЗАМЕНИТЕ_НА_АБСОЛЮТНЫЙ_ПУТЬ\\tools\\scenario-example\\table-hook.js"
+  }
+}

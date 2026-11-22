@@ -123,13 +123,18 @@ function line(r) {
 // Слово о помощнике. Из чата Claude — как в team-v18; в запасном режиме — от гостя-чата (дирижёр или слово о дирижёре, К1).
 // Строка слова о помощнике (без записи): права и поля.
 function entry(a) {
-  require('./access').guard('team', 'team_word', { ...a, action: 'record' });
-  if (require('./access').guest() && !require('./fallback').helperAllowed(a)) throw Error('Гостю это действие запрещено: слово о помощнике записывает чат Claude; в запасном режиме — дирижёр.');
+  const access = require('./access');
+  // team-v58: признак поручения — первым; из поручения слово человека не пишется.
+  if (access.jobSession()) throw Error('Слово пользователя записывает чат участника; из поручения запрещено.');
+  access.guard('team', 'team_word', { ...a, action: 'record' });
+  // team-v58: чат любого участника записывает слово о помощнике как чат Claude (слово человека); в запасном режиме
+  // прежний путь гостя (дирижёр/слово о дирижёре) ведёт fallback.helperWord до вызова record.
+  if (access.guest() && !access.chatSession() && !require('./fallback').helperAllowed(a)) throw Error('Гостю это действие запрещено: слово о помощнике записывает чат Claude; в запасном режиме — дирижёр.');
   if (a.who_down !== 'grok') require('./members').assertAvailable(a.who_down);
   if (!WHO.includes(a.who_down)) throw Error('who_down: нужен голосующий помощник или запасной дирижёр из team_status.');
   if (typeof a.quote !== 'string' || !a.quote.trim()) throw Error('Нужно слово пользователя дословно (quote).');
-  const client = require('./access').client();
-  return { who_down: a.who_down, quote: a.quote, source: 'chat-' + (require('./access').guest() ? client : 'claude'), recorded_by: client, ...(a.owner ? { owner: a.owner } : {}) };
+  const client = access.client();
+  return { who_down: a.who_down, quote: a.quote, source: 'chat-' + client, recorded_by: client, ...(a.owner ? { owner: a.owner } : {}) };
 }
 async function record(a) {
   const r = await append(entry(a));
@@ -138,33 +143,75 @@ async function record(a) {
 
 // Запись остановки: поиск и дописывание под тем же замком журнала.
 async function recordStopConfirmation(job_ids, quote, apply = async r => r) {
+  // team-v58 (task10 а): слово владельца пишет ТОЛЬКО доказанный чат (chatSession). Поручение — первым; недоказанный сеанс
+  // (подмена MOST_CLIENT, сброс MOST_JOB_ID) слово не пишет. Запасной режим доказанный чат не ограничивает. source — клиент чата.
+  const acc = require('./access');
+  if (acc.jobSession()) throw Error('Подтверждение остановки записывает чат участника; из поручения запрещено.');
+  if (!acc.chatSession()) throw Error('Подтверждение остановки записывает доказанный чат участника; происхождение чата не доказано: ' + acc.chatOriginReason() + '.');
+  const client = acc.client();
   return locked(async () => {
-    if (mode().active) throw Error('Подтверждение остановки недоступно в запасном режиме.');
     const ids = [...new Set(job_ids)].sort();
     const record = lines().find(r => r.kind === 'stop_confirm' && r.quote === quote && JSON.stringify(r.job_ids) === JSON.stringify(ids)) ||
-      write({ kind: 'stop_confirm', job_ids: ids, quote, recorded_by: 'claude', source: 'chat-claude' });
+      write({ kind: 'stop_confirm', job_ids: ids, quote, recorded_by: client, source: 'chat-' + client });
     return apply(record);
   });
 }
 
 // Запись закрытия карточек «нужно решение» словом пользователя: поиск и дописывание под тем же замком журнала.
 async function recordJobClose(job_ids, quote, apply = async r => r) {
+  // team-v58 (task10 а): слово владельца пишет ТОЛЬКО доказанный чат (chatSession). Поручение — первым; недоказанный сеанс
+  // слово не пишет. Запасной режим доказанный чат не ограничивает. source/recorded_by — клиент чата.
+  const acc = require('./access');
+  if (acc.jobSession()) throw Error('Закрытие словом записывает чат участника; из поручения запрещено.');
+  if (!acc.chatSession()) throw Error('Закрытие словом записывает доказанный чат участника; происхождение чата не доказано: ' + acc.chatOriginReason() + '.');
+  const client = acc.client();
   return locked(async () => {
-    if (mode().active) throw Error('Закрытие словом недоступно в запасном режиме.');
     const ids = [...new Set(job_ids)].sort();
     const record = lines().find(r => r.kind === 'job_close' && r.quote === quote && JSON.stringify(r.job_ids) === JSON.stringify(ids)) ||
-      write({ kind: 'job_close', job_ids: ids, quote, recorded_by: 'claude', source: 'chat-claude' });
+      write({ kind: 'job_close', job_ids: ids, quote, recorded_by: client, source: 'chat-' + client });
     return apply(record);
   });
+}
+
+// team-v56 Б0 п.5: запись снятия осиротевшего замка словом. Идемпотентна по точному instance; поиск и дописывание —
+// под тем же замком журнала. Снятие самого замка выполняет apply под этим же замком (см. common/release-orphan.js).
+async function recordOrphanRelease(instance, jobId, folder, quote, apply = async r => r, extra = {}) {
+  // team-v58 (task10 а): слово владельца пишет ТОЛЬКО доказанный чат (chatSession). Поручение — первым; недоказанный сеанс
+  // слово не пишет. Запасной режим доказанный чат не ограничивает. source/recorded_by — клиент чата.
+  const acc = require('./access');
+  if (acc.jobSession()) throw Error('Снятие осиротевшего замка записывает чат участника; из поручения запрещено.');
+  if (!acc.chatSession()) throw Error('Снятие осиротевшего замка записывает доказанный чат участника; происхождение чата не доказано: ' + acc.chatOriginReason() + '.');
+  const client = acc.client();
+  return locked(async () => {
+    // team-v56 И7 (ревью Kimi 5): повтор сверяется по instance+jobId+folder. Прежняя запись того же instance с ДРУГИМ
+    // поручением/папкой — конфликт (идемпотентность request_id/instance не нарушается скрытым перенаправлением).
+    const prior = lines().filter(r => r.kind === 'release_orphan' && r.lock_instance === instance);
+    const exact = prior.find(r => r.job_id === jobId && r.folder === folder);
+    const conflict = prior.find(r => r.job_id !== jobId || r.folder !== folder);
+    if (!exact && conflict) throw Error('instance ' + instance + ' уже снимался с другим поручением/папкой (' + conflict.job_id + ', ' + conflict.folder + '): конфликт release_orphan.');
+    // team-v56 К2 (ревью круг 3): extra.revoked_admission явно фиксирует в записи слова, отзывалась ли постановка (замок без
+    // собственного jobId снимается, но admission/session не отзывается — связь не доказана).
+    const record = exact || write({ kind: 'release_orphan', lock_instance: instance, job_id: jobId, folder, quote, recorded_by: client, source: 'chat-' + client, ...extra });
+    return apply(record);
+  });
+}
+// Точная прежняя запись освобождения (instance+jobId+folder) для идемпотентного «уже снято» без нового отзыва.
+function findOrphanRelease(instance, jobId, folder) {
+  return lines().find(r => r.kind === 'release_orphan' && r.lock_instance === instance && r.job_id === jobId && r.folder === folder) || null;
 }
 
 function listText(now = Date.now()) {
   const rows = read(), m = mode(now);
   const fallback = claudeEntries().map(r => local(Date.parse(r.at)) + ' · Claude · ' + ({ record: 'слово', return: 'возврат', handover: 'дирижёр остановился', conductor: 'смена дирижёра' }[r.kind]) +
     (r.quote ? ' „' + r.quote + '“' : '') + (r.recorded_by || r.conductor || r.by ? ' · ' + NAMES[r.conductor || r.recorded_by || r.by] : '') + ' · ' + r.id);
-  const stops = lines().filter(r => r.kind === 'stop_confirm' || r.kind === 'job_close').map(r => local(Date.parse(r.at)) + ' · ' + (r.kind === 'stop_confirm' ? 'подтверждение остановки' : 'закрытие словом') + ' · ' + r.job_ids.join(', ') + ' · „' + r.quote + '“ · ' + r.id);
-  if (!rows.length && !fallback.length && !stops.length) return 'Записей слова нет.';
-  return [...stops, ...(fallback.length ? ['Запасной режим: ' + (m.active ? 'действует, дирижёр ' + NAMES[m.conductor] : 'не действует'), ...fallback] : []), ...rows.map(r => {
+  const stops = lines().filter(r => ['stop_confirm', 'job_close', 'release_orphan'].includes(r.kind)).map(r => local(Date.parse(r.at)) + ' · ' +
+    (r.kind === 'stop_confirm' ? 'подтверждение остановки' : r.kind === 'job_close' ? 'закрытие словом' : 'снятие осиротевшего замка') + ' · ' +
+    (r.kind === 'release_orphan' ? r.job_id + ' (instance ' + r.lock_instance + ')' : r.job_ids.join(', ')) + ' · „' + r.quote + '“ · ' + r.id);
+  // team-v59: слово владельца, перекрывшее правило (голоса при слиянии, вход, запись слова), — отдельной строкой.
+  const overrides = lines().filter(r => r.kind === 'owner_override').map(r => local(Date.parse(r.at)) + ' · слово владельца перекрыло · ' +
+    (r.overrides || '?') + ' · „' + r.quote + '“ · ' + r.id);
+  if (!rows.length && !fallback.length && !stops.length && !overrides.length) return 'Записей слова нет.';
+  return [...stops, ...overrides, ...(fallback.length ? ['Запасной режим: ' + (m.active ? 'действует, дирижёр ' + NAMES[m.conductor] : 'не действует'), ...fallback] : []), ...rows.map(r => {
     const at = Date.parse(r.at), back = success(r.who_down, at, now);
     const state = back ? 'не действует: успешный ответ ' + back.id
       : now - at >= DAY ? 'истекло' : 'действует до ' + local(at + DAY);
@@ -172,4 +219,4 @@ function listText(now = Date.now()) {
   })].join('\n');
 }
 
-module.exports = { DAY, NAMES, dir, file, ms, lines, read, claudeEntries, mode, append, transact, entry, holds, active, latest, byId, success, record, line, local, listText, recordStopConfirmation, recordJobClose };
+module.exports = { DAY, NAMES, dir, file, ms, lines, read, claudeEntries, mode, append, transact, entry, holds, active, latest, byId, success, record, line, local, listText, recordStopConfirmation, recordJobClose, recordOrphanRelease, findOrphanRelease };

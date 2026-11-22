@@ -118,6 +118,10 @@ async function migrate(options = {}) {
   const state = options.state || options.stateDir;
   const env = options.env || process.env;
   if ((env.MOST_CLIENT || 'claude') !== 'claude' || env.MOST_PROBE_ONLY === '1') return;
+  // team-v63 (п.17, заявка DeepSeek №5): дочерние серверы участников, поднятые исполнителем сценариев (senderRunner),
+  // НЕ запускают первичную миграцию — иначе пять серверов на одном состоянии затевали бы пять сверок разом (сериализуются
+  // замком, но это впустую), а сами сценарные дети оперируют карточками напрямую и в переносе старых карточек не нуждаются.
+  if (env.MOST_SCENARIO_CHILD === '1') return;
   if (!require('./paths').samePath(state, path.join(root, 'state'))) return;
   fs.mkdirSync(state, { recursive: true });
   const locks = require('./locks');
@@ -254,14 +258,69 @@ async function migrate(options = {}) {
     return result;
   } finally { await lock.release(); }
 }
-// Первичная сверка — барьер перед подключением MCP, ready и запуском очередей.
+// Гейт первичной миграции (team-v62): пока она не завершилась — успехом ИЛИ записанной ошибкой — обработчики инструментов,
+// которым нужно перенесённое состояние, ждут её (с пределом), а периодические триггеры очереди/уборки не запускаются.
+// На initialize/tools/list гейт не влияет: их обслуживает MCP ещё до вызова инструментов.
+let primarySettled = false, settleResolve, started = false;
+const settledPromise = new Promise(resolve => { settleResolve = resolve; });
+function settlePrimary() { if (!primarySettled) { primarySettled = true; settleResolve(); } }
+// Миграция вообще применима? (как проверяет migrate(): только клиент claude, не проба, состояние == <repo>/state).
+// Если неприменима — барьера нет: ждать нечего.
+function applicable(env = process.env) {
+  if ((env.MOST_CLIENT || 'claude') !== 'claude' || env.MOST_PROBE_ONLY === '1' || env.MOST_SCENARIO_CHILD === '1') return false;
+  const paths = require('./paths');
+  try { return paths.samePath(paths.stateDir, path.join(paths.repoRoot, 'state')); } catch { return false; }
+}
+// team-v63 (п.18, заявка Gemini): барьер «состояние ещё переносится» надо ВЗВЕСТИ синхронно ДО server.connect — иначе вызов
+// инструмента, пришедший между connect() и .then(start()), проскочил бы мимо (started ещё false → waitPrimary пропускал). arm()
+// ставит started синхронно, когда миграция применима; его зовёт бутстрап КАЖДОГО сервера перед connect. Тесты без бутстрапа
+// arm() не зовут → для них барьер не висит. Идемпотентно.
+function arm() { if (!started && applicable()) started = true; return started; }
+function armedForTest() { return started; }
+function resetForTest() { started = false; primarySettled = false; }
+function primaryDone() { return primarySettled; }
+// Ждём завершения первичной миграции не дольше timeoutMs. true — завершилась (или миграция неприменима).
+async function waitPrimary(timeoutMs = Number(process.env.MOST_MIGRATION_WAIT_MS) || 20000) {
+  // team-v63 (Г): ждать нечего, если первичная сверка в ЭТОМ процессе не запускалась (start() не вызван). start() вызывается
+  // в бутстрапе сервера синхронно сразу после server.connect — раньше, чем событийный цикл обработает первый вызов инструмента,
+  // — поэтому `started` к этому моменту уже выставлен, и боевой барьер сохраняется. А тесты, грузящие обработчики сервера БЕЗ
+  // бутстрапа (internals), не вызывают start(): для них барьер не висит пустые 20 с (дефект: зависимость теста от миграции,
+  // которой нет). Признак применимости миграции (applicable) оставлен как есть.
+  if (primarySettled || !applicable() || !started) return true;
+  let timer;
+  const timedOut = new Promise(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs)); });
+  const settled = await Promise.race([settledPromise.then(() => true), timedOut]);
+  clearTimeout(timer);
+  return settled;
+}
+// Для обработчика инструмента: null — состояние готово; иначе понятный текст с предложением повторить.
+async function awaitPrimary(timeoutMs = Number(process.env.MOST_MIGRATION_WAIT_MS) || 20000) {
+  if (await waitPrimary(timeoutMs)) return null;
+  return 'Состояние ещё переносится, повторите через ' + Math.max(1, Math.ceil(timeoutMs / 1000)) + ' с.';
+}
+// Первичная сверка идёт в ФОНЕ после server.connect; её ошибка не теряется, повтор по таймеру ставится всегда.
 async function start(options, scheduler = {}) {
-  const result = await migrate(options);
-  if (!result) return;
+  started = true; // team-v63 (Г): синхронно отмечаем, что первичная сверка запущена в этом процессе (см. waitPrimary).
   const root = options.root || options.repoRoot, state = options.state || options.stateDir;
   const env = options.env || process.env;
+  let result, failed = null;
+  try {
+    result = await migrate(options);
+  } catch (error) {
+    failed = error;
+    try { atomic(path.join(state, 'migration-error.json'), JSON.stringify({ at: new Date().toISOString(), error: error.message })); }
+    catch (writeError) { console.error('Перенос хранилища: не удалось записать migration-error.json: ' + writeError.message); }
+    // Текст ошибки — в журнал сервера (не только «сбой операции»); он же виден в team_status.
+    console.error('Перенос хранилища: первичная сверка не завершена: ' + (error && error.message || error));
+  } finally {
+    // Барьер снят: обработчики инструментов больше не ждут, периодические триггеры могут запускаться.
+    settlePrimary();
+  }
+  // Миграция неприменима (не claude / проба / другое состояние) — ни повтора, ни барьера не нужно.
+  if (!failed && !result) return;
   const sources = sourcesFor(options, root, env);
-  if (!sources.some(source => fs.existsSync(source))) return;
+  // При успехе без источников повтор не нужен; при первичном СБОЕ таймер повторной сверки ставим всегда.
+  if (!failed && !sources.some(source => fs.existsSync(source))) return;
   let running = false;
   const schedule = scheduler.setInterval || setInterval;
   const cancel = scheduler.clearInterval || clearInterval;
@@ -272,10 +331,10 @@ async function start(options, scheduler = {}) {
     try { await migrate(options); }
     catch (error) {
       atomic(path.join(state, 'migration-error.json'), JSON.stringify({ at: new Date().toISOString(), error: error.message }));
-      console.error('Перенос хранилища: сверка не завершена; подробности в team_status.');
+      console.error('Перенос хранилища: сверка не завершена: ' + error.message);
     } finally { running = false; }
   }, INTERVAL_MS);
   timer.unref?.();
   return timer;
 }
-module.exports = { migrate, start, bundle, marker, VERSION, INTERVAL_MS };
+module.exports = { migrate, start, bundle, marker, VERSION, INTERVAL_MS, waitPrimary, awaitPrimary, primaryDone, applicable, arm, armedForTest, resetForTest };

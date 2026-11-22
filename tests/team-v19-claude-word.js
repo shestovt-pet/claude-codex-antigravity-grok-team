@@ -152,11 +152,14 @@ test('3, Р-ж: гость-поручение — слово, поручения
   fs.renameSync(lib('user-word').file(), lib('user-word').file() + '.bak');
   as('codex');
   assert.doesNotThrow(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't' })); // team-v25: чат, не поручение
-  assert.throws(() => acc.guard('antigravity', 'antigravity_apply', { id: 'x', owner: OWNER }), /^Error: Гостю это действие запрещено/, 'перенос');
+  // team-v58: перенос (antigravity_apply) из чата участника открыт — полный набор дирижёра.
+  assert.doesNotThrow(() => acc.guard('antigravity', 'antigravity_apply', { id: 'x', owner: OWNER }), 'перенос из чата открыт');
   // team-v48e Г4b-2: team_work-изменение гостю-чату открыто безусловно (тумблер MOST_GUEST_STRICT удалён).
   assert.doesNotThrow(() => acc.guard('team', 'team_work', { action: 'update', owner: OWNER }), 'работа открыта');
-  for (const a of [{ action: 'record', who_down: 'codex', quote: 'Codex отвалился', owner: OWNER }, { action: 'return', quote: 'вернулся', owner: OWNER },
-    { action: 'handover', owner: OWNER }, { action: 'rebind', quote: 'x', owner: OWNER }])
+  // team-v58: слово о помощнике из чата участника записывается (source chat-codex), а не отказывается.
+  assert.match(await team().word({ action: 'record', who_down: 'codex', quote: 'Codex отвалился', owner: OWNER }), /Записал/);
+  // Возврат/остановка/перепривязка без активного запасного режима по-прежнему отказывают (режим не действует / пишет дирижёр).
+  for (const a of [{ action: 'return', quote: 'вернулся', owner: OWNER }, { action: 'handover', owner: OWNER }, { action: 'rebind', quote: 'x', owner: OWNER }])
     await assert.rejects(team().word(a), /^Error: Гостю это действие запрещено/, a.action);
   fs.renameSync(lib('user-word').file() + '.bak', lib('user-word').file());
   const count = lib('user-word').claudeEntries().length;
@@ -214,38 +217,43 @@ test('5, К3: дирижёр забирает работу с живым пор�
   assert.equal(w.owner, OWNER); assert(w.previous_owners.includes('claude-sess'));
 });
 
-test('6, Р-д, К6: Claude при активном режиме — изменения отказ с текстом Р-д; чтение проходит, баннер первой строкой', async () => {
+test('6, team-v58 (часть А): чат самого Claude при активном режиме НЕ уступает дирижёру — полный набор; владение защищает, баннер первой строкой', async () => {
   ready(); const w = await claudeWork(); await word('codex');
   as('claude'); const acc = lib('access'), t = team();
-  await assert.rejects(t.work({ action: 'update', name: 'w', owner: 'claude-sess', expected_revision: w.revision, next_step: 'x' }), RD);
-  for (const action of ['create', 'claim', 'close']) assert.throws(() => acc.guard('team', 'team_work', { action, name: 'w' }), RD);
-  assert.throws(() => acc.guard('team', 'team_change', { action: 'commit' }), RD);
-  await assert.rejects(t.word({ action: 'record', who_down: 'codex', quote: 'Codex отвалился' }), RD);
-  assert.throws(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't', work: 'w', stage: 'Итог' }), RD);
-  assert.throws(() => acc.guard('antigravity', 'antigravity_send', { task: 't', work: 'w', stage: 'Итог' }), RD);
-  assert.throws(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't', write: true }), RD);
-  // Перенос и отмена — тоже изменения (Codex 1c35bf39 п. 1); очередь дирижёра основной сервер исполняет сам (случай 13).
+  assert(lib('user-word').mode().active && lib('user-word').mode().conductor === 'codex', 'режим активен, дирижёр Codex');
+  assert.equal(acc.chatSession(), true, 'чат Claude с доказанным происхождением');
+  // Слово владельца (18.11.2026): чат Claude в запасном режиме получает тот же полный набор, что и чаты остальных —
+  // режим больше его не ограничивает; от двойного ведения одной работы защищает владение работой (owner), а не режим.
+  for (const action of ['create', 'claim', 'close']) assert.doesNotThrow(() => acc.guard('team', 'team_work', { action, name: 'w' }), action);
+  assert.doesNotThrow(() => acc.guard('team', 'team_change', { action: 'commit' }), 'team_change commit');
+  assert.doesNotThrow(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't', work: 'w', stage: 'Итог' }), 'codex_send work');
+  assert.doesNotThrow(() => acc.guard('antigravity', 'antigravity_send', { task: 't', work: 'w', stage: 'Итог' }), 'antigravity_send work');
+  assert.doesNotThrow(() => acc.guard('codex', 'codex_send', { folder: PROJECT, task: 't', write: true }), 'codex_send write');
   for (const [server, tool, a] of [['antigravity', 'antigravity_apply', { id: 'x', to: path.join(PROJECT, 'x.txt') }], ['antigravity', 'antigravity_cancel', { id: 'x' }],
-    ['codex', 'codex_cancel', { id: 'x' }], ['grok', 'grok_cancel', { id: 'x' }]]) assert.throws(() => acc.guard(server, tool, a), RD, tool);
+    ['codex', 'codex_cancel', { id: 'x' }]]) assert.doesNotThrow(() => acc.guard(server, tool, a), tool);
+  // Чтение проходит как прежде.
   for (const [server, tool, a] of [['team', 'team_status', {}], ['team', 'team_work', { action: 'get' }], ['team', 'team_work', { action: 'list' }], ['codex', 'codex_status', {}],
     ['codex', 'codex_result', { id: 'x' }], ['team', 'team_change', { action: 'diff' }], ['team', 'team_word', { action: 'list' }], ['codex', 'codex_send', { folder: PROJECT, task: 't' }]]) acc.guard(server, tool, a);
+  // Владение работой (owner), а не режим: update с чужой меткой — отказ (защита от двух ведущих одну работу).
+  await assert.rejects(t.work({ action: 'update', name: 'w', owner: 'claude-sess-other', expected_revision: w.revision, next_step: 'x' }), /владение|Работа жив/);
   const s = await mcp('team', 'claude');
   try {
     const st = await s.call('team_status', {}); assert(!st.error, st.text);
+    // Баннер запасного режима остаётся первой строкой — режим живёт как отметка состояния.
     assert.match(st.text.split('\n')[0], /^Запасной режим: дирижёр Codex с \d\d:\d\d \(слово „Claude отвалился“, word-[0-9a-f-]+\); чат с меткой fallback-codex-ab12$/);
-    const get = await s.call('team_work', { action: 'get', name: 'w', owner: 'claude-sess' }); assert(!get.error, get.text); assert.match(get.text, /^Запасной режим: дирижёр Codex/);
-    const upd = await s.call('team_work', { action: 'update', name: 'w', owner: 'claude-sess', expected_revision: w.revision, next_step: 'x' });
-    assert(upd.error); assert.match(upd.text, /^Запасной режим: дирижёр Codex/); assert.match(upd.text, /Ничего не меняй/);
+    const get = await s.call('team_work', { action: 'get', name: 'w', owner: 'claude-sess' }); assert(!get.error, get.text);
   } finally { await s.close(); }
 });
 
-test('7, Р-б: дирижёр — team_change любое действие — отказ; инструмента у гостя нет', async () => {
+test('7, team-v58: чат участника (дирижёр запасного режима) ведёт team_change целиком; инструменты зарегистрированы', async () => {
   ready(); await word('codex'); as('codex'); const acc = lib('access');
-  for (const action of ['diff', 'precheck', 'list', 'commit', 'merge', 'deploy']) assert.throws(() => acc.guard('team', 'team_change', { action, owner: OWNER }), /Гостю это действие запрещено/);
+  // team-v58: чат любого участника получает полный набор дирижёра — все действия team_change открыты и в запасном режиме.
+  for (const action of ['diff', 'precheck', 'list', 'commit', 'merge', 'deploy']) assert.doesNotThrow(() => acc.guard('team', 'team_change', { action, owner: OWNER }), action);
   const s = await mcp('team', 'codex', guestEnv());
   try {
-    const tools = await s.tools(); assert(!tools.includes('team_change')); assert(tools.includes('team_word'));
-    assert((await s.call('team_change', { action: 'list' })).error);
+    const tools = await s.tools(); assert(tools.includes('team_change'), 'team_change зарегистрирован'); assert(tools.includes('team_word'));
+    const r = await s.call('team_change', { action: 'list' });
+    assert(!(r.error && /запрещено/.test(r.text)), 'team_change list не отказан чату: ' + r.text);
   } finally { await s.close(); }
 });
 
@@ -349,9 +357,9 @@ test('10, К1: смена дирижёра — слово о Codex из чата
   assert.equal(W.mode(Date.now() + 25 * HOUR).conductor, 'antigravity');
   job('codex', { task: 'другая работа' });
   assert.equal(W.mode().conductor, 'antigravity'); assert.equal(W.mode(Date.now() + 25 * HOUR).conductor, 'antigravity');
-  // Участник другой семьи слово о себе дирижёром не пишет; Grok — только дирижёр.
+  // team-v59: запись слова «X отвалился» ведёт любой доказанный чат (ограничение мест снято); Grok — не записываемый помощник.
   as('codex');
-  await assert.rejects(team().word({ action: 'record', who_down: 'grok', quote: 'Грок отвалился', owner: OWNER }), /Гостю это действие запрещено|записывает дирижёр/);
+  await assert.rejects(team().word({ action: 'record', who_down: 'grok', quote: 'Грок отвалился', owner: OWNER }), /Гостю это действие запрещено|записывает дирижёр|who_down/);
 });
 
 test('11, К2: сервер своей семьи — инструменты у гостя с самого старта; без режима чат Codex — разрешён, Antigravity — отказ; дирижёр — новое поручение', async () => {
@@ -363,7 +371,8 @@ test('11, К2: сервер своей семьи — инструменты у 
     assert(!r.error, r.text); assert.match(r.text, /В ОЧЕРЕДИ/);
   } finally { await s.close(); }
   const team = await mcp('team', 'codex', guestEnv());
-  try { assert.deepEqual(await team.tools(), ['team_ask', 'team_ask_result', 'team_rules', 'team_status', 'team_word', 'team_work']); } finally { await team.close(); }
+  // team-v58: чат участника получает полный набор дирижёра на team — все девять инструментов.
+  try { assert.deepEqual(await team.tools(), ['team_ask', 'team_ask_result', 'team_change', 'team_inbox', 'team_members', 'team_rules', 'team_scenario', 'team_status', 'team_word', 'team_work']); } finally { await team.close(); }
   const agy = await mcp('antigravity', 'antigravity', guestEnv());
   // team-v48e Г4b-2b: свой сервер Antigravity открыт гостю безусловно (как Codex) — antigravity_send проходит guard
   // (упирается в проверку режима review, а не в «только дирижёр»); тумблер MOST_GUEST_STRICT удалён.
@@ -417,7 +426,7 @@ test('12, К2: codex_send write=true от дирижёра Antigravity — ос�
   } finally { await main.close(); }
 });
 
-test('13, К2: antigravity_apply — от дирижёра Codex и от дирижёра Antigravity (своё поручение «текст») исполняет основной сервер; гость без прав — отказ', async () => {
+test('13, К2/v58: antigravity_apply — из чата участника (в т.ч. с любой меткой сеанса) исполняет основной сервер из очереди', async () => {
   ready();
   const main = await mcp('antigravity', 'claude', { AGY_PATH: path.join(__dirname, 'fake-agy.js'), MOST_AGY_INPUT_FORMAT: 'legacy', MOST_QUEUE_TICK_MS: '100' });
   const cardOf = id => read(path.join(STATE, 'jobs', id, 'card.json'));
@@ -428,8 +437,9 @@ test('13, К2: antigravity_apply — от дирижёра Codex и от дир�
     await word('codex');
     const other = await mcp('antigravity', 'codex', guestEnv({ MOST_AGY_INPUT_FORMAT: 'legacy' }));
     try {
+      // team-v58: перенос из чата участника открыт независимо от метки сеанса — ставится в очередь основного сервера.
       const r = await other.call('antigravity_apply', { id: id1, to: path.join(PROJECT, 'out1.txt'), owner: 'fallback-codex-zz99' });
-      assert(r.error); assert.match(r.text, /только у дирижёра запасного режима/);
+      assert(!r.error, r.text); assert.match(r.text, /поставлен в очередь основного сервера/);
       const ok = await other.call('antigravity_apply', { id: id1, to: path.join(PROJECT, 'out1.txt'), owner: OWNER });
       assert(!ok.error, ok.text); assert.match(ok.text, /поставлен в очередь основного сервера/);
     } finally { await other.close(); }
@@ -515,7 +525,8 @@ test('16, Р-в: слово о Claude старше суток — режим д�
   write(lib('user-word').file(), JSON.stringify({ id: 'word-old', at: iso(Date.now() - 30 * HOUR), kind: 'record', who_down: 'claude', quote: 'Claude отвалился',
     source: 'chat-codex', recorded_by: 'codex', owner: OWNER, fingerprint: { pid: 4100, startedAt: APP_AT } }) + '\n');
   const m = lib('user-word').mode(); assert(m.active); assert.equal(m.conductor, 'codex');
-  as('claude'); assert.throws(() => lib('access').guard('team', 'team_work', { action: 'update' }), RD);
+  // team-v58 (часть А): «режим действует» проверяется активностью (m.active); чат Claude режимом больше не ограничивается.
+  as('claude'); assert.doesNotThrow(() => lib('access').guard('team', 'team_work', { action: 'update' }));
 });
 
 test('17, Р-а, К8: host-fallback enter и roles-propose — указатель на rules/fallback.md, код 1; scripts/roles.cmd → task-roles-cli работает', async () => {
@@ -635,7 +646,8 @@ test('22, К4а: этап Claude — поручение «текст» Codex —
   fs.writeFileSync(copy, 'испорчено');
   await assert.rejects(cont(S1.id), /continue_stage: копии файла claude\.md в снимке нет или она не совпадает с хешем снимка — частичный результат Claude только из снимка/);
   fs.writeFileSync(copy, 'Начало текста Claude\n');
-  as('claude'); await assert.rejects(t.work({ action: 'update', name: 'c22', owner: 'claude-sess', expected_revision: w.revision, continue_stage: { id: S1.id, author: { family: 'openai', model: 'gpt-6' } } }), RD);
+  // team-v58 (часть А): чат Claude режимом не ограничен, но работу c22 ведёт дирижёр (owner) — отказ по владению, не по режиму.
+  as('claude'); await assert.rejects(t.work({ action: 'update', name: 'c22', owner: 'claude-sess', expected_revision: w.revision, continue_stage: { id: S1.id, author: { family: 'openai', model: 'gpt-6' } } }), /владение передано/);
   as('codex');
   await cont(S1.id, { material: ['codex.md'] });
   w = read(c.workFile('c22'));
@@ -756,26 +768,28 @@ test('25, К2: разрешения Antigravity и config.toml — team_word и 
   const text = cc.toml('# мой текст\n', rel, REPO, STATE, 'node');
   assert(text.includes('env_vars = ["MOST_JOB_ID"]'));
   const servers = cc.block(text).parsed.root.mcp_servers;
-  assert.deepEqual(Object.keys(servers).sort(), ['antigravity', 'codex', 'team']);
+  assert.deepEqual(Object.keys(servers).sort(), [...lib('members').installedServers].sort());
   for (const n of Object.keys(servers)) {
     assert.deepEqual(servers[n].env_vars, ['MOST_JOB_ID'], n); assert.equal(servers[n].default_tools_approval_mode, 'approve', n); assert.equal(servers[n].env.MOST_CLIENT, 'codex', n);
   }
   assert.equal(cc.toml(text, rel, REPO, STATE, 'node'), text, 'повтор установки');
   const agy = cc.jsonConfig({}, 'agy', rel, REPO, STATE, 'node');
-  assert.deepEqual(Object.keys(agy.mcpServers).sort(), ['antigravity', 'codex', 'team']);
+  assert.deepEqual(Object.keys(agy.mcpServers).sort(), [...lib('members').installedServers].sort());
   const acc = lib('access');
-  assert.deepEqual(acc.guestTools('team', 'codex'), ['team_status', 'team_rules', 'team_work', 'team_ask', 'team_ask_result', 'team_word']);
+  // team-v58: чат участника получает полный набор дирижёра; Grok (не член связки) — прежний набор только для чтения/вопросов.
+  assert.deepEqual(acc.guestTools('team', 'codex'), ['team_status', 'team_rules', 'team_members', 'team_change', 'team_word', 'team_work', 'team_inbox', 'team_ask', 'team_ask_result', 'team_scenario']);
   assert.deepEqual(acc.guestTools('team', 'grok'), ['team_status', 'team_rules', 'team_work', 'team_ask', 'team_ask_result']);
   assert.deepEqual(acc.guestTools('codex', 'codex'), ['codex_status', 'codex_send', 'codex_result', 'codex_cancel']);
-  assert.deepEqual(acc.guestTools('antigravity', 'codex'), ['antigravity_status', 'antigravity_send', 'antigravity_result', 'antigravity_apply']);
+  assert.deepEqual(acc.guestTools('antigravity', 'codex'), ['antigravity_status', 'antigravity_send', 'antigravity_result', 'antigravity_apply', 'antigravity_cancel']);
   // team-v48e Г4b: свой сервер (claude→codex) открыт безусловно (тумблер MOST_GUEST_STRICT удалён).
   assert.deepEqual(acc.guestTools('codex', 'claude'), ['codex_status', 'codex_send', 'codex_result', 'codex_cancel']);
   const probe = lib('probe').probe, file = path.join(ROOT, 'servers', 'team', 'index.js');
   const base = { ...process.env, MOST_CLIENT: 'codex', MOST_PROBE_ONLY: '1' };
   const full = (await probe(file, { ...base, MOST_PROBE_GUEST: 'full' })).tools.map(t => t.name).sort();
-  assert.deepEqual(full, ['team_ask', 'team_ask_result', 'team_rules', 'team_status', 'team_word', 'team_work']);
+  // team-v58: полная проба чата участника включает весь набор дирижёра team.
+  assert.deepEqual(full, ['team_ask', 'team_ask_result', 'team_change', 'team_inbox', 'team_members', 'team_rules', 'team_scenario', 'team_status', 'team_word', 'team_work']);
   const legacy = (await probe(file, base)).tools.map(t => t.name).sort();
-  assert.deepEqual(legacy, ['team_rules', 'team_status', 'team_work'], 'установщик прежнего релиза проверяет прежним списком');
+  assert.deepEqual(legacy, ['team_rules', 'team_status', 'team_work'], 'установщик прежнего релиза проверяет прежним списком (без team_change)');
   const own = (await probe(path.join(ROOT, 'servers', 'codex', 'index.js'), { ...base, MOST_PROBE_GUEST: 'full' })).tools.map(t => t.name).sort();
   assert.deepEqual(own, ['codex_cancel', 'codex_result', 'codex_send', 'codex_status']);
 });
@@ -993,11 +1007,12 @@ test('Т1–Т9: тексты правил запасного режима', asy
   assert(agents.includes('по решению Claude или дирижёра запасного режима (rules/fallback.md)')); assert(agents.includes('в запасном режиме — тоже только через поручения'));
   for (const [f, label] of [['rules/helpers/codex-section.md', 'fallback-codex-'], ['rules/helpers/antigravity-section.md', 'fallback-antigravity-']]) {
     const s = text(f);
-    assert(s.includes('Claude — дирижёр и судья, кроме запасного режима') && (f.includes('codex-section') ? s.includes('Чат Codex может сам ставить поручения через мост, в том числе себе') : s.includes('кроме запасного режима по слову пользователя (ниже)')) && s.includes(label) && s.includes('team_word handover'), f);
+    // team-v58 (часть А, пункт 2): чат любого участника = полный набор дирижёра (прежние по-семейные ограничения сняты).
+    assert(s.includes('Claude — дирижёр и судья, кроме запасного режима') && s.includes(f.includes('codex-section') ? 'Чат Codex — полный набор дирижёра' : 'Чат Antigravity — полный набор дирижёра') && s.includes(label) && s.includes('team_word handover'), f);
   }
   assert(text('rules/helpers/antigravity-section.md').includes('«скажи это в чате Codex»'));
   const common = text('rules/common.md');
-  assert(common.includes('дирижёр замечание к работе своей семьи не отклоняет — только через пересмотр проверяющим') && common.includes('в запасном режиме изменения связки ждут Claude (rules/fallback.md)') &&
+  assert(common.includes('дирижёр замечание к работе своей семьи не отклоняет — только через пересмотр проверяющим') && common.includes('в запасном режиме прочие изменения связки ждут Claude (rules/fallback.md)') &&
     common.includes('в запасном режиме этап «высокий» ждёт Claude: помощника с чистой памятью без Claude нет.') && !common.includes('запасным ведущим с подтверждением человека'));
   const claude = text('rules/claude.md');
   for (const s of ['напоминание только смотрит статус и ничего не меняет', 'team_word return quote=<его реплика дословно>', 'сверки с текстом правил этого хода', 'сверка sha256 с исходником; расхождение — повторить запись']) assert(claude.includes(s), s);

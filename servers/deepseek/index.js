@@ -125,7 +125,21 @@ async function resolveId(id) {
 function reply(j, body, next = 'Проверьте результат.', error = false) {
   return { content: [{ type: 'text', text: format('DeepSeek', j, body, next) }], ...(error ? { isError: true } : {}) };
 }
+// team-v56 И8 (ревью Gemini-А 3): повтор request_id без карточки на диске не рапортует молча 'queued'. Различаем
+// recovery_required (с recoveryId), идущую постановку (владелец жив) и исчезнувшую постановку (владелец мёртв — явная ошибка).
+async function duplicateReply(r, requestId) {
+  const rec = r.record || {};
+  if (rec.phase === 'recovery_required')
+    return reply({ id: r.jobId, status: 'failed', requestId }, 'Повтор request_id ' + requestId + ': прежняя постановка требует восстановления (recovery_required' + (rec.recoveryId ? ' ' + rec.recoveryId : '') + '); карточка не создана.', 'Разберите незавершённую постановку.', true);
+  if (rec.committed)
+    return reply({ id: r.jobId, status: 'delivery_unclear', requestId }, 'Повтор request_id ' + requestId + ': поручение ' + r.jobId + ' постановлено, но карточка недоступна; доставка ответа неясна.', 'Запросите результат позже.', true);
+  let owner = 'unknown'; try { owner = await locks.ownerState(rec.owner); } catch {}
+  if (owner === 'alive' || owner === 'self')
+    return reply({ id: r.jobId, status: 'queued', requestId }, 'Повтор request_id ' + requestId + ': постановка ещё идёт (владелец активен); повторите запрос позже.');
+  return reply({ id: r.jobId, status: 'failed', requestId }, 'Повтор request_id ' + requestId + ': прежняя постановка оборвалась до публикации (владелец ' + owner + '); карточки нет. Повторите с новым request_id.', 'Повторите запрос.', true);
+}
 function view(j, offset = 0) {
+  const ml = j.modelChoiceLine ? j.modelChoiceLine + '\n' : ''; // team-v59 ч4: строка выбора модели — в карточке и ответе
   let body = j.error || '';
   if (j.status === 'queued') body = access.queued;
   if (j.status === 'done' && (!j.resultFile || !fs.existsSync(j.resultFile)))
@@ -134,9 +148,9 @@ function view(j, offset = 0) {
     const s = fs.readFileSync(j.resultFile, 'utf8');
     body += '\n' + s.slice(offset, offset + 24000);
     if (offset + 24000 < s.length)
-      return reply(j, body, 'Вызовите deepseek_result: id ' + j.id + ', from_char ' + (offset + 24000) + '.');
+      return reply(j, ml + body, 'Вызовите deepseek_result: id ' + j.id + ', from_char ' + (offset + 24000) + '.');
   }
-  return reply(j, body,
+  return reply(j, ml + body,
     j.status === 'needs_decision' ? 'Проверьте изменения и решите, продолжать ли.'
       : j.status === 'running' ? 'Запросите deepseek_result с id ' + j.id + '.' : 'Проверьте результат.');
 }
@@ -189,7 +203,7 @@ async function execute(job, folderLock) {
     try {
       const e = JSON.parse(s);
       if (e.type === 'session' && e.sessionId) { job.sessionId = e.sessionId; mutate(job.id, c => { c.sessionId = e.sessionId; }).catch(logFailure); }
-      if (e.type === 'final') { finalText = String(e.text ?? ''); completed = true; }
+      if (e.type === 'final') { finalText = String(e.text ?? ''); completed = true; const t = require('../../common/usage').genericTokens(e.usage); if (t) job.tokens = { ...(job.tokens || {}), ...t }; }
       if (e.type === 'tool_call') provenance.observe(job, 'deepseek', { toolNames: [e.tool] });
     } catch {}
   }
@@ -223,10 +237,21 @@ async function execute(job, folderLock) {
         const ev = profiles.sessionEvidence(job.sessionId);
         c.reportedModel = ev?.model || null;
         c.modelEvidence = ev?.evidence || null;
-        c.modelConfirmed = !!c.reportedModel && c.reportedModel === profiles.profileModel(job.profile || profiles.profileName(job), params);
+        c.modelConfirmed = !!c.reportedModel && c.reportedModel === job.launchModel;
         c.provenance = provenance.forJob(job, 'deepseek');
         c.finishedAt = new Date().toISOString();
         c.exitCode = code;
+        // team-v63 (п.6): объём ответа, секунды, токены (если CLI сообщил usage).
+        try { require('../../common/usage').finalize(c, { resultText: finalText == null ? undefined : finalText }); } catch {}
+        if (job.tokens) c.tokens = job.tokens;
+        if (Number.isFinite(c.chars_out)) c.sessionCharsOut = (c.sessionCharsOut || 0) + c.chars_out;
+        // team-v59 (Codex №1): поручение снято словом владельца на ходу — поздний результат карточку НЕ воскрешает: статус
+        // остаётся снятым, done/needs_decision не выставляется, голосом не считается, замок записи не возвращается.
+        if (require('../../common/live-jobs').closedByOwnerWord(c)) {
+          if (finalText !== null) { c.lateResultFile = path.join(path.dirname(file(job.id)), job.id + '.late.result.txt'); fs.writeFileSync(c.lateResultFile, finalText); }
+          c.lateResult = { at: c.finishedAt, exitCode: code, completed: !!completed }; c.voteEligible = false;
+          return;
+        }
         const deadlines = require('../../common/chain-deadline');
         if (c.status === 'running' && (deadlines.parentTerminal(c) || deadlines.deadlinePassed(c))) {
           c.status = 'cancelling'; c.stopReason = deadlines.parentTerminal(c) ? 'parent' : 'timeout';
@@ -249,7 +274,17 @@ async function execute(job, folderLock) {
           delete c.error;
         } else {
           c.status = c.write ? 'needs_decision' : 'failed';
-          c.error = 'DeepSeek не завершил поручение: ' + (error || errors || 'нет подтверждённого результата');
+          // team-v61 (п.13): исчерпание подписочной квоты DeepSeek — понятный прямой текст тем же общим модулем, что у Kimi,
+          // ТОЛЬКО по диагностике провайдера (stderr/ошибка запуска), как в п.1 (текст ответа в распознавание не идёт).
+          // Авто-продолжения у очереди DeepSeek нет — честно просим повторить (новое поручение).
+          const q = require('../../common/quota');
+          if (q.quotaExhausted([errors, error].filter(Boolean).join('\n'))) {
+            const provider = q.providerLine(errors || error);
+            c.error = 'Лимит DeepSeek исчерпан (подписочная квота)' + (provider ? ' (' + provider + ')' : '') + '. Повторите позже или отдайте работу другой семье.';
+            c.errorKind = 'quota';
+          } else {
+            c.error = 'DeepSeek не завершил поручение: ' + (error || errors || 'нет подтверждённого результата');
+          }
         }
         if (!c.treeWarning) delete c.stopUnconfirmed;
       });
@@ -294,18 +329,22 @@ async function execute(job, folderLock) {
   }
   job.fullAccessApplied = fullAccessAllowed(job) && job.write;
   job.profile = profiles.profileName(job);
+  job.launchModel ??= job.model ?? profiles.profileModel(job.profile, params);
   try {
-    await mutate(job.id, (c) => { c.fullAccessApplied = job.fullAccessApplied; c.profile = job.profile; c.dshVersion = dshVersion(); c.resultFile = job.resultFile; });
+    await mutate(job.id, (c) => { c.fullAccessApplied = job.fullAccessApplied; c.profile = job.profile; c.launchModel = job.launchModel; c.dshVersion = dshVersion(); c.resultFile = job.resultFile; });
     if (!process.env.MOST_DSH_NO_PROFILES) profiles.generate(params, undefined, bridgeParams());
     if (require('../../common/chain-deadline').deadlinePassed(job)) throw Error('Срок поручения истёк до запуска.');
-    const args = ['--profile', job.profile, '--json', '-']; // слово headless dsh считал задачей; «-» — задача из stdin (живые пробы 95ce3e03, 48edb61f, 406eb880)
+    // team-v63 (Б.1): продолжение сеанса headless dsh — флаг `--session-id <id>` (dsh --profile headless --help: «adopt the
+    // persisted Session with this id»). sessionId прошлого хода захвачен из потока (type:session) и сохранён в карточке;
+    // при продолжении он перенесён в job.sessionId (send). Без него — обычный новый сеанс.
+    const args = ['--profile', job.profile, '--json', ...(job.sessionId ? ['--session-id', job.sessionId] : []), '-']; // слово headless dsh считал задачей; «-» — задача из stdin (живые пробы 95ce3e03, 48edb61f, 406eb880)
     // team-v48e (ревью п.1): связку «фактическая папка записи ↔ замок» сверяем синхронно после последнего await,
     // непосредственно перед spawn (без await между сверкой и запуском), и запускаем с cwd = проверенный realpath.
     let cwd = job.folder;
     if (job.write) { folderLock = writeLock.reconcile(folderLock, job.folder, { jobId: job.id }); cwd = folderLock.owner.folder; }
     child = spawn(require('../../common/dsh-probe').command(currentBinary()), args, {
       cwd,
-      env: { ...require('../../common/fallback').jobEnv(job.id), DSH_HOME: profiles.profilesDir() },
+      env: { ...require('../../common/fallback').jobEnv(job.id), DSH_HOME: profiles.profilesDir(), [profiles.MODEL_ENV]: job.launchModel },
       windowsHide: true,
       detached: process.platform !== 'win32',
       // dsh — это .cmd на Windows; оболочка запускает его и передаёт stdin.
@@ -333,6 +372,7 @@ async function execute(job, folderLock) {
     poll = setInterval(guarded(function pollJob() {
       const j = load(job.id);
       if (require('../../common/chain-deadline').parentTerminal(j)) stop(job.id, 'parent').catch(logFailure);
+      else if (require('../../common/live-jobs').closedByOwnerWord(j)) killByWord(job.id); // снято словом владельца — штатный kill дерева
       else if (j.status === 'cancelling') stop(job.id, j.stopReason).catch(logFailure);
       else if (require('../../common/chain-deadline').deadlinePassed(j)) stop(job.id, 'timeout').catch(logFailure);
     }), 200);
@@ -340,7 +380,7 @@ async function execute(job, folderLock) {
       job.fullAccessApplied ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; каждое действие вне папки поручения перечисли в отчёте.'
         : job.write ? 'Изменения разрешены только в рамках поручения. Перечисли файлы и проверки.'
         : 'Только чтение. Не изменяй файлы.',
-      'Не обходи ограничения. Отвечай по-русски.', job.task, job.textFile ? 'Материал в файле: ' + job.textFile : ''].join('\n'));
+      'Не обходи ограничения. Отвечай по-русски.', job.task, job.textFile ? 'Материал в файле: ' + job.textFile : '', ...require('../../common/attachments').promptTail(job)].join('\n'));
   } catch (e) {
     await finish(null, e.message);
   }
@@ -370,6 +410,16 @@ async function stop(id, reason = 'cancel') {
   }
   setTimeout(guarded(() => { if (active.has(id)) mutate(id, (c) => { c.status = 'stop_unconfirmed'; c.stopUnconfirmed = { pid: e.child.pid }; }).catch(logFailure); }), 3000).unref();
 }
+// team-v59 (Codex №1): карточка уже снята словом владельца (статус терминален) — процесс останавливаем, статус не трогаем.
+function killByWord(id) {
+  const e = active.get(id);
+  if (!e || e.stopping) return;
+  e.stopping = true;
+  try {
+    if (process.platform === 'win32') execFileSync('taskkill.exe', ['/PID', String(e.child.pid), '/T', '/F'], { windowsHide: true, timeout: 10000, stdio: 'pipe' });
+    else process.kill(-e.child.pid, 'SIGKILL');
+  } catch { try { e.child.kill('SIGKILL'); } catch {} }
+}
 // team-v36: пути гостевых серверов моста для профилей поручений DeepSeek.
 function bridgeParams() {
   return { release: path.resolve(__dirname, '..', '..'), root: require('../../common/paths').repoRoot, node: process.execPath };
@@ -386,9 +436,20 @@ async function send(a) {
   if (extra) a.text = (a.text || '') + extra;
   if (!currentBinary() && !access.guest()) throw Error('Исполнитель DeepSeek не найден. Укажите DSH_PATH.');
   if (closing) throw Error('Сервер останавливается.');
-  if (!path.isAbsolute(a.folder) || !fs.existsSync(a.folder) || !fs.statSync(a.folder).isDirectory())
+  // team-v63 (п.5): действующая отметка «лимит исчерпан» (меньше 10 минут, без позднего успеха) — не запускаем CLI; force — всегда.
+  // team-v63 (п.19): продолжение (continue_id) при свежей отметке — тот же быстрый отказ (кроме force).
+  if (a.force !== true && !access.guest()) {
+    const qm = require('../../common/quota-mark').blocked(list());
+    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('DeepSeek', qm.at), 'Дождитесь сброса или передайте force: true.');
+  }
+  // team-v63 (п.1/п.16): вложения читаются сейчас; гостю без полного доступа — только из его папки поручения.
+  const _att = require('../../common/attachments');
+  const attachData = _att.read(a.files, { authorize: _att.guestAuthorizer({ guest: access.guest() && !access.chatSession(), folder: a.folder, fullAccess: a.full_access === true }) });
+  // team-v59 (часть 3 п.3в): роль «совет»/«текст» без записи и «проверка» text — папка необязательна (служебная пустая).
+  require('../../common/scratch-folder').ensure(a);
+  if (!path.isAbsolute(a.folder || '') || !fs.existsSync(a.folder) || !fs.statSync(a.folder).isDirectory())
     throw Error('Нужна абсолютная существующая папка.');
-  if (a.work && !a.stage) throw Error('Для работы укажите этап.');
+  if (a.work && !a.stage && a.role !== 'совет') throw Error('Для работы укажите этап.'); // team-v59 ч3: совет — этап не обязателен (незарегистрированная работа примется ярлыком)
   // team-v46 п.5а: общее правило папок для любой записи.
   if (a.write) {
     const fref = writeFolder.refusal(a.folder, { client: access.client(), guest: access.guest(), fullAccess: a.full_access === true, owner: a.owner });
@@ -396,8 +457,23 @@ async function send(a) {
   }
   const folder = fs.realpathSync(a.folder),
     id = randomUUID();
-  let prior = null, priorLock = null, folderLock = null;
+  let prior = null, priorLock = null, folderLock = null, admId = null, requestId = null, published = false;
   try {
+    // team-v56 Б0 (этап 2): устойчивая admission ВСЕГДА до захвата замка/публикации. request_id необязателен — при
+    // отсутствии сервер выдаёт новый и показывает его в ответе; повтор того же ID возвращает тот же номер, иные параметры
+    // того же ключа — REQUEST_ID_CONFLICT без карточки, замка и следов на диске.
+    {
+      const adm = require('../../common/job-admission');
+      const txt = a.text === undefined ? undefined : require('crypto').createHash('sha256').update(a.text).digest('hex');
+      const values = [['folder', require('../../common/scratch-folder').folderValue(a, folder)], ['task', a.task], ['text', txt], ['role', a.role], ['write', a.write === true],
+        ['full_access', a.full_access === true], ['model', a.model], ['level', a.level], ['files', attachData?.hash], ['continue_id', a.continue_id], ['work', a.work], ['stage', a.stage], ['stageId', a.stageId], ['stageTitle', a.stageTitle], ['gateOrder', a.gateOrder],
+        ['scopeTask', a.scopeTask], ['replaces', a.replaces], ['replacementEvidence', a.replacementEvidence], ['owner', a.owner],
+        ['parentJob', require('../../common/job-chain').fields(a).parentJob], ['opora', a.opora]];
+      const r = await adm.begin({ adapter: 'dsh-headless', access, requestId: a.request_id, values, newJobId: id });
+      requestId = r.requestId;
+      if (r.duplicate) { require('../../common/scratch-folder').discard(a); try { return view(load(r.jobId)); } catch {} return await duplicateReply(r, requestId); }
+      admId = r.admissionId;
+    }
     if (a.continue_id) {
       const full = await resolveId(a.continue_id);
       priorLock = await locks.tryLock('deepseek_queue', full, { jobId: id });
@@ -407,27 +483,38 @@ async function send(a) {
       if (prior.archived || !['done', 'failed', 'needs_decision'].includes(prior.status) || prior.stopUnconfirmed)
         throw Error('Продолжение недоступно: нужно завершённое поручение с подтверждённой остановкой.');
       if (canon(prior.folder) !== canon(folder) || prior.write !== a.write) throw Error('Сохраните папку и режим записи предыдущего поручения.');
+      // team-v63 (Б.1): для продолжения нужен сохранённый sessionId прошлого хода (его захватывает поток type:session).
+      // Нет сеанса — честный отказ: без него dsh начал бы новый разговор без памяти.
+      if (!prior.sessionId) throw Error('Продолжение недоступно: прошлое поручение не оставило сеанса dsh (нет sessionId).');
     }
-    if (a.write) {
-      folderLock = await writeLock.acquire(folder, { jobId: id });
-      if (!folderLock.ok) throw Error(folderLock.needsDecision ? 'Нужно решение: остановка прежнего исполнителя не подтверждена; замок записи сохранён.' : 'В этой папке (или вложенной) уже идёт поручение с записью.');
-    }
+    // team-v56 Б0 п.1: модель/профиль, медленная подготовка профиля проверки, stage/chain/срок — ДО захвата write-lock.
     const params = adapterParams();
-    a.model ??= prior?.model ?? profiles.modelFor({ role: a.role, write: a.write, fullAccessApplied: fullAccessAllowed({ fullAccess: a.full_access === true, write: a.write, role: a.role, from: access.client() }) }, params);
-    if (!access.guest() && restartServer) restartHold.assertAdmitted(stateDir, restartServer, { early: true });
-    // Профиль назначается сервером до ворот этапа: проверка этапа требует most-review (ревью Codex f977c3d4, п.1).
+    // Профиль назначается до ворот этапа: для проверки сохраняется most-review при любой модели.
     a.profile = profiles.profileName({ role: a.role, write: a.write, fullAccessApplied: fullAccessAllowed({ fullAccess: a.full_access === true, write: a.write, role: a.role, from: access.client() }) });
+    const mc = require('../../common/model-choice');
+    const dsChoice = mc.choose('deepseek', a);
+    const inherited = prior?.launchModel ?? prior?.model;
+    a.model ??= dsChoice.byLevel ? dsChoice.model : inherited ?? profiles.profileModel(a.profile, params);
+    if (!/^[a-z0-9][a-z0-9._:/-]*$/i.test(a.model)) throw Error('Недопустимая модель DeepSeek.');
+    const modelChoiceLine = mc.line('deepseek', { ...dsChoice, model: a.model }, dsChoice.named, a.model);
+    if (!access.guest() && restartServer) restartHold.assertAdmitted(stateDir, restartServer, { early: true });
     if (a.role === 'проверка' && !access.guest() && !process.env.MOST_DSH_NO_PROFILES) await require('../../common/dsh-probe').ensure().catch(logFailure);
     await require('../../common/stage-gate').prepareJob(a, 'deepseek');
     const chainFields = require('../../common/job-chain').fields(a);
     const dl = require('../../common/chain-deadline').applyDeadline(chainFields, access.client(), 'deepseek');
     if (dl.error) throw Error(dl.error);
+    // Захват замка — последний шаг перед публикацией: дальше только построение карточки, запись входа и save/commit.
+    if (a.write) {
+      folderLock = await writeLock.acquire(folder, { jobId: id });
+      if (!folderLock.ok) throw Error(folderLock.needsDecision ? 'Нужно решение: остановка прежнего исполнителя не подтверждена; замок записи сохранён.' : 'В этой папке (или вложенной) уже идёт поручение с записью.');
+    }
     const job = {
-      id, folder, write: a.write, fullAccess: a.full_access === true, model: a.model,
-      profile: profiles.profileName({ role: a.role, write: a.write, fullAccessApplied: fullAccessAllowed({ fullAccess: a.full_access === true, write: a.write, role: a.role, from: access.client() }) }),
+      id, folder, write: a.write, fullAccess: a.full_access === true, model: a.model, launchModel: a.model, modelChoiceLine,
+      profile: a.profile,
       task: a.task,
       stage: a.stage, stageTitle: a.stageTitle, stageId: a.stageId, gateOrder: a.gateOrder, scopeTask: a.scopeTask, role: a.role, replaces: a.replaces, replacementEvidence: a.replacementEvidence,
       work: a.work,
+      workLabel: a.workLabel, workUnbound: a.workUnbound, // team-v62: имя работы-ярлыка (нелатинская/незарегистрированная) сохраняется для сводки и *_result
       from: require('../../common/job-identity').memberId(access.client()) || access.client(),
       ...chainFields,
       ...(access.guest() && access.client() === 'deepseek' && !process.env.MOST_JOB_ID ? { fromChat: 'deepseek' } : {}),
@@ -436,23 +523,40 @@ async function send(a) {
       owner: access.guest() ? null : locks.owner(),
       ownerLabel: a.owner,
       previous: prior?.id || null,
+      sessionId: prior?.sessionId || null, // team-v63 (Б.1): продолжение — тот же сеанс dsh (--session-id в execute)
       rev: require('../../common/members').rev(),
       dshVersion: dshVersion(),
       quotaAttempts: 0,
       ...(dl.deadline ? { deadline: dl.deadline } : {}),
     };
     if (a.text !== undefined) { job.textFile = path.join(dir, id + '.input.txt'); fs.writeFileSync(job.textFile, a.text); }
+    // team-v63 (п.1/п.6/п.2): вложения, объём входа, номер хода в сеансе и накопленные знаки.
+    const attachChars = require('../../common/attachments').attach(job, attachData, path.join(dir, id + '.attach.txt')).chars;
+    job.chars_in = require('../../common/usage').charsIn(a, attachChars);
+    if (prior) { job.sessionTurn = (prior.sessionTurn || 1) + 1; job.sessionCharsIn = (prior.sessionCharsIn || prior.chars_in || 0) + job.chars_in; job.sessionCharsOut = prior.sessionCharsOut || prior.chars_out || 0; }
+    else { job.sessionTurn = 1; job.sessionCharsIn = job.chars_in; job.sessionCharsOut = 0; }
+    job.requestId = requestId;
     job.provenance = provenance.forJob(job, 'deepseek');
+    // team-v56 Б0 п.2/п.4: публикация карточки и commit admission — одной короткой секцией; published отмечает публикацию.
     if (access.guest()) save(job);
     else await restartHold.locked(stateDir, () => { admitExecution(); save(job); });
+    published = true;
+    // team-v56 И7 (ревью Codex 5): постановка отозвана (release_orphan) → commit вернёт null; карточку не запускаем.
+    if (admId && !require('../../common/job-admission').commit(stateDir, admId, { instance: folderLock?.owner?.instance })) {
+      try { await mutate(job.id, c => { c.status = 'cancelled'; c.error = 'Постановка отозвана (release_orphan) до запуска.'; }); } catch {}
+      throw Error('Постановка отозвана (release_orphan); запуск отменён.');
+    }
     if (access.guest()) return reply(job, access.queued);
     const lock = folderLock;
     folderLock = null;
     await execute(job, lock);
     return view(load(job.id));
   } finally {
+    // team-v56 Б0 п.3: до публикации — узкий откат admission и точного замка по его instance (при неудаче снятия —
+    // recovery_required с диагностическим ID). После публикации — no-op; опубликованный замок снимает обычный release.
+    if (admId) try { require('../../common/job-admission').releaseUnpublished(stateDir, admId, { lock: folderLock?.ok ? { instance: folderLock.owner.instance, folder, jobId: id } : undefined, published }); } catch {}
     if (priorLock?.ok) await priorLock.release();
-    if (folderLock?.ok) await folderLock.release();
+    if (folderLock?.ok && published) await folderLock.release();
   }
 }
 async function queue() {
@@ -526,9 +630,13 @@ async function queue() {
 }
 const server = new McpServer({ name: 'deepseek', version: VERSION }, require('../../common/server-instructions').options('deepseek'));
 function register(name, title, description, inputSchema, fn) {
-  if (!access.allowed('deepseek', name)) return;
+  if (!access.offered('deepseek', name)) return;
   server.registerTool(name, { title, description, inputSchema: require('../../common/schema').compatible(inputSchema) }, async (a) => {
     try {
+      // team-v62 (взгляд участников): обработчику нужно перенесённое состояние — дождёмся конца первичной миграции (с
+      // пределом). initialize/tools/list сюда не попадают. По превышении — понятный текст с предложением повторить.
+      const hold = await require('../../common/state-migration').awaitPrimary();
+      if (hold) throw Error(hold);
       access.guard('deepseek', name, a);
       if (name === 'deepseek_send') {
         const refusal = fullAccessRefusal(a);
@@ -543,10 +651,13 @@ function register(name, title, description, inputSchema, fn) {
   });
 }
 register('deepseek_send', 'Поручить DeepSeek', 'Начать отдельное поручение DeepSeek (headless dsh).', {
-  folder: z.string().describe('Абсолютная папка проекта.'),
+  folder: z.string().optional().describe('Абсолютная папка проекта; для роли «совет»/«текст» без записи необязательна — мост берёт служебную папку.'),
   ...require('../../common/stage-schema').send,
   task: z.string().min(1).describe('Поручение.'),
   text: z.string().optional().describe('Материал для работы.'),
+  files: z.array(z.union([z.string(), z.object({ path: z.string(), lines: z.string().optional() })])).optional().describe('Вложения: абсолютные пути (строка или { path, lines }); мост читает и вкладывает их в поручение, файлы открывать не нужно.'),
+  level: z.enum(['fast', 'normal', 'strong']).optional().describe('Уровень модели: fast | normal | strong; не меняет роль и права. model сильнее.'),
+  force: z.boolean().optional().describe('Пробовать даже при действующей отметке «лимит исчерпан».'),
   write: z.boolean().default(false).describe('Разрешить изменения по поручению.'),
   full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя; при write=true, роли текст или совет и абсолютной существующей папке.'),
   model: z.string().regex(/^[A-Za-z0-9._:-]+$/).optional().describe('Запрошенная модель; по умолчанию из реестра по роли.'),
@@ -554,6 +665,7 @@ register('deepseek_send', 'Поручить DeepSeek', 'Начать отдел�
   stage: z.string().optional().describe('Этап.'),
   owner: z.string().optional().describe('Метка сеанса владельца работы.'),
   work: z.string().optional().describe('Работа.'),
+  request_id: z.string().optional().describe('Идентификатор запроса для идемпотентного повтора (team-v56 Б0); повтор того же request_id возвращает тот же номер.'),
 }, send);
 register('deepseek_result', 'Результат DeepSeek', 'Получить состояние и ответ, при необходимости частями.', {
   id: z.string().describe('Номер поручения.'),
@@ -563,6 +675,11 @@ register('deepseek_result', 'Результат DeepSeek', 'Получить с�
   const end = Date.now() + wait_sec * 1000;
   let j = await normalized(id);
   while (j.status === 'running' && Date.now() < end) { await sleep(100); j = await normalized(id); }
+  // team-v56 Л2 (ревью круг 5, М1; круг 6): если готовый результат этого поручения-потомка выдаётся его родителю (parentJob ==
+  // текущее поручение вызывающего), фиксируем в карточке потомка факт выдачи (кому/когда/sha) — доказуемый след получения
+  // результата для приёмки Kimi. Отметку строим по тому же снимку j и from_char, что уходят в view (иначе гонка снимок/карточка
+  // засчитала бы невыданный результат). Служебный след; его ошибка не влияет на выдачу результата.
+  await require('../../common/result-receipt').record({ mutate, id, snapshot: j, fromChar: from_char });
   return view(j, from_char);
 });
 register('deepseek_cancel', 'Отменить DeepSeek', 'Остановить поручение.', { id: z.string().describe('Номер поручения.') }, async (a) => {
@@ -598,7 +715,6 @@ async function shutdown() {
   process.exit(0);
 }
 (async () => {
-  await require('../../common/state-migration').start(require('../../common/paths'));
   restartServer = access.guest() ? null : restartHold.serverAsync(stateDir, 'deepseek');
   process.stdin.on('close', guarded(shutdown));
   const owner = await locks.startOwner({ version: VERSION, file: __filename });
@@ -607,15 +723,22 @@ async function shutdown() {
   process.on('SIGINT', guarded(shutdown));
   process.on('SIGTERM', guarded(shutdown));
   server.server.onclose = guarded(shutdown);
+  try { require('../../common/state-migration').arm(); } catch {} // team-v63 (п.18): взвести барьер миграции до connect
   await server.connect(require('../../common/public-transport').publicTransport(new StdioServerTransport()));
   access.ready('deepseek');
-  if (!access.guest() && process.env.MOST_PROBE_ONLY !== '1') {
-    // Профили поручений создаются из реестра (временный DSH_HOME в тестах).
-    if (!process.env.MOST_DSH_NO_PROFILES) profiles.generate(adapterParams(), undefined, bridgeParams());
-    dshVersion();
-    // Проба отказа записи после установки (ревью Codex f977c3d4, п.4): без неё голос DeepSeek не засчитывается.
-    if (!process.env.MOST_DSH_NO_PROFILES) require('../../common/dsh-probe').ensure().catch(logFailure);
-    await queue().catch(logFailure);
-    setInterval(guarded(queue), Math.min(30000, Number(process.env.MOST_QUEUE_TICK_MS || 1000))).unref();
-  }
+  try { require('../../common/chat-origin').primeAsync(); } catch {} // team-v59 (task2): происхождение чата — в фоне после connect
+  // team-v62 (task4): миграция хранилища, профили dsh, проба и первая сверка очереди — в ФОНЕ после ответа на
+  // initialize/tools/list (общий замок миграции больше не держит server.connect). Очередь стартует после миграции.
+  (async () => {
+    await require('../../common/state-migration').start(require('../../common/paths'));
+    if (!access.guest() && process.env.MOST_PROBE_ONLY !== '1') {
+      // Профили поручений создаются из реестра (временный DSH_HOME в тестах).
+      if (!process.env.MOST_DSH_NO_PROFILES) profiles.generate(adapterParams(), undefined, bridgeParams());
+      dshVersion();
+      // Проба отказа записи после установки (ревью Codex f977c3d4, п.4): без неё голос DeepSeek не засчитывается.
+      if (!process.env.MOST_DSH_NO_PROFILES) require('../../common/dsh-probe').ensure().catch(logFailure);
+      await queue().catch(logFailure);
+      setInterval(guarded(queue), Math.min(30000, Number(process.env.MOST_QUEUE_TICK_MS || 1000))).unref();
+    }
+  })().catch(logFailure);
 })().catch((e) => { logFailure(e); process.exit(1); });

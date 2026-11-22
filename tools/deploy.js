@@ -58,12 +58,20 @@ async function main(args, deps = {}) {
     { ...deps, validateResult: () => {
       const context = boot.resultContext(options, __filename);
       if (!boot.equal(context.file, options.result)) throw Error('Путь результата операции изменился перед записью.');
-    } }) : await action(options);
+    } }) : await action(options, deps);
   (deps.print || console.log)(result);
   return result;
 }
+// team-v57 (ред.5): слово пользователя НЕ передаётся параметром. При непустом списке установки deploy.js печатает его в эту
+// же (унаследованную) консоль и читает слово с клавиатуры. readLine — зависимость установки для перекрытия барьера.
+function readLine(prompt) {
+  return new Promise((resolve) => {
+    const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(prompt, (answer) => { rl.close(); resolve(answer); });
+  });
+}
 if (require.main === module)
-  main(process.argv.slice(2)).catch((e) => {
+  main(process.argv.slice(2), { promptWord: readLine }).catch((e) => {
     console.error('Ошибка: ' + (e.message || String(e)));
     process.exitCode = 1;
   });

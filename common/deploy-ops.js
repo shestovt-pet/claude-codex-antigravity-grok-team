@@ -64,7 +64,7 @@ function launch(release, args, root) {
       else resolve(pid);
     }));
 }
-async function start({ root, release, configs, restartClaude, cleanup = true }, deps = {}) {
+async function start({ root, release, configs, restartClaude, cleanup = true, word, channel, listHash }, deps = {}) {
   root = realOrGiven(root);
   release = realOrGiven(release);
   require('../tools/deploy-bootstrap').stateRoot(root);
@@ -77,7 +77,15 @@ async function start({ root, release, configs, restartClaude, cleanup = true }, 
     if (pending) throw Error('Идёт установка ' + pending.id);
     id = randomUUID(); file = path.join(policy.root, 'state/deploy-ops', id + '.json');
     // reason успешный старый execute сохраняет; старый team.js показывает его и после restart.
-    atomic(file, JSON.stringify({ id, root: policy.root, release, status: 'запущена', ...(cleanup === false || policy.oldCode ? { noCleanup: true } : {}), ...(policy.oldCode ? { oldCode: true, reason: oldCodeLine } : {}), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
+    // team-v57 (ред.5): проверенное слово пользователя и канал кладутся в запись операции; исполнитель вне пакета читает их
+    // и передаёт барьеру install (overriddenByWord пишется туда же ДО первого изменяющего шага). Слова нет в аргументах CLI.
+    // team-v57 (task9 п.1): рядом со словом кладётся утверждённый отпечаток показанного списка (installListHash) — барьер
+    // install и перезапуск сверяют его перед изменяющим шагом, чтобы слово перекрывало только то, что видел пользователь.
+    // §5.1 (team-v58): рядом с отпечатком кладётся и сам утверждённый список (installList) — перезапуск сверяет свежий
+    // список НЕ по полному равенству отпечатка, а по НОВЫМ записям относительно этого утверждённого списка.
+    let installList = null;
+    if (word) { try { installList = require('./members-kimi').installationBlockers(path.join(policy.root, 'state'), {}); } catch {} }
+    atomic(file, JSON.stringify({ id, root: policy.root, release, status: 'запущена', ...(cleanup === false || policy.oldCode ? { noCleanup: true } : {}), ...(policy.oldCode ? { oldCode: true, reason: oldCodeLine } : {}), ...(word ? { installWord: word, installChannel: channel || 'console', ...(listHash ? { installListHash: listHash } : {}), ...(installList ? { installList } : {}) } : {}), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }));
     const args = ['--root', root, '--config-only', '--release', release, '--result', file, ...configs.flatMap(f => ['--config', f]), ...(restartClaude ? ['--restart-claude'] : [])];
     try {
       const pid = await (deps.launch || launch)(release, args, root);
@@ -90,8 +98,10 @@ async function start({ root, release, configs, restartClaude, cleanup = true }, 
   do {
     const op = list(root, deps).find(op => op.id === id);
     if (terminal.includes(op.status)) {
-      if (op.status !== 'завершено') throw Error('Установка ' + id + ': ' + op.status + ' · ' + (op.reason || ''));
-      return 'Установка ' + id + ': завершено. ' + (op.message || '') + (op.oldCode ? '\n' + oldCodeLine : '') + (op.restart ? '\n' + op.restart : '') + (op.cleanup ? '\n' + cleanupLine(op.cleanup) : '');
+      // team-v57 (task9 п.5, ревью Kimi 4): слово и полный перекрытый список входят и в сообщение об УСПЕХЕ, и в сообщение
+      // об ОТКАЗЕ — барьер мог записать overriddenByWord/gatePassed до того, как последующий шаг завершился сбоем.
+      if (op.status !== 'завершено') throw Error('Установка ' + id + ': ' + op.status + ' · ' + (op.reason || '') + wordSummary(op));
+      return 'Установка ' + id + ': завершено. ' + (op.message || '') + wordSummary(op) + (op.oldCode ? '\n' + oldCodeLine : '') + (op.restart ? '\n' + op.restart : '') + (op.cleanup ? '\n' + cleanupLine(op.cleanup) : '');
     }
     await sleep(250);
   } while (now() < deadline);
@@ -107,11 +117,17 @@ async function execute(options, action, deps = {}) {
     let message = await action({ ...options, restartClaude: false, method: 'из Claude через исполнителя вне пакета' });
     if (options.restartClaude) message = message.replace('нужен перезапуск Claude', 'перезапуск Claude выполнит исполнитель');
     update(file, { status: 'переключено', message, switchedAt: new Date().toISOString() });
+    // §5.4 (team-v58): после установки по слову карточки перекрытых поручений (overriddenByWord) получают отметку остановки
+    // с основанием — словом установки (тот же вид, что stop_confirm; источник — канал установки), чтобы не числиться «идёт»/
+    // «отменяется». Делается один раз после переключения; сбой разметки установку не валит.
+    try { const cur = read(file), w = cur.overriddenByWord; if (w && w.quote) update(file, { overriddenMarked: require('./members-kimi').markOverriddenStopped(path.join(cur.root, 'state'), w).marked }); } catch {}
     if (options.restartClaude) {
       const op = read(file);
       try {
         update(file, { status: 'перезапуск идёт' });
-        const restart = await (deps.restart || require('./restart').restart)({ root: op.root, release: options.release, state: path.join(op.root, 'state'), id: op.id, waitCompletion: true, close: true }, deps.restartDeps || {});
+        // team-v57 (ред.7, task9 п.1): слово пользователя из записи операции перекрывает защиту restart от обрыва поручений, а
+        // утверждённый отпечаток (installListHash) связывает это перекрытие с показанным списком (сверка перед закрытием Claude).
+        const restart = await (deps.restart || require('./restart').restart)({ root: op.root, release: options.release, state: path.join(op.root, 'state'), id: op.id, waitCompletion: true, close: true, word: op.installWord, wordListHash: op.installListHash, wordList: op.installList }, deps.restartDeps || {});
         update(file, { restart: typeof restart === 'string' ? restart : restart.message, restartEvidence: typeof restart === 'object' ? restart : null });
       }
       catch (e) {
@@ -128,12 +144,33 @@ async function execute(options, action, deps = {}) {
     throw e;
   }
 }
+// team-v57 (ред.6/7, task9 п.5): оба поля барьера установки печатаются в итоговом сообщении — пропущенное по слову на
+// карточке/перезагрузке (gatePassed) и перекрытое общим словом пользователя с полным списком перекрытого (overriddenByWord).
+// Печать идёт тем же форматтером, что показанный список (members-kimi.listText): с причинами, папками, статусом, отправителем.
+function wordSummary(op) {
+  const g = op.gatePassed, w = op.overriddenByWord, parts = [];
+  if (w && w.quote) parts.push('Проверка перекрыта словом пользователя (канал ' + (w.channel || '?') + '): «' + w.quote + '». Перекрыто (будет оборвано):');
+  const b = { running: (w && w.running) || [], blockers: (w && w.blockers) || [], passedByCardWord: (g && g.passedByCardWord) || [], passedByReboot: (g && g.passedByReboot) || [] };
+  if (b.running.length || b.blockers.length || b.passedByCardWord.length || b.passedByReboot.length)
+    parts.push(require('./members-kimi').listText(b));
+  else if (w && w.quote) parts.push('ничего');
+  return parts.length ? '\n' + parts.join('\n') : '';
+}
 const oldCodeLine = 'уборка отключена: релиз старого кода (до team-v21). После возврата на любой релиз старого кода (без common/path-compat.js) не запускать team_change cleanup.';
 // Строка уборки после установки (team-v10 Р5); у старых операций поля нет — и строки нет.
-function cleanupLine(c, now = Date.now()) {
+// team-v58 (task5 пп.2–3): уборку выполняет отдельный процесс; его PID и время запуска лежат в записи. «идёт» действительно,
+// ТОЛЬКО пока этот процесс жив (и, если проверяется, с тем же временем запуска); иначе — «прервана» (повтор вручную
+// team_change cleanup). Так запись 38b0578e (cleanup «идёт» с 18.11 08:00, процесс мёртв) распознаётся как прерванная.
+function cleanupLine(c, now = Date.now(), deps = {}) {
   if (!c) return '';
   if (c.state === 'отключена') return 'уборка: отключена';
-  if (c.state === 'идёт') return now - Date.parse(c.started) > 1800000 ? 'уборка: прервана' : 'уборка: идёт';
+  if (c.state === 'прервана') return 'уборка: прервана' + (c.reason ? ': ' + c.reason : '');
+  if (c.state === 'идёт') {
+    const aliveFn = deps.alive || alive;
+    const dead = Number.isInteger(c.pid) && aliveFn(c.pid) === false;
+    if (dead || now - Date.parse(c.started) > 1800000) return 'уборка: прервана';
+    return 'уборка: идёт с ' + c.started;
+  }
   if (c.state === 'ошибка') return 'уборка: ошибка: ' + c.reason;
   if (c.state === 'готово') return 'уборка: удалено ' + c.removed + ', не удалено ' + c.failed + (c.blocked?.length ? ' · релизы не удалялись: ' + c.blocked.join('; ') : '') + (c.uncheckedHiddenProcesses ? ' · не проверено процессов со скрытыми сведениями: ' + c.uncheckedHiddenProcesses : '');
   return 'уборка: состояние неизвестно';

@@ -130,7 +130,7 @@ function configs(label, rootLabel = label) {
 }
 const mock = {
   archive: async (root, id, temp) => {
-    for (const n of ['team', 'codex', 'antigravity', 'claude', 'grok']) write(path.join(temp, 'servers', n, 'index.js'), '');
+    for (const n of ['team', 'codex', 'antigravity', 'claude', 'kimi', 'grok']) write(path.join(temp, 'servers', n, 'index.js'), '');
     write(path.join(temp, 'common', 'access.js'), fs.readFileSync(path.join(ROOT, 'common', 'access.js')));
   for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(temp, 'common', name), fs.readFileSync(path.join(ROOT, 'common', name))); /* реестр кандидата А */ // team-v28 Р1
   },
@@ -197,6 +197,33 @@ test('Работы: создание, гонка редакций, доказа�
       }),
     /доказательства/,
   );
+});
+test('§5.5 install.cmd: сборка выпуска кладёт установочный файл с подставленным коммитом (CRLF; отличие от шаблона — только строка коммита)', () => {
+  const deploy = require('../common/deploy');
+  const rel = path.join(RUN, 'rel-install-' + Date.now()); fs.mkdirSync(path.join(rel, 'tools'), { recursive: true });
+  const tplBuf = fs.readFileSync(path.resolve(__dirname, '..', 'tools', 'install.template.cmd'));
+  const lat = b => b.toString('latin1');
+  // Шаблон в репозитории с CRLF: все переводы строк — CRLF (одиночных \n нет), имена V57 отсутствуют, есть плейсхолдер.
+  assert.equal((lat(tplBuf).match(/\n/g) || []).length, (lat(tplBuf).match(/\r\n/g) || []).length, 'шаблон с CRLF');
+  assert(!/V57/.test(lat(tplBuf)), 'в шаблоне нет имён V57');
+  assert(lat(tplBuf).includes('__COMMIT__'), 'в шаблоне есть плейсхолдер __COMMIT__');
+  // Как в архиве выпуска: шаблон лежит в tools\ выпуска. writeInstallScript (его зовёт сборка) кладёт install.cmd.
+  fs.writeFileSync(path.join(rel, 'tools', 'install.template.cmd'), tplBuf);
+  const commit = 'a'.repeat(40), out = deploy.writeInstallScript(rel, commit);
+  assert.equal(out, path.join(rel, 'install.cmd'));
+  const buf = fs.readFileSync(out);
+  assert.equal((lat(buf).match(/\n/g) || []).length, (lat(buf).match(/\r\n/g) || []).length, 'в готовом файле все строки с CRLF');
+  assert(buf.toString('utf8').includes(commit) && !buf.toString('utf8').includes('__COMMIT__'), 'коммит подставлен, плейсхолдера нет');
+  assert(!/V57/.test(buf.toString('utf8')), 'в готовом файле нет имён V57');
+  // Отличие от шаблона — только строка с коммитом.
+  const t = lat(tplBuf).split('\r\n'), o = lat(buf).split('\r\n');
+  assert.equal(t.length, o.length, 'число строк не изменилось');
+  const diff = t.map((l, i) => [l, o[i], i]).filter(([a, b]) => a !== b);
+  assert.equal(diff.length, 1, 'отличается ровно одна строка');
+  assert.match(diff[0][0], /__COMMIT__/, 'отличается строка шаблона с __COMMIT__');
+  assert(diff[0][1].includes(commit), 'на её месте — строка с коммитом');
+  // Старый выпуск без шаблона — тихо пропускается.
+  assert.equal(deploy.writeInstallScript(path.join(RUN, 'rel-empty-' + Date.now()), commit), null);
 });
 test('Границы: шаблон имён и выход за корень', async () => {
   for (const n of ['../x', 'A', 'a/b', 'x'.repeat(41), '-x;whoami']) assert.throws(() => g.name(n));
@@ -277,7 +304,7 @@ test('MCP: девять инструментов (кандидат А: team_memb
   try {
     await cl.connect(tr);
     const list = await cl.listTools();
-    assert.equal(list.tools.length, 9);
+    assert.equal(list.tools.length, 10); // team-v63: + team_scenario
     assert(list.tools.some(t => t.name === 'team_members'));
     assert(list.tools.some(t => t.name === 'team_word'));
     for (const name of ['team_ask', 'team_ask_result', 'team_inbox']) assert(list.tools.some(t => t.name === name), name);
@@ -412,7 +439,7 @@ test(
   true,
 );
 test(
-  'Ворота (team-v18): решение пользователя пишется в историю, но место не закрывает',
+  'Ворота (team-v59): решение пользователя закрывает место словом владельца',
   async () => {
     const x = await change('user');
     await vote(x);
@@ -426,12 +453,14 @@ test(
       replaces: 'codex',
       quote: 'Принимаю вместо Codex',
     });
-    assert.match(out, /место им не закрывается/);
+    // team-v59: место Codex закрыто словом владельца (прежде писалось только в историю).
+    assert.match(out, /Закрыто словом владельца/);
+    assert(read(x.team.changeFile('one')).decisions.some(d => d.kind === 'owner_word' && d.replaces === 'codex'));
+    // Antigravity ещё не закрыт — слияние ждёт его.
+    await rejects(() => x.team.change({ action: 'merge', name: 'one' }), /antigravity/);
     await vote(x, 'antigravity');
-    await rejects(() => x.team.change({ action: 'merge', name: 'one' }), /Нет действующего принятия: codex/);
-    assert(read(x.team.changeFile('one')).verdicts.some(v => v.who === 'user' && v.replaces === 'codex'));
-    await vote(x, 'codex');
-    await x.team.change({ action: 'merge', name: 'one' });
+    const merged = await x.team.change({ action: 'merge', name: 'one' });
+    assert.match(merged, /слито словом владельца/);
     assert.equal(g.hash(x.root), x.c.candidate);
   },
   true,
@@ -591,7 +620,7 @@ test(
   async () => {
     const root = repo('archive-release'),
       files = configs('archive-release');
-    for (const n of ['team', 'codex', 'antigravity', 'claude', 'grok']) write(path.join(root, 'servers', n, 'index.js'), 'принятый');
+    for (const n of ['team', 'codex', 'antigravity', 'claude', 'kimi', 'grok']) write(path.join(root, 'servers', n, 'index.js'), 'принятый');
     g.git(root, ['add', '-A']);
     g.git(root, ['commit', '-m', 'Серверы']);
     write(path.join(root, 'servers/team/index.js'), 'непринятый');
@@ -748,6 +777,9 @@ test('Статус: сбои квот, работ, репозитория, ре�
   write(path.join(team.state, 'claude-quota.json'), '{');
   write(path.join(simple, 'live/deployed.json'), '{');
   quota.codexQuota = async () => { throw Error('таймаут квоты'); };
+  // team-v58 (task5 п.1): квота Codex кэшируется; при наличии прошлого снимка ошибка маскируется им (так и задумано — «при
+  // истечении предела прошлое значение»). Этот тест проверяет случай БЕЗ прошлого снимка, поэтому кэш сбрасывается.
+  require('../common/quota-line').resetCodexCache();
   stores.list = (who) => { if (who === 'codex') throw Error('сбой поручений'); return oldList(who); };
   team.works = () => { throw Error('сбой работ'); };
   try {
@@ -804,6 +836,10 @@ test('Bootstrap CLI: настоящий архив, готовые зависи�
   const root = repo('bootstrap'), files = configs('bootstrap-configs', 'bootstrap');
   require('./fixtures/team-v43/fixture').phaseB(root);
   require('../common/members-v46').apply(require('path').join(root, 'state'), 'forward'); // развёртывание уже на team-v46: состав установки включает claude
+  // Готовый состав: миграцию и неполный снимок процессов отдельно проверяет kimi-deploy.
+  const kimiState = path.join(root, 'state'), kimi = require('../common/members-kimi');
+  const installedRoster = require('../common/members-store').create(kimiState).read({ initialize: false });
+  kimi.apply(kimiState, installedRoster.rev, kimi.installTarget(kimiState, installedRoster, ROOT));
   for (const dir of ['common', 'servers', 'tools']) fs.cpSync(path.join(ROOT, dir), path.join(root, dir), { recursive: true });
   for (const file of ['package.json', 'package-lock.json']) fs.copyFileSync(path.join(ROOT, file), path.join(root, file));
   g.git(root, ['add', '-A']);
@@ -825,13 +861,22 @@ test('Bootstrap CLI: настоящий архив, готовые зависи�
   assert(!fs.existsSync(forbidden));
   assert(!fs.existsSync(path.join(live, 'deployed.json')));
   files.forEach((f, i) => { assert.equal(fs.readFileSync(f, 'utf8'), before[i]); assert(!fs.existsSync(f + '.prev')); });
-  const marker = fs.readFileSync(path.join(release, 'probe-ok.json'), 'utf8');
+  let marker = fs.readFileSync(path.join(release, 'probe-ok.json'), 'utf8');
   for (const f of files) {
     env.MOST_TEST_WRITE_ROOT = RUN;
     assert.match(cli(['--config-only', '--release', release, '--config', f, '--dry-run'], path.dirname(f), env), /изменений нет/);
     assert.equal(fs.readFileSync(f, 'utf8'), before[files.indexOf(f)]);
     assert(!fs.existsSync(f + '.prev'));
+    assert.equal(fs.readFileSync(path.join(release, 'probe-ok.json'), 'utf8'), marker);
     assert.match(cli(['--config-only', '--release', release, '--config', f], path.dirname(f), env), /Конфиги обновлены/);
+    if (f === files[0]) {
+      // После первой настройки proof согласован с уже установленным реестром.
+      marker = fs.readFileSync(path.join(release, 'probe-ok.json'), 'utf8');
+      const proof = JSON.parse(marker), roster = read(path.join(root, 'state/members.json'));
+      assert.equal(proof.sourceRegistryRev, roster.rev);
+      assert.equal(proof.targetRegistryHash, require('../common/members-kimi').digest(roster));
+      assert.deepEqual(proof.servers, require('../common/members').serversForInstall(roster));
+    } else assert.equal(fs.readFileSync(path.join(release, 'probe-ok.json'), 'utf8'), marker);
     assert.equal(read(f).theme, 'тёмная');
     assert.equal(read(f).mcpServers.other.command, 'keep');
     assert.equal(read(f).mcpServers.team.env.MOST_REPO_ROOT, root);
@@ -840,6 +885,7 @@ test('Bootstrap CLI: настоящий архив, готовые зависи�
     assert.equal(backup, before[files.indexOf(f)]);
     cli(['--config-only', '--release', release, '--config', f], path.dirname(f), env);
     assert.equal(fs.readFileSync(f + '.prev', 'utf8'), backup);
+    assert.equal(fs.readFileSync(path.join(release, 'probe-ok.json'), 'utf8'), marker);
   }
   assert.equal(fs.readFileSync(path.join(release, 'probe-ok.json'), 'utf8'), marker);
   assert(!fs.existsSync(forbidden));
@@ -958,7 +1004,13 @@ test('team: исчезнувшие после перечисления карт�
 });
 
 test('Откат: конфигурация пользователя most + cmd /c npx, существующий и отсутствующий сервер', async () => {
-  const root = repo('rollback-cmd'), files = configs('rollback-cmd');
+  const root = repo('rollback-cmd-pre-registry'), files = configs('rollback-cmd-pre-registry');
+  // Отдельное историческое состояние до реестра: копируем только код CLI, без установки Kimi.
+  const release = path.join(root, 'live', 'f'.repeat(40));
+  for (const name of ['common', 'tools', 'node_modules']) fs.cpSync(path.join(ROOT, name), path.join(release, name), { recursive: true });
+  rollbackReleases.set(root, release);
+  const registryFiles = ['members.json', 'members.json.last-good', 'members-log.jsonl'].map(name => path.join(root, 'state', name));
+  assert(registryFiles.every(file => !fs.existsSync(file)));
   // Эти две записи сверены с обоими конфигами Claude пользователя; секретов здесь нет.
   let server = 'C:/most/index.js';
   if (process.platform !== 'win32' || !fs.existsSync(server)) {
@@ -987,6 +1039,7 @@ test('Откат: конфигурация пользователя most + cmd /
   assert.deepEqual(read(files[0]).mcpServers.antigravity, previous.mcpServers.antigravity);
   assert.match(cli(['--root', root, '--config-only', '--rollback', '--config', files[1]], path.dirname(files[1])), /откат невозможен/);
   assert.equal(fs.readFileSync(files[1], 'utf8'), original[1]);
+  assert(registryFiles.every(file => !fs.existsSync(file)));
 }, true);
 
 test('Откат: ключи cmd и npx пропускаются; пути скриптов проверяются', async () => {
@@ -1038,3 +1091,4 @@ test('Откат: ключи cmd и npx пропускаются; пути ск�
   console.error(e);
   process.exitCode = 1;
 });
+

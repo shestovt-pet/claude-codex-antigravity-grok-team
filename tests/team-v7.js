@@ -58,6 +58,9 @@ test('Р2/Р6: настоящая краткая сводка — подсказ
   for (const [id, hours, stage] of [['routine', 2, 'рутина: перенос'], ['old', 25, 'рутина'], ['review', 1, 'ревью']])
     json(path.join(stores.roots().codex, id + '.json'), { id, startedAt: new Date(Date.now() - hours * 3600000).toISOString(), stage, status: 'done' });
   const team = new (require('../common/team').Team)(RUN);
+  // team-v59 (часть 3): краткая сводка берёт внешнюю квоту и её подсказки из кэша (внешний снимок дорогой, не на пути ответа).
+  // Прогреваем кэш теми же источниками, что и status, — тогда подсказка по квоте Antigravity появляется в краткой сводке.
+  await require('../common/quota-line').refreshLineCache({ state: path.join(RUN, 'state', 'team'), binary: process.env.CODEX_PATH, agyModel: 'chosen' });
   const result = await team.status(undefined, undefined, false, false, { agy_model: 'chosen' });
   assert.match(result, /новые крупные тексты отложить/); assert(!result.includes('Grok: квота не видна'));
   assert(!result.includes('Grok —')); assert.match(result, /Рутина за сутки[^\n]*codex — 1/);

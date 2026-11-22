@@ -228,7 +228,12 @@ tests.push(['Сводка: точка после всех участников, 
 }]);
 tests.push(['Откат: most, аргументы node и неизвестная цель не обходят phase A', async () => {
   const d = require('../common/deploy'), root = path.join(f.RUN, 'rollback-targets');
-  storeLib.create(path.join(root, 'state')).read();
+  // Отдельная историческая установка A: этот журнал никогда не содержал kimi-cli.
+  const historical = require('../common/members-default')(); historical.members = historical.members.filter(m => m.adapter !== 'kimi-cli');
+  const legacyStore = storeLib.create(path.join(root, 'state'));
+  legacyStore.read({ initialRoster: historical });
+  assert.equal(legacyStore.history().length, 1);
+  assert(!legacyStore.history()[0].after.members.some(m => m.adapter === 'kimi-cli'));
   const script = path.join(root, 'base', 'servers', 'team', 'index.js'); f.write(script, '// база');
   const supported = path.join(root, 'phase-a', 'servers', 'team', 'index.js'); f.write(supported, '// A');
   f.write(path.join(root, 'phase-a', 'common', 'members-store.js'), '// A');

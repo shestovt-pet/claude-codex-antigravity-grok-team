@@ -8,5 +8,11 @@ module.exports = () => ({ rev: 0, phase: 'A', members: [
   { id: 'antigravity', family: 'google', title: 'Antigravity', specialization: 'литературный текст и содержательная правка', external: true,
     adapter: 'agy-cli', adapter_params: {}, mcp_allow: ['team/team_status', 'team/team_rules', 'team/team_work', 'codex/codex_status', 'codex/codex_result', 'codex/codex_send', 'notion/*'], roles: { conductor: false, fallback_conductor: true, voter: true, writer: false, literary: true, receives: true, sends: true }, state: 'active', pause: null },
   { id: 'deepseek', family: 'deepseek', title: 'DeepSeek', specialization: 'чтение материалов; исполнение и голос включаются следующими кандидатами', external: true,
-    adapter: 'dsh-headless', adapter_params: { profile: 'headless', models: { read: 'deepseek-v4-flash', review: 'deepseek-v4-pro' }, auth: 'saved' }, roles: { conductor: false, fallback_conductor: false, voter: false, writer: false, literary: false, receives: false, sends: false }, state: 'active', pause: null },
+    adapter: 'dsh-headless', adapter_params: { profile: 'headless', models: { read: 'deepseek-flash', review: 'deepseek-flash' }, auth: 'saved' }, roles: { conductor: false, fallback_conductor: false, voter: false, writer: false, literary: false, receives: false, sends: false }, state: 'active', pause: null },
+  // team-v56 А5: роли Kimi — способность места; полноправные writer/sends включает детерминированная миграция
+  // members-kimi.forward с новой редакцией реестра (идемпотентно), а первичная инициализация остаётся безопасной
+  // (пауза до доказанного основания). Поэтому здесь writer/sends=false — это стартовое состояние, не отрицание А1–А3.
+  { id: 'kimi', family: 'moonshot', title: 'Kimi', specialization: 'чтение входящих материалов и независимая проверка', external: true,
+    adapter: 'kimi-cli', adapter_params: {}, roles: { receives: true, sends: false, voter: true, writer: false, conductor: false, fallback_conductor: false, literary: false },
+    state: 'paused', pause: { kind: 'manual', scope: 'participant', since: new Date().toISOString(), until: null, next_probe: null } },
 ] });

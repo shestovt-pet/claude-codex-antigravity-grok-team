@@ -383,6 +383,31 @@ function listJobs() {
   try { for (const d of fs.readdirSync(JOBS_DIR)) { const j = loadJob(d); if (j && !j.corrupt) out.push(j); } } catch (e) {}
   return out;
 }
+// team-v63 (п.2): лёгкий индекс request_id→id (без полного сканирования тысяч карточек). Повтор того же request_id после
+// перезапуска возвращает уже созданное задание, а не плодит второе. Имя файла индекса — безопасный хвост-хеш request_id.
+function reqIndexKey(requestId, from) {
+  return require('crypto').createHash('sha256').update(String(from || '') + '\0' + String(requestId)).digest('hex').slice(0, 32);
+}
+function reqIndexPath(requestId, from) {
+  return path.join(JOBS_DIR, '.req', reqIndexKey(requestId, from) + '.json');
+}
+// team-v63 (Б3): поиск задания по request_id. Сначала лёгкий индекс; при ОТСУТСТВИИ записи индекса (сбой между записью
+// карточки и индекса) — запасной поиск карточки по сохранённому в ней requestId, чтобы связь не терялась и повтор не плодил
+// второе задание. Запасной путь ограничен совпадением from (принципал), как в индексе.
+function findJobByRequest(requestId, from) {
+  if (!requestId) return null;
+  try { const rec = JSON.parse(fs.readFileSync(reqIndexPath(requestId, from), 'utf8')); const j = rec && rec.id ? loadJob(rec.id) : null; if (j && !j.corrupt) return j; } catch {}
+  try { for (const j of listJobs()) if (j.requestId === requestId && (j.from || null) === (from || null)) return j; } catch {}
+  return null;
+}
+// team-v63 (Б3): ошибка записи индекса НЕ глотается молча — пишется в журнал (не фатальна: карточка хранит requestId, поэтому
+// findJobByRequest найдёт задание запасным поиском, но потерю индекса надо видеть, а не прятать за пустым catch).
+function recordJobRequest(requestId, from, id) {
+  if (!requestId) return;
+  try { const p = reqIndexPath(requestId, from); fs.mkdirSync(path.dirname(p), { recursive: true });
+    replaceFileAtomicSync(p, JSON.stringify({ id, requestId, from: from || null, at: nowIso() })); }
+  catch (e) { try { log('ВНИМАНИЕ: индекс request_id не записан для задания ' + id + ' (' + requestId + '): ' + (e && e.message || e) + ' — связь восстановима по requestId в карточке'); } catch {} }
+}
 // team-v46: очередь читает только незавершённые карточки. Завершённые без ожидающего переноса
 // запоминаются по mtime и размеру card.json и не перечитываются (4351 карточка, 472 МБ — 4 с синхронного чтения
 // на каждый тик; поток был занят, и Claude Desktop не дожидался ответа initialize).
@@ -898,7 +923,10 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
   ACTIVE.add(job.id);
   try {
     if (job.modelSelectionPending) {
-      const selection = await resolveModel(job.requestedModel);
+      let selection = await resolveModel(job.requestedModel);
+      // team-v59 ч4: модель, выбранную мостом (не названную вызывающим), которой нет в списке аккаунта, не роняем —
+      // откат на модель по умолчанию приложения (для чата-гостя выбор резолвится здесь, при запуске).
+      if (selection.error && job.modelByBridge) selection = await resolveModel(null);
       if (selection.error) throw Error(selection.error);
       args = args.filter((v, i) => v !== '--model' && args[i - 1] !== '--model');
       if (selection.id) args.push('--model', selection.id);
@@ -1125,7 +1153,7 @@ function publicText(s) {
 const HANDLERS = {};
 function register(oldName, description, schema, fn) {
   HANDLERS[oldName] = fn;
-  if (!access.allowed('antigravity', publicNames[oldName])) return;
+  if (!access.offered('antigravity', publicNames[oldName])) return;
   const inputSchema = {};
   for (const [key, val] of Object.entries(schema))
     inputSchema[argNames[key] || key] =
@@ -1139,6 +1167,11 @@ function register(oldName, description, schema, fn) {
       stage: z.string().optional().describe('Этап работы.'),
       owner: z.string().optional().describe('Метка сеанса владельца работы.'),
       work: z.string().optional().describe('Название работы.'),
+      // team-v63 (Б.3): вложения материала прямо в поручение (общий модуль attachments) и уровень модели.
+      files: z.array(z.union([z.string(), z.object({ path: z.string(), lines: z.string().optional() })])).optional().describe('Вложения: абсолютные пути (строка или { path, lines }); мост читает и вкладывает их в поручение, файлы открывать не нужно.'),
+      level: z.enum(['fast', 'normal', 'strong']).optional().describe('Уровень модели: fast | normal | strong; не меняет роль и права. model сильнее.'),
+      // team-v63 (п.2): идемпотентный повтор — тот же request_id возвращает уже созданное задание (а не второе после перезапуска).
+      request_id: z.string().optional().describe('Идентификатор запроса для идемпотентного повтора; повтор того же request_id возвращает тот же номер задания.'),
     });
   if (oldName === 'most_perenesti' || oldName === 'most_otmenit')
     inputSchema.owner = z.string().optional().describe('Запасной режим: метка сеанса дирижёра.');
@@ -1156,11 +1189,17 @@ function register(oldName, description, schema, fn) {
     { title: titles[oldName], description: publicText(description), inputSchema: require('../../common/schema').compatible(inputSchema) },
     async (args) =>
       context.run({ args }, async () => {
+        // team-v62 (взгляд участников): обработчику нужно перенесённое состояние — дождёмся конца первичной миграции (с
+        // пределом). initialize/tools/list сюда не попадают. По превышении — понятный текст с предложением повторить.
+        const hold = await require('../../common/state-migration').awaitPrimary();
+        if (hold) return fail(hold);
         const perform = async () => {
         try {
           access.guard('antigravity', publicNames[oldName], args);
           // Этап нужен только при постановке поручения; чтение, перенос и отмена обходятся без него (team-v9 Р7).
-          if (oldName === 'most_poruchit' && args.work && !args.stage) return fail('Для зарегистрированной работы укажите этап.');
+          // team-v62: роль «совет» (в т.ч. по умолчанию — ensure позже выставит «совет») — этап не обязателен; нелатинская/
+          // незарегистрированная работа примется ярлыком (prepareJob). Зарегистрированной работе этап по-прежнему нужен.
+          if (oldName === 'most_poruchit' && args.work && !args.stage && (args.role || 'совет') !== 'совет') return fail('Для зарегистрированной работы укажите этап.');
           const old = { ...args };
           for (const [a, b] of Object.entries(argNames)) if (b in args) old[a] = args[b];
           if (oldName === 'most_poruchit') old.opora = args.refs;
@@ -1281,9 +1320,9 @@ register(
   "most_poruchit",
   "Отдать поручение Antigravity. Мост сам читает файлы и передаёт текст; результат хранится у задания отдельно и копируется в общий черновик _antigravity_result.txt в папке проекта. " +
   "Режимы: edit — исправить файл (нужен file); review — только замечания по файлу с короткими цитатами (нужен file); text — новый текст (без file). " +
-  "В одной папке проекта одновременно идёт только одно задание. Возвращает номер сразу; результат — через antigravity_result.",
+  "В одной папке проекта можно вести несколько заданий одновременно (общий черновик показывает последнее — у каждого задания результат хранится отдельно). Возвращает номер сразу; результат — через antigravity_result.",
   {
-    papka_proekta: z.string().describe("Полный путь к папке проекта. Туда ляжет общий черновик."),
+    papka_proekta: z.string().optional().describe("Полный путь к папке проекта. Туда ляжет общий черновик. Для нового текста необязателен — мост возьмёт служебную папку; для edit/review без папки берётся папка файла."),
     poruchenie: z.string().describe("Что сделать. Пиши по-человечески, правила ответа мост добавит сам."),
     fayl: z.string().optional().describe("Файл для правки или замечаний (полный путь, внутри папки проекта). Для нового текста не указывай."),
     stroki: z.string().optional().describe("Только вместе с file: какие строки отдать, например «10-40» или «12» (счёт с 1, включительно). Не указывай — весь файл."),
@@ -1291,24 +1330,76 @@ register(
     model: z.string().optional().describe("Модель: код или имя из antigravity_status, например gemini-3.1-pro-high. Не указывай — модель по умолчанию."),
     rezhim: z.enum(["pravka", "zamechaniya", "tekst"]).optional().describe("edit (по умолчанию при file), review (нужен file), text (по умолчанию без file)."),
   },
-  async ({ papka_proekta, poruchenie, fayl, stroki, opora, model, rezhim }) => {
+  async ({ papka_proekta, poruchenie, fayl, stroki, opora, model, rezhim, files, level, request_id }) => {
     if (shuttingDown) return fail("мост останавливается");
     if (!access.guest()) { const gate = restartHold.admit(STATE_DIR, restartServer, { early: true }); if (!gate.ok) return restartRefusal(gate); }
     if (!AGY) return fail("agy не найден.");
     if (!instancePipeOk) return fail("канал экземпляра моста не открыт — задания не принимаются (см. журнал). Перезапусти Claude.");
-    if (!papka_proekta || !fs.existsSync(papka_proekta) || !fs.statSync(papka_proekta).isDirectory()) return fail("папки проекта нет: " + papka_proekta);
     if (!poruchenie || !poruchenie.trim()) return fail("пустое поручение");
     rezhim = rezhim || (fayl ? "pravka" : "tekst");
     if ((rezhim === "pravka" || rezhim === "zamechaniya") && !fayl) return fail("для режима " + modeNames[rezhim] + " нужен file");
     if (rezhim === "tekst" && fayl) return fail("для нового текста file не указывай; исходные материалы передай через refs (или выбери режим edit / review)");
     if (stroki && !fayl) return fail("lines указываются только вместе с file");
+    // team-v63 (п.в.1): file — только полный (абсолютный) путь. Относительный раньше молча разрешался от рабочей папки
+    // сервера (без folder из него же бралась и папка проекта, и проверка «внутри папки» проходила) — теперь отклоняем.
+    if (fayl && !path.isAbsolute(fayl)) return fail("file укажи полным путём (абсолютным): " + fayl);
+    // team-v63 (п.2/Б3): идемпотентность. Повтор того же request_id (например, переотправка сценарием после перезапуска)
+    // возвращает уже созданное задание, не плодя второе. Принципал — отправитель (from), как в admission других адаптеров.
+    // Проверка «уже есть задание с этим request_id» и СОЗДАНИЕ задания — под ОДНИМ замком запроса (включая await resolveModel
+    // между ними): два одновременных повтора одного request_id не могут оба пройти проверку отсутствия и создать разные задания.
+    const reqFrom = require('../../common/job-identity').memberId(access.client()) || access.client();
+    let reqLock = { ok: true, release: async () => {} };
+    if (request_id) {
+      try { reqLock = await tryLock('agyreq', reqIndexKey(request_id, reqFrom), { request_id }); }
+      catch (e) { return fail('не удалось взять замок запроса (request_id): ' + errText(e)); }
+      if (!reqLock.ok) return fail('повтор request_id ' + request_id + ' уже обрабатывается другим вызовом — повторите позже или запросите antigravity_result.');
+    }
+    try {
+    if (request_id) { const dup = findJobByRequest(request_id, reqFrom); if (dup) { context.getStore().jobId = dup.id; return reply('Повтор request_id: задание ' + dup.id + ' уже создано (статус ' + dup.status + ').'); } }
+    // team-v63 (Б.3): вложения `files` — общий модуль attachments; читаются сейчас (отказ на нечитаемом файле — до постановки)
+    // и дописываются в текст поручения размеченными блоками с пометкой NOTE, чтобы не открывать файлы инструментами.
+    // team-v63 (п.16): гостю-исполнителю без полного доступа вложения ограничены папкой поручения (у Antigravity — папка
+    // проекта/файла); владельцу и доказанному чату — без пределов. Antigravity полного доступа в поручении не принимает.
+    let attachData = null;
+    const _att = require('../../common/attachments');
+    const _attFolder = papka_proekta || (fayl ? path.dirname(path.resolve(fayl)) : null);
+    try { attachData = _att.read(files, { authorize: _att.guestAuthorizer({ guest: access.guest() && !access.chatSession(), folder: _attFolder, fullAccess: false }) }); }
+    catch (e) { return fail(errText(e)); }
+    if (attachData) poruchenie = poruchenie.trim() + '\n\n' + require('../../common/attachments').NOTE + attachData.text;
+    // team-v60: папка проекта необязательна. Новый текст без файла — служебная папка (тот же scratch-folder, что у codex/
+    // deepseek/kimi); edit/review с файлом без папки — папка файла.
+    if (!papka_proekta || !String(papka_proekta).trim()) {
+      if (fayl) papka_proekta = path.dirname(path.resolve(fayl));
+      // team-v63 (п.а): mode=text файла не имеет — служебная папка берётся при любой роли (текст, проверка, совет, без роли).
+      else papka_proekta = require('../../common/scratch-folder').ensure({ role: context.getStore()?.args?.role, text: context.getStore()?.args?.text, write: false, anyRole: true });
+    }
+    if (!papka_proekta || !fs.existsSync(papka_proekta) || !fs.statSync(papka_proekta).isDirectory()) return fail("папки проекта нет: " + papka_proekta);
 
     let papkaCanon;
     try { papkaCanon = canon(papka_proekta); } catch (e) { return fail("не удалось проверить папку проекта: " + errText(e)); }
     const papka = path.resolve(papka_proekta);
     const draftPath = path.join(papka, DRAFT_NAME);
 
-    const m = access.guest() ? { id: model || null } : await resolveModel(model);
+    // team-v59 ч4: если модель не названа — её выбирает мост по классу задачи (common/model-choice); у Antigravity уровень
+    // вшит в id модели. Выбор доходит до реального запуска (--model), а не остаётся моделью по умолчанию приложения: для
+    // чата-гостя он сохраняется в requestedModel и resolveModel подхватывает его при старте (modelSelectionPending).
+    const mc = require('../../common/model-choice');
+    const agyRole = context.getStore()?.args?.role;
+    const modelNamed = model !== undefined && model !== null;
+    const modelChoice = mc.choose('antigravity', { task: poruchenie, rezhim, fayl, opora, role: agyRole, level });
+    if (!modelNamed) model = modelChoice.model;
+    let modelChoiceLine = mc.line('antigravity', modelChoice, modelNamed, model);
+
+    let m = access.guest() ? { id: model || null } : await resolveModel(model);
+    // team-v63 (п.б): выбранной мостом модели ревью кода (neon-low) нет в списке аккаунта — откат на прежний выбор
+    // (hydrogen-high) без отказа, а не сразу на модель по умолчанию приложения. Проверяется ДО общего отката ниже.
+    if (m.error && !modelNamed && modelChoice.fallback && !access.guest()) {
+      const fb = await resolveModel(modelChoice.fallback);
+      if (!fb.error) { model = modelChoice.fallback; m = fb; modelChoiceLine += ' (' + modelChoice.model + ' недоступна в аккаунте — прежний выбор ' + model + ')'; }
+    }
+    // team-v59 ч4: модель, выбранную мостом, которой нет в списке аккаунта, не роняем — откат на модель по умолчанию
+    // приложения (слово вызывающего так не теряется: при названной модели ошибка остаётся отказом, как прежде).
+    if (m.error && !modelNamed) { model = null; m = access.guest() ? { id: null } : await resolveModel(null); modelChoiceLine += ' (модель моста недоступна в аккаунте — модель по умолчанию приложения)'; }
     if (m.error) return fail(m.error);
 
     let work = null;
@@ -1367,6 +1458,10 @@ register(
       const stageArgs = context.getStore()?.args;
       if (stageArgs) {
         stageArgs.model = m.id;
+        // team-v62: имя работы без явной роли — это простой вопрос (роль «совет»), как у scratch-folder.ensure в других
+        // адаптерах. Тогда prepareJob нелатинскую/незарегистрированную работу примет ярлыком (workLabel), а зарегистрированной
+        // латинской по-прежнему потребует этап. Роль задаём только при наличии work, чтобы не менять выбор модели обычных правок.
+        if (stageArgs.work && !stageArgs.role) stageArgs.role = 'совет';
         const originalTask = stageArgs.task || '';
         await require('../../common/stage-gate').prepareJob(stageArgs, 'antigravity');
         // poruchenie уже содержит материал режима text; добавляем только замечания замены.
@@ -1397,17 +1492,20 @@ register(
     if (dl.error) return fail(dl.error);
 
     const job = {
-      id, gateOrder: context.getStore()?.args.gateOrder, stageTitle: context.getStore()?.args.stageTitle, stageId: context.getStore()?.args.stageId, scopeTask: context.getStore()?.args.scopeTask, role: context.getStore()?.args.role, replaces: context.getStore()?.args.replaces, replacementEvidence: context.getStore()?.args.replacementEvidence, stage: context.getStore()?.args.stage, workName: context.getStore()?.args.work, textInput: !!context.getStore()?.textFile, retry: { args, inputDir, stdin, ...(STREAM_INPUT ? { refs: opList } : {}) }, version: VERSION, from: require('../../common/job-identity').memberId(access.client()) || access.client(), ...chainFields, status: access.guest() ? "queued" : "running", startedAt: nowIso(), rezhim,
+      id, gateOrder: context.getStore()?.args.gateOrder, stageTitle: context.getStore()?.args.stageTitle, stageId: context.getStore()?.args.stageId, scopeTask: context.getStore()?.args.scopeTask, role: context.getStore()?.args.role, replaces: context.getStore()?.args.replaces, replacementEvidence: context.getStore()?.args.replacementEvidence, stage: context.getStore()?.args.stage, workName: context.getStore()?.args.work, workLabel: context.getStore()?.args.workLabel, workUnbound: context.getStore()?.args.workUnbound, textInput: !!context.getStore()?.textFile, retry: { args, inputDir, stdin, ...(STREAM_INPUT ? { refs: opList } : {}) }, version: VERSION, from: require('../../common/job-identity').memberId(access.client()) || access.client(), ...chainFields, status: access.guest() ? "queued" : "running", startedAt: nowIso(), rezhim,
       papka, papkaCanon, draftPath, ownerLabel: context.getStore()?.args?.owner,
       work: work ? { path: work.path, range: work.range, fileHash: work.fileHash, bom: work.bom, text: work.text } : null,
-      ...modelFields(m), modelSelectionPending: access.guest(), requestedModel: model || null,
+      ...modelFields(m), modelSelectionPending: access.guest(), requestedModel: model || null, modelChoiceLine, modelByBridge: !modelNamed,
       fileMode, poruchenieFile, promptChars: prompt.length, markers,
       poruchenie, task: context.getStore()?.args.scopeTask ?? poruchenie,
       owner: { instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT },
+      ...(request_id ? { requestId: request_id } : {}), // team-v63 (п.2): идемпотентный ключ на карточке
       ...(dl.deadline ? { deadline: dl.deadline } : {}),
     };
     try {
-      const save = () => { fs.mkdirSync(jobDir(id), { recursive: true }); saveJob(job); };
+      // team-v63 (Б3): индекс request_id пишем ВМЕСТЕ с карточкой, в той же короткой секции под замком — чтобы сбой между
+      // записями не терял связь. Карточка уже хранит requestId, поэтому даже при потере индекса findJobByRequest найдёт её.
+      const save = () => { fs.mkdirSync(jobDir(id), { recursive: true }); saveJob(job); recordJobRequest(request_id, reqFrom, id); };
       if (access.guest()) save();
       else await restartHold.locked(STATE_DIR, () => { restartHold.assertAdmitted(STATE_DIR, restartServer); save(); });
     }
@@ -1425,11 +1523,13 @@ register(
     return reply([
       "Задание " + id + (access.guest() ? " в очереди. Режим: " : " запущено. Режим: ") + modeNames[rezhim] + ".",
       access.guest() ? access.queued : "",
+      modelChoiceLine,
       "Модель: " + job.model + (job.modelWarning ? " — " + job.modelWarning : ""),
       work ? "Исходник: " + work.path + (work.range ? ", строки " + work.range.from + "–" + work.range.to : ", весь файл") : "Новый текст.",
       fileMode ? "Текст длинный: Antigravity получит его файлами во временной папке" + (poruchenieFile ? " (поручение — тоже файлом)" : "") + "." : "Текст передан прямо в поручении.",
       "Результат: antigravity_result с номером " + id + ".",
     ].join("\n"));
+    } finally { try { await reqLock.release(); } catch {} } // Б3: замок запроса держится весь путь проверка→resolveModel→создание
   }
 );
 
@@ -1498,6 +1598,7 @@ register(
       "Задание " + nomer + " готово за " + job.durationSec + " с. Режим: " + (modeNames[job.rezhim] || "edit") + ". Модель: " + job.model + "." + (job.modelWarning ? " (" + job.modelWarning + ")" : ""),
     ];
     if (job.recovered) head.push("Восстановлено: " + job.recovered + ".");
+    { const wl = require('../../common/summary').workLabelLine(job); if (wl) head.push(wl); } // team-v62: ярлык нелатинской/незарегистрированной работы
     if (r.error) return fail("Задание " + nomer + ": " + r.error);
     head.push("Результат задания: " + resultPath(nomer) + " — " + job.words + " слов.");
     head.push(draftLine(job));
@@ -1925,13 +2026,13 @@ async function resumeQueue() {
 }
 // ---------- запуск ----------
 (async () => {
-  await require('../../common/state-migration').start(require('../../common/paths'));
   restartServer = access.guest() ? null : restartHold.serverAsync(STATE_DIR, 'antigravity');
   process.stdin.on('end', () => { if (restartServer) restartServer.closed = true; });
   process.stdin.on('close', () => { if (restartServer) restartServer.closed = true; });
   rotateJournal();
   // team-v46: уборка старых заданий (обход всех каталогов, ~10 с) — не до подключения к Claude, а через 2 мин после старта.
-  if (!access.guest() && !process.env.MOST_TEST_KEEP) setTimeout(() => { try { pruneOld(); } catch (e) { log(errText(e)); } }, 120000).unref();
+  // team-v62 (взгляд участников): уборка старых заданий сканирует каталоги заданий — только ПОСЛЕ первичной миграции.
+  if (!access.guest() && !process.env.MOST_TEST_KEEP) setTimeout(() => { require('../../common/state-migration').waitPrimary().then(() => { try { pruneOld(); } catch (e) { log(errText(e)); } }); }, 120000).unref();
   // канал экземпляра: по нему другие экземпляры моста узнают, жив ли этот
   const ip = await startOwner(() => ({ version: VERSION, file: __filename, running: [...RUNNING.keys()] }));
   if (ip.ok) { instanceServer = ip.srv; instancePipeOk = true; }
@@ -1939,11 +2040,9 @@ async function resumeQueue() {
   log("мост " + VERSION + " запущен; agy: " + (AGY ? AGY.shown : "не найден") + "; хранилище: " + STATE_DIR);
   if (!access.guest() && AGY && process.env.MOST_PROBE_ONLY !== '1') {
     loadModels().catch(() => {});
-    setInterval(
-      () => resumeQueue().catch((e) => log(errText(e))),
-      Math.min(30000, Number(process.env.MOST_QUEUE_TICK_MS || 1000)),
-    ).unref();
-    // team-v46 fix: первый проход очереди — после подключения к Claude Desktop (ниже), не до.
+    // team-v62 (взгляд участников): интервальная сверка очереди перенесена в фоновую цепочку ПОСЛЕ миграции (ниже), не сюда.
+    // Прежде этот setInterval регистрировался ДО server.connect и срабатывал каждые 30 с независимо от миграции — поздний
+    // сервер мог прочитать state/jobs в полуперенесённом виде. Теперь очередь (и первый проход, и интервал) — после миграции.
   }
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -1952,9 +2051,24 @@ async function resumeQueue() {
   process.stdin.on("close", () => shutdown("Claude закрыл связь с мостом (stdin закрыт)"));
   process.on("uncaughtException", (e) => { log("необработанная ошибка: " + (e && e.stack ? e.stack : errText(e)).slice(0, 2000)); });
   process.on("unhandledRejection", (e) => { log("необработанный отказ: " + (e && e.stack ? e.stack : errText(e)).slice(0, 2000)); });
+  try { require('../../common/state-migration').arm(); } catch {} // team-v63 (п.18): взвести барьер миграции до connect
   const transport = require('../../common/public-transport').publicTransport(new StdioServerTransport());
   server.server.onclose = () => shutdown("связь MCP закрыта");
   await server.connect(transport);
   access.ready('antigravity');
-  if (!access.guest() && AGY && process.env.MOST_PROBE_ONLY !== '1') resumeQueue().catch((e) => log(errText(e)));
+  try { require('../../common/chat-origin').primeAsync(); } catch {} // team-v59 (task2): происхождение чата — в фоне после connect
+  // team-v62 (task4): миграция хранилища — в ФОНЕ после ответа на initialize/tools/list (общий замок миграции больше
+  // не держит server.connect: иначе серверы подключались по очереди и поздние появлялись в приложении минутами позже).
+  // Первая сверка очереди ждёт миграцию (барьер сохранён).
+  (async () => {
+    await require('../../common/state-migration').start(require('../../common/paths'));
+    if (!access.guest() && AGY && process.env.MOST_PROBE_ONLY !== '1') {
+      // Очередь стартует только после миграции (барьер сохранён): и первый проход, и периодический интервал.
+      resumeQueue().catch((e) => log(errText(e)));
+      setInterval(
+        () => resumeQueue().catch((e) => log(errText(e))),
+        Math.min(30000, Number(process.env.MOST_QUEUE_TICK_MS || 1000)),
+      ).unref();
+    }
+  })().catch((e) => log(errText(e)));
 })();

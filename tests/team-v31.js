@@ -35,7 +35,13 @@ run([
     fs.mkdirSync(state, { recursive: true });
     // Фальшивый dsh: читает задачу из stdin и печатает NDJSON-события сессии и финала.
     const fake = path.join(runDir, 'fake-dsh.js');
-    fs.writeFileSync(fake, 'process.stdout.write("{\\"type\\":\\"session\\",\\"sessionId\\":\\"s-1\\"}\\n{\\"type\\":\\"final\\",\\"text\\":\\"ОК\\"}\\n");\n');
+    fs.writeFileSync(fake, `
+const [flag, profile, ...args] = process.argv.slice(2);
+if (flag !== '--profile') process.exit(1);
+if (args.includes('--session-id') && args[args.indexOf('--session-id') + 1] !== 's-1') process.exit(2);
+console.log(JSON.stringify({ type: 'session', sessionId: 's-1' }));
+console.log(JSON.stringify({ type: 'final', text: 'ОК ' + profile + ' ' + process.env.MOST_DSH_JOB_MODEL }));
+`);
     const cmd = path.join(runDir, 'fake-dsh.cmd');
     fs.writeFileSync(cmd, '@node "%~dp0fake-dsh.js" %*\r\n');
     // Реестр: путь к dsh и профиль из adapter_params.
@@ -67,9 +73,34 @@ run([
         await new Promise(res => setTimeout(res, 100));
       }
       assert.equal(card.status, 'done');
-      assert.equal(card.model, 'deepseek-v4-flash');
+      assert.equal(card.model, 'deepseek-flash');
       const rr = await c.callTool({ name: 'deepseek_result', arguments: { id, wait_sec: 5 } });
-      assert.match((rr.content || []).map(x => x.text || '').join('\n'), /ОК/, 'ответ через deepseek_result');
+      assert.match((rr.content || []).map(x => x.text || '').join('\n'), /ОК most-read deepseek-flash/, 'профиль и модель процесса dsh');
+      const strong = await c.callTool({ name: 'deepseek_send', arguments: { folder, task: 'Ответь ровно: ОК', role: 'проверка', level: 'strong' } });
+      const strongText = strong.content.map(x => x.text || '').join('\n');
+      assert(!strong.isError, strongText);
+      assert.match(strongText, /модель и уровень: deepseek-v4-pro/);
+      const strongId = fs.readdirSync(jobs).find(n => /^[0-9a-f-]{36}\.json$/.test(n) && n !== id + '.json').slice(0, -5);
+      const strongReply = await c.callTool({ name: 'deepseek_result', arguments: { id: strongId, wait_sec: 5 } });
+      assert.match(strongReply.content.map(x => x.text || '').join('\n'), /ОК most-review deepseek-v4-pro/, 'сильная модель в том же профиле проверки');
+      const legacy = { ...card, model: 'deepseek-v4-flash' };
+      delete legacy.launchModel;
+      f.json(path.join(jobs, id + '.json'), legacy);
+      async function runReview(args, model, profile) {
+        const result = await c.callTool({ name: 'deepseek_send', arguments: { folder, task: 'Ответь ровно: ОК', ...args } });
+        const body = result.content.map(x => x.text || '').join('\n');
+        assert(!result.isError, body);
+        const jobId = /с id ([0-9a-f-]{36})\./.exec(body)?.[1];
+        assert(jobId, body);
+        const final = await c.callTool({ name: 'deepseek_result', arguments: { id: jobId, wait_sec: 5 } });
+        assert(final.content.map(x => x.text || '').join('\n').includes('ОК ' + profile + ' ' + model));
+        const resumed = JSON.parse(fs.readFileSync(path.join(jobs, jobId + '.json')));
+        assert.equal(resumed.launchModel, model);
+        if (args.continue_id) assert.equal(resumed.previous, id);
+      }
+      await runReview({ role: 'проверка' }, 'deepseek-flash', 'most-review');
+      await runReview({ continue_id: id }, 'deepseek-v4-flash', 'most-read');
+      await runReview({ continue_id: id, level: 'strong' }, 'deepseek-v4-pro', 'most-read');
       // Гость-чат без доказательства (Codex) не проходит fallback.guard (подпись места — всегда); серверный бан записи — Г4c-2, проверяется юнитом.
       const gTransport = new StdioClientTransport({ command: process.execPath, args: [path.join(ROOT, 'servers/deepseek/index.js')], stderr: 'pipe',
         env: { ...process.env, MOST_CLIENT: 'codex', MOST_REPO_ROOT: runDir, MOST_STATE_DIR: state, MOST_DEEPSEEK_JOBS_DIR: path.join(state, 'deepseek-jobs'), MOST_DSH_NO_PROFILES: '1', MOST_PROBE_ONLY: '1' } });
@@ -128,13 +159,12 @@ run([
       assert(patch.includes('disabled: false'), name + ': авторизация включена');
       assert(patch.includes('provider: deepseek-account'), name);
       assert(!patch.includes('dsh-mcp-client') && !patch.includes('mcp-most-'), name + ': MCP моста нет');
-      const expected = name === 'most-read' ? 'deepseek-v4-flash' : 'deepseek-v4-pro';
-      assert(patch.includes('model: ' + expected), name + ': модель ' + expected);
+      assert(patch.includes('model: !!js process.env.MOST_DSH_JOB_MODEL || "deepseek-flash"'), name + ': штатная модель и выбор процесса');
     }
     const ro = fs.readFileSync(path.join(dir, 'profiles/most-read/cordis.patch.yml'), 'utf8');
     assert(ro.includes('mode: read-only') && ro.includes('tool-pwsh') && ro.includes('disabled: true'), 'read: песочница и без оболочки');
     const rv = fs.readFileSync(path.join(dir, 'profiles/most-review/cordis.patch.yml'), 'utf8');
-    assert(rv.includes('mode: read-only') && rv.includes('model: deepseek-v4-pro') && rv.includes('disabled: true'), 'review: read-only, pro, без оболочки');
+    assert(rv.includes('mode: read-only') && rv.includes('disabled: true'), 'review: read-only, без оболочки');
     const wr = fs.readFileSync(path.join(dir, 'profiles/most-write/cordis.patch.yml'), 'utf8');
     assert(wr.includes('mode: workspace-write') && wr.includes('disabled: true'), 'write: песочница записи и без оболочки');
     const fu = fs.readFileSync(path.join(dir, 'profiles/most-full/cordis.patch.yml'), 'utf8');
@@ -143,8 +173,9 @@ run([
     assert.equal(profiles.profileName({ fullAccessApplied: true }), 'most-full');
     assert.equal(profiles.profileName({ role: 'проверка' }), 'most-review');
     assert.equal(profiles.profileName({ role: 'проверка', write: true }), 'most-review');
-    assert.equal(profiles.modelFor({ role: 'проверка' }, { models: { read: 'deepseek-v4-flash', review: 'deepseek-v4-pro' } }), 'deepseek-v4-pro');
-    assert.equal(profiles.modelFor({ write: true }, { models: { read: 'deepseek-v4-flash', review: 'deepseek-v4-pro' } }), 'deepseek-v4-pro');
+    assert.equal(profiles.modelFor({ role: 'проверка' }, { models: { read: 'deepseek-v4-flash', review: 'deepseek-v4-pro' } }), 'deepseek-flash');
+    assert.equal(profiles.modelFor({ write: true }, { models: { read: 'deepseek-v4-flash', review: 'deepseek-v4-pro' } }), 'deepseek-flash');
+    assert.equal(profiles.modelFor({ role: 'проверка' }, { models: { review: 'deepseek-custom' } }), 'deepseek-custom');
   }],
   ['Адаптер: dsh-headless известен, DeepSeek исполняет и голосует в B', () => {
     setB();

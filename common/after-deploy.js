@@ -13,7 +13,7 @@ async function afterDeploy(id, opts = {}) {
   let op;
   try { op = read(); } catch (e) { return 'уборка после установки: карточка операции не прочитана — ' + e.message; }
   if (op.status !== 'завершено') return 'уборка после установки: операция «' + op.status + '», уборки нет';
-  if (op.cleanup) return ops.cleanupLine(op.cleanup, now()) === 'уборка: прервана'
+  if (op.cleanup) return ops.cleanupLine(op.cleanup, now()).startsWith('уборка: прервана')
     ? 'уборка после установки прервана — автоматически не повторяется, нужна ручная уборка (team_change cleanup)'
     : 'уборка после установки уже ' + (op.cleanup.state || 'записана');
   if (op.noCleanup) { ops.update(file, { cleanup: { state: 'отключена' } }); return 'уборка: отключена'; }
@@ -28,6 +28,14 @@ async function afterDeploy(id, opts = {}) {
     else if (!op.release || !fs.existsSync(op.release)) bad = 'релиз операции не найден: ' + op.release;
   } catch (e) { bad = 'контекст операции не проверен: ' + e.message; }
   if (bad) { ops.update(file, { cleanup: { state: 'ошибка', reason: bad } }); return 'уборка: ошибка: ' + bad; }
+  // team-v58 (task5 пп.2–3): боевая уборка — ОТДЕЛЬНЫЙ процесс с пределом времени (сервер team не блокируется, замок берётся
+  // на каждый путь). Тесты подставляют opts.cleanup/opts.locked — тогда синхронная уборка под замком, как прежде (team-v10).
+  if (opts.cleanup || opts.inline) return inlineCleanup(file, id, opts, now, root, read, ops);
+  return spawnCleanup(file, id, opts, now, root);
+}
+
+// Синхронная уборка под замком репозитория (путь тестов и совместимости).
+async function inlineCleanup(file, id, opts, now, root, read, ops) {
   const locks = opts.locks || require('./locks');
   const mine = await locks.tryLock('after_deploy_cleanup', id, {}, path.join(root, 'state'));
   if (!mine.ok) return 'уборка после установки уже выполняется другим сервером';
@@ -37,7 +45,7 @@ async function afterDeploy(id, opts = {}) {
     try {
       text = await locked(root, async () => {
         if (read().cleanup) return 'уборка после установки уже записана';
-        ops.update(file, { cleanup: { state: 'идёт', started: new Date(now()).toISOString() } });
+        ops.update(file, { cleanup: { state: 'идёт', started: new Date(now()).toISOString(), pid: process.pid } });
         try {
           const r = (opts.cleanup || require('./cleanup').cleanup)({ root, apply: true, owner: 'после установки ' + id }, opts.cleanupDeps || {});
           const c = { state: 'готово', removed: r.removed.length, failed: r.failed.length, kept: r.plan.keep.length, blocked: r.plan.blocked, uncheckedHiddenProcesses: r.plan.uncheckedHiddenProcesses || 0, finished: new Date(now()).toISOString() };
@@ -54,6 +62,28 @@ async function afterDeploy(id, opts = {}) {
     }
     return text;
   } finally { await mine.release(); }
+}
+
+// Боевая уборка отдельным процессом: записывает «идёт» с PID и временем запуска процесса уборки и сразу возвращается.
+// «идёт» действительно, только пока этот процесс жив (см. deploy-ops.cleanupLine). Сам процесс берёт замок на каждый путь и
+// соблюдает предел времени (common/cleanup-run.js).
+function spawnCleanup(file, id, opts, now, root) {
+  const ops = require('./deploy-ops');
+  const limitMs = opts.cleanupLimitMs || Number(process.env.MOST_CLEANUP_LIMIT_MS || 1800000);
+  const started = new Date(now()).toISOString();
+  let child;
+  try { child = (opts.spawnCleanup || spawnCleanupWorker)({ root, id, limitMs, stateDir: opts.stateDir || require('./paths').stateDir }); }
+  catch (e) { try { ops.update(file, { cleanup: { state: 'ошибка', reason: 'не удалось запустить процесс уборки: ' + e.message } }); } catch {} return 'уборка: ошибка: не удалось запустить процесс уборки: ' + e.message; }
+  ops.update(file, { cleanup: { state: 'идёт', started, pid: child.pid, procStartedAt: child.startedAt || started } });
+  return 'уборка запущена отдельным процессом (PID ' + child.pid + '); предел ' + Math.round(limitMs / 1000) + ' с; состояние — в team_status';
+}
+function spawnCleanupWorker({ root, id, limitMs, stateDir }) {
+  const child = require('child_process').spawn(process.execPath, [path.join(__dirname, '..', 'tools', 'cleanup-worker.js')], {
+    detached: true, windowsHide: true, stdio: 'ignore',
+    env: { ...process.env, MOST_REPO_ROOT: root, MOST_STATE_DIR: stateDir, MOST_CLEANUP_ROOT: root, MOST_CLEANUP_ID: id, MOST_CLEANUP_LIMIT_MS: String(limitMs) },
+  });
+  child.unref();
+  return { pid: child.pid, startedAt: new Date().toISOString() };
 }
 
 // Последняя операция установки этого корня. Если она ещё не в конечном состоянии (исполнитель пишет «завершено»

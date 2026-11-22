@@ -512,9 +512,12 @@ test('Перенос: одновременно запущенные team, codex 
     return { client, transport, who };
   });
   try {
-    await Promise.all(clients.map(async ({ client, transport }) => {
-      await client.connect(transport); assert(fs.existsSync(marker(target)));
-    }));
+    // team-v62 перенёс первичную сверку в ФОН после server.connect, поэтому отметка .migration-done появляется НЕ синхронно с
+    // connect, а чуть позже (гонка). Дожидаемся общей отметки с пределом, а не проверяем её сразу после подключения.
+    await Promise.all(clients.map(({ client, transport }) => client.connect(transport)));
+    for (let i = 0; i < 200 && !fs.existsSync(marker(target)); i++) await new Promise(r => setTimeout(r, 50));
+    assert(fs.existsSync(marker(target)));
+    for (let i = 0; i < 200 && !(fs.existsSync(path.join(target, 'migration.log')) && read(path.join(target, 'migration.log')).copied === 1); i++) await new Promise(r => setTimeout(r, 50));
     assert.equal(read(path.join(target, 'migration.log')).copied, 1);
     assert.equal(read(path.join(target, 'jobs/review/card.json')).status, 'done');
   } finally { await Promise.all(clients.map(({ client }) => client.close())); }

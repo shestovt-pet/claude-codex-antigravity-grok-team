@@ -3,7 +3,7 @@ const fs = require('fs'), path = require('path');
 const runner = require('./runner-support');
 async function main(args = process.argv.slice(2)) {
   const root = path.resolve(__dirname, '..');
-  const log = runner.logPath(__dirname, process.env.MOST_TEST_OUTPUT || 'windows-test-output-' + path.basename(root) + '.txt');
+  const log = runner.logPath(__dirname, process.env.MOST_TEST_OUTPUT || 'windows-test-output-' + path.basename(root) + '.txt', process.env.MOST_TEST_OUTPUT_DIR);
   runner.mainBranch(root);
   const files = ['consilium-workflow.js', 'attribution.js', 'antigravity.js', 'part1.js', 'part2.js', 'trio-v2.js', 'trio-review.js', 'trio-v4.js', 'trio-v4-fix1.js', 'trio-v4-fix2.js', 'trio-v5.js', 'team-v6.js', 'team-v7.js', 'team-v8.js', 'team-v9.js', 'team-v10.js', 'team-v11.js', 'team-v12.js', 'team-v13.js', 'team-v14.js', 'team-v14-bridges.js'];
   files.push('team-v16-sources.js', 'team-v16-gate.js', 'team-v16-workflow.js', 'team-v16-status.js', 'team-v16-roles.js');
@@ -11,6 +11,14 @@ async function main(args = process.argv.slice(2)) {
   files.push('team-v17-rules.js', 'team-v23.js', 'team-v24.js', 'team-v25.js', 'team-v27.js', 'team-v28.js', 'team-v29.js');
   files.push('team-v18-word.js', 'team-v18-change.js');
   files.push('team-v19-claude-word.js', 'team-v21-paths.js', 'team-v22-full-access.js');
+  files.push('kimi-server.js', 'kimi-material.js', 'kimi-votes.js', 'kimi-deploy.js', 'kimi-full.js', 'kimi-probe.js');
+  files.push('admission-orphans.js');
+  files.push('team-v58-any-chat.js', 'team-v58-chat-origin.js', 'team-v58-status.js', 'team-v58-cleanup.js', 'team-v58-kimi-config.js');
+  files.push('team-v59-owner-word.js', 'team-v59-p3.js', 'team-v59-p2.js', 'team-v59-model-choice.js', 'team-v59-late-word.js');
+  files.push('team-v60-status.js');
+  files.push('team-v61-night.js');
+  files.push('team-v62-rehearsal.js');
+  files.push('team-v63-scenario.js');
   if (args.some(f => !files.includes(f))) throw Error('Неизвестный набор тестов.');
   const temp = fs.mkdtempSync(path.join(__dirname, '.tmp-windows-'));
   fs.writeFileSync(log, '');

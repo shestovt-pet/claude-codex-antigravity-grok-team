@@ -32,6 +32,10 @@ function seat(c, who, phase, candidate = c.candidate) {
   const claude = phase === 'design' ? recs.filter(v => v.who === 'claude' && v.replaces === who && v.decision === 'ПРИНЯТО') : [];
   const grok = []; // Старые замены не закрывают и не блокируют место.
   const base = { seat: who, phase, binding: b, closed: false, blocked: false, by: null, record: null, empty: !own.length && !claude.length && !grok.length };
+  // team-v59: слово владельца закрывает место при ЛЮБОМ состоянии участника (не отвечал, НЕ ПРИНЯТО, пауза) — запись
+  // owner_word в c.decisions с replaces=<участник> или replaces=all на эту же пару (verdict) либо замысел (design).
+  const ownerWord = (c.decisions || []).find(d => d.kind === 'owner_word' && d.phase === phase && (d.replaces === who || d.replaces === 'all') && bound(d, b));
+  if (ownerWord) return { ...base, closed: true, by: 'owner_word', record: ownerWord };
   // Отказ Grok на месте выпавшего снимает только новая редакция: ни «Отклонено:», ни позднее «ПРИНЯТО» вернувшегося.
   const grokNo = grok.find(v => v.decision === 'НЕ ПРИНЯТО');
   if (grokNo) return { ...base, blocked: true, by: 'grok', record: grokNo, reason: 'НЕ ПРИНЯТО Grok на месте ' + NAMES[who] + ' (' + grokNo.job_id + ') — снимает только новая редакция' };
@@ -83,7 +87,8 @@ function reviewJobs(c, who, b) {
     if (adapter === 'dsh-headless' && (j.write || j.previous || j.role !== 'проверка' || j.profile !== 'most-review' || !j.modelConfirmed ||
       require('./model-family').family(j.reportedModel) !== 'deepseek' || !require('./dsh-probe').ok() ||
       !j.dshVersion || j.dshVersion !== require('./dsh-probe').version())) return false;
-    if (!['codex-cli', 'agy-cli', 'dsh-headless'].includes(adapter)) return false;
+    if (adapter === 'kimi-cli' && j.status === 'done') { try { require('./kimi-review').evidence(j); } catch { return false; } }
+    if (!['codex-cli', 'agy-cli', 'dsh-headless', 'kimi-cli'].includes(adapter)) return false;
     if (!b) return true;
     return b.designHash ? hashIn(task, b.designHash, true) : hashIn(task, b.base) && hashIn(task, b.candidate);
   }).sort((x, y) => Date.parse(x.startedAt) - Date.parse(y.startedAt));

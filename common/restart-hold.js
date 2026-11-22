@@ -137,6 +137,7 @@ function claims(state) {
 }
 // Вызывается под job_start. early — только чтение, никогда не публикует отмену.
 function admit(state, server, { early = false, ...deps } = {}) {
+  if (require('./members-kimi').pending(state)) return { ok: false, kind: 'kimi-recovery', reason: 'Миграция Kimi не завершена; запуски удерживаются до восстановления новым кодом.' };
   // Один свежий снимок на вызов: только повтор capture или цели при оборванной цепочке.
   let processRows, targetTable;
   const processTable = () => processRows ??= (deps.processTable || (() => require('./fallback').processTable(true, { native: true })))();
@@ -234,6 +235,7 @@ async function locked(state, fn, deps = {}) {
 }
 // resolved не равно admit: живой сценарий после «закрыто» ещё запускает новый Claude.
 function resolved(state, deps = {}) {
+  if (require('./members-kimi').pending(state)) return false;
   const r = hold(state); if (r.missing) return true; if (r.error) return false;
   let d = decision(state, r.value); if (d.error) return false;
   if (d.missing && processState(r.value.executor, deps) === 'dead') {
@@ -249,8 +251,9 @@ function removeOwn(state, h) {
 async function cleanup(state, deps = {}) {
   return locked(state, () => { const r = hold(state); if (!r.missing && !r.error && resolved(state, deps)) { removeOwn(state, r.value); return true; } return false; }, deps);
 }
-async function begin(state, { runId, id = runId }, deps = {}) {
-  return locked(state, () => {
+async function begin(state, { runId, id = runId, beforeHold }, deps = {}) {
+  return locked(state, async () => {
+    await beforeHold?.(); // Под job_start, до чтения/разрешения прежней паузы и любых записей.
     const r = hold(state);
     if (!r.missing) {
       if (r.error || !resolved(state, deps)) throw Object.assign(Error('Перезапуск не запущен: идёт другой перезапуск (операция ' + (r.value?.id || 'не прочитана') + ').'), { restartNotStarted: true });
@@ -265,6 +268,7 @@ async function begin(state, { runId, id = runId }, deps = {}) {
   }, deps);
 }
 async function abort(state, h, deps = {}) {
+  if (require('./members-kimi').pending(state)) return false;
   return locked(state, () => {
     try { cancel(state, h.runId); } catch { return false; }
     const d = decision(state, h);
@@ -272,13 +276,36 @@ async function abort(state, h, deps = {}) {
     return false;
   }, deps);
 }
+// team-v60: предупреждения сводки не запускают powershell на каждый PID. Один кэшируемый снимок таблицы процессов на запрос
+// (fallback.processTable, кэш в памяти процесса) — живость PID проверяется по карте, а не отдельным Get-Process на процесс.
+// Переданный deps.fingerprint (тесты) не трогаем.
+function snapshotFingerprint() {
+  let map, snapError;
+  return pid => {
+    if (!map) {
+      // team-v61 (п.2): сбой снимка (CIM/powershell бросил, либо пустая таблица — при успехе в ней всегда есть сам процесс)
+      // НЕ превращается в пустую карту: иначе каждый PID выглядел бы мёртвым и предупреждения («Claude должен был закрыться…
+      // но работает», «не удалось проверить цепочку предков…») молча пропадали бы. Ошибку запоминаем и бросаем на каждый
+      // запрос — processState ловит её и возвращает 'unknown' («проверить нельзя»), как прежний per-PID путь. Таблица
+      // запрашивается ровно один раз на вызов warnings (кэш в fallback), второго powershell на PID нет.
+      try {
+        const rows = require('./fallback').processTable(false);
+        if (!Array.isArray(rows) || !rows.length) throw Error('Снимок процессов пуст.');
+        map = new Map(rows.map(p => [p.pid, p]));
+      } catch (e) { snapError = e; map = new Map(); }
+    }
+    if (snapError) throw snapError;
+    return map.get(pid) || null;
+  };
+}
 function warnings(state, deps = {}) {
   const lines = [], r = hold(state);
+  const d2 = { ...deps, fingerprint: deps.fingerprint || snapshotFingerprint() };
   if (r.error) lines.push('Пауза перезапуска: проверить нельзя — файл паузы не читается; новые поручения не принимаются.');
   if (r.value && !r.error) {
-    const d = decision(state, r.value), done = !d.error && d.value && (d.value.decision === 'отмена' || processState(d.value, deps) === 'dead');
+    const d = decision(state, r.value), done = !d.error && d.value && (d.value.decision === 'отмена' || processState(d.value, d2) === 'dead');
     if (!done) {
-      const owner = d.value?.decision === 'закрываю' ? d.value : r.value.executor, live = processState(owner, deps);
+      const owner = d.value?.decision === 'закрываю' ? d.value : r.value.executor, live = processState(owner, d2);
       const detail = d.error || live === 'unknown' ? 'проверить нельзя' : d.value ? 'сценарий закрывает Claude' : live === 'alive' ? 'исполнитель жив' : 'исполнитель мёртв, решение не опубликовано — снимет следующий участник';
       lines.push(`Пауза перезапуска: операция ${r.value.id}, с ${time(r.value)}, ${detail} — старые серверы не принимают новые поручения`);
     }
@@ -286,13 +313,13 @@ function warnings(state, deps = {}) {
   try {
     for (const f of claims(state).filter(f => !f.endsWith('.closed.json'))) {
       const c = read(f).value;
-      if (validClosing(c) && processState(c, deps) === 'dead' && c.targets.some(t => processState(t, deps) === 'alive'))
+      if (validClosing(c) && processState(c, d2) === 'dead' && c.targets.some(t => processState(t, d2) === 'alive'))
         lines.push(`Claude должен был закрыться при перезапуске (операция ${c.id}), но работает: его серверы не принимают поручения — перезапустите Claude`);
     }
     const dir = path.join(state, 'restart-servers');
     if (fs.existsSync(dir)) for (const f of fs.readdirSync(dir).filter(n => n.endsWith('.json'))) {
       const s = read(path.join(dir, f)).value;
-      if (s?.error && processState(s.process, deps) !== 'dead') lines.push('Не удалось проверить цепочку предков сервера ' + s.name + ' — поручения не принимаются; подробности в журнале сервера.');
+      if (s?.error && processState(s.process, d2) !== 'dead') lines.push('Не удалось проверить цепочку предков сервера ' + s.name + ' — поручения не принимаются; подробности в журнале сервера.');
     }
   } catch { lines.push('Пауза перезапуска: не удалось прочитать отметки перезапуска.'); }
   return [...new Set(lines)];

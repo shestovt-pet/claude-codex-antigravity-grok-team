@@ -11,31 +11,19 @@ const { samePath } = require('./paths');
 const names = require('./members').installedServers;
 // Ожидаемый список серверов для установки конкретного корня (его собственный реестр, в том числе
 // мигрированный team-v46), а не окружения MOST_STATE_DIR, которое в тестах может быть другим.
-function serversForRoot(root) {
+function serversForRoot(root, release) {
   try {
     const roster = require('./members-store').create(path.join(root, 'state')).read({ initialize: false });
-    return require('./members').serversForInstall(roster);
+    return require('./members').serversForInstall(release && require('./members-kimi').supported(release) ? require(path.join(release, 'common/members-kimi.js')).installTarget(path.join(root, 'state'), roster, release) : roster);
   } catch { return names; }
 }
 function activateMembers(release, root) {
   if (!fs.existsSync(path.join(release, 'common/members-store.js'))) return;
   const store = require('./members-store').create(path.join(root, 'state')), current = store.read();
-  const phase = fs.existsSync(path.join(release, 'common/install-phase.js')) ? require(path.join(release, 'common/install-phase')).phase : 'A';
+  const planned = require('./members-kimi').activation(path.join(root, 'state'), current, release), phase = planned.phase;
   // Фаза меняется только явной установкой: обычная правка состава сохраняет прежнюю (ревью DeepSeek, З-7).
   if (current.phase === phase) return;
-  store.update(current.rev, next => {
-    const d = next.members.find(m => m.id === 'deepseek');
-    const agy = next.members.find(m => m.id === 'antigravity');
-    if (phase === 'B') {
-      // Фаза B (team-v31): DeepSeek включается исполнителем и голосующим; из чата поручает Codex и Antigravity (К1).
-      if (d) d.roles = { ...d.roles, receives: true, sends: true, writer: true, voter: true };
-      if (agy) agy.mcp_allow = [...new Set([...(agy.mcp_allow || []), 'deepseek/deepseek_send', 'deepseek/deepseek_result', 'deepseek/deepseek_status'])];
-    } else {
-      // Фаза A: сброс исполнительных и голосующих ролей DeepSeek и его масок у Antigravity.
-      if (d) d.roles = { ...d.roles, receives: false, sends: false, writer: false, voter: false };
-      if (agy) agy.mcp_allow = (agy.mcp_allow || []).filter(x => !/^deepseek\//.test(x));
-    }
-  }, { action: 'phase', who: 'deploy', quote: null, reason: 'Установлен релиз с фильтром фазы ' + phase }, { phase });
+  store.update(current.rev, next => { next.members = planned.members; }, { action: 'phase', who: 'deploy', quote: null, reason: 'Установлен релиз с фильтром фазы ' + phase }, { phase });
 }
 function configPaths() {
   if (process.env.MOST_CLAUDE_CONFIGS) return JSON.parse(process.env.MOST_CLAUDE_CONFIGS);
@@ -197,6 +185,16 @@ function install(release, state) {
   else throw Error('Не найден npm-cli.js рядом с node.exe.');
 }
 
+// §5.5 (team-v58): кладёт готовый install.cmd в каталог выпуска из шаблона tools\install.template.cmd этого же выпуска,
+// подставляя коммит вместо __COMMIT__. Чтение/запись в 'latin1' — байт-в-байт: CRLF шаблона и UTF-8 (кириллица) сохраняются,
+// меняется только строка с коммитом (ASCII). Старый выпуск без шаблона — тихо пропускается (null).
+function writeInstallScript(release, commit) {
+  const tpl = path.join(release, 'tools', 'install.template.cmd');
+  if (!fs.existsSync(tpl)) return null;
+  const text = fs.readFileSync(tpl, 'latin1');
+  fs.writeFileSync(path.join(release, 'install.cmd'), text.replace(/__COMMIT__/g, commit), 'latin1');
+  return path.join(release, 'install.cmd');
+}
 function archive(root, commit, temp) {
   // Не извлекаем ссылки или подмодули: tar не должен записать через них вне релиза.
   if (
@@ -221,7 +219,44 @@ async function locked(root, fn, state) {
   }
 }
 
-async function deploy({ root, commit = 'main', configs, dryRun = false, releaseOnly = false, stateDir, nodeModulesFrom, restartClaude = false, external = false, cleanup = true }, deps = {}) {
+// team-v57 (ред.5): слово пользователя для перекрытия барьера установки.
+//  — канал Claude: слово проверено сервером (team.js), пришло в options.word/wordChannel — пробрасывается без вопроса;
+//  — канал консоли (установочный файл): слова в командной строке НЕТ. При непустом списке и интерактивном вводе
+//    tools/deploy.js печатает полный список и спрашивает слово с клавиатуры (deps.promptWord). При перенаправленном
+//    вводе, в поручении (MOST_JOB_ID) или у клиента (MOST_CLIENT) вопрос не задаётся — отказ. Между показом и установкой
+//    список собирается заново: изменился — показать и спросить снова. Пустое/пробельное слово — отказ.
+async function resolveInstallWord(state, options, deps) {
+  const kimi = require('./members-kimi');
+  let b = kimi.installationBlockers(state, { bootAt: deps.bootAt }), hash = kimi.listHash(b);
+  const findings = () => b.running.length || b.blockers.length;
+  if (!findings()) return {};
+  // Слово из чата (канал Claude/участника): отпечаток показанного списка уже проверен сервером (team.js) и пришёл сюда
+  // (options.wordListHash) — он идёт в запись операции вместе со словом и сверяется барьером install до изменяющего шага.
+  if (options.word) { const r = { quote: String(options.word).trim(), channel: options.wordChannel || 'claude' }; if (options.wordListHash) r.listHash = options.wordListHash; return r; }
+  const interactive = !!deps.promptWord && !process.env.MOST_JOB_ID && !process.env.MOST_CLIENT && process.stdin.isTTY;
+  if (!interactive) {
+    // §5.3 (team-v58): для ЧАТА (вопрос с клавиатуры недоступен — deps.promptWord нет) отказ идёт КАНАЛОМ КЛИЕНТА через
+    // refusalText (новый полный список + отпечаток, «передайте слово пользователя quote с этим list_hash»), а не консольным
+    // текстом «Интерактивный ввод недоступен…». Так чат, у которого при первом шаге находок не было, а к запуску они
+    // появились (и слова ещё нет), получает новый список и может дать слово тем же каналом. Консольный текст остаётся для
+    // установочного файла (promptWord есть, но ввод перенаправлен / задано MOST_JOB_ID/MOST_CLIENT).
+    if (!deps.promptWord) throw Error(kimi.refusalText(b, hash, options.wordChannel || 'claude'));
+    throw Error(kimi.refusalText(b, hash, 'console') + '\nИнтерактивный ввод недоступен (ввод не терминал, либо задано MOST_JOB_ID/MOST_CLIENT): установка отказана без вопроса.');
+  }
+  for (;;) {
+    const print = deps.print || console.log;
+    print(kimi.refusalText(b, hash, 'console'));
+    const answer = String(await deps.promptWord('Слово пользователя для перекрытия проверки (Enter — отмена): ') || '').trim();
+    if (!answer) throw Error('Слово не введено — установка отказана (пустое слово перекрытием не является).');
+    const b2 = kimi.installationBlockers(state, { bootAt: deps.bootAt }), hash2 = kimi.listHash(b2);
+    // team-v57 (task9 п.6, ревью Gemini 3): если за время ввода список изменился и находок больше НЕ осталось — слово не
+    // нужно и в операцию не пишется (возвращаем {}). Если находки остались — показываем изменившийся список и спрашиваем снова.
+    if (hash2 !== hash) { b = b2; hash = hash2; if (!findings()) return {}; print('Список изменился с момента показа — проверьте заново.'); continue; }
+    // Отпечаток показанного списка (по которому дано слово) уходит в операцию вместе со словом.
+    return { quote: answer, channel: 'console', listHash: hash };
+  }
+}
+async function deploy({ root, commit = 'main', configs, dryRun = false, releaseOnly = false, stateDir, nodeModulesFrom, restartClaude = false, external = false, cleanup = true, word, wordChannel, wordListHash }, deps = {}) {
   root = fs.realpathSync(root);
   repository(root, deployGit);
   const id = hash(root, commit, deployGit),
@@ -236,8 +271,11 @@ async function deploy({ root, commit = 'main', configs, dryRun = false, releaseO
   }
   require('./deploy-ops').assertIdle(root, null, dryRun);
   const state = path.join(root, 'state');
+  // §task7 п.2б/3: в начале установки путь настроек чата Kimi находится сам (client_config/MOST_KIMI_MCP_CONFIG/сохранённое/
+  // живой процесс) и ЗАПОМИНАЕТСЯ в state\kimi-client.json — следующие установки и перезапуски серверов не зависят от переменной.
+  if (!dryRun) try { require('./kimi-client').capture(state); } catch {}
   const deployState = path.resolve(stateDir || inside(root, 'live', '.deploy-state'));
-  const clients = releaseOnly || external ? [] : require('./client-configs').paths().filter(p => fs.existsSync(p.file));
+  const clients = releaseOnly || external ? [] : require('./client-configs').paths().filter(p => require('./client-configs').present(p));
   const files = releaseOnly ? [] : [...new Set((configs || configPaths()).map((p) => path.resolve(p)))].filter((p) => fs.existsSync(p));
   const plan = [
     'Коммит: ' + id,
@@ -249,17 +287,19 @@ async function deploy({ root, commit = 'main', configs, dryRun = false, releaseO
   // До этой точки нет mkdir, блокировок, временных файлов и запуска серверов.
   if (dryRun) {
     configPlans(files.map(snapshot), release, root, state);
-    require('./client-configs').plans(clients.map(p => ({...snapshot(p.file), kind: p.kind, client: p.client})), release, root, state, nodeCommand());
+    require('./client-configs').plans(clients.map(p => ({...snapshot(p.file, p.kind === 'kimi'), kind: p.kind, client: p.client})), release, root, state, nodeCommand());
     return 'Проверочный режим; изменений нет.\n' + plan;
   }
   const execute = deps.repoLocked ? async (_root, fn) => fn() : locked;
   const output = await execute(root, async () => {
-    // team-v46: сначала целевой снимок реестра (полная матрица), по нему — проба и конфиги; при сбое — откат реестра.
+    // У Kimi все миграции применяются одним снимком после hold и целевой пробы.
+    // Старые кандидаты сохраняют отдельную миграцию team-v46.
     const registryBefore = require('./members-store').create(state).read({ initialize: false });
-    const migrated = !releaseOnly && require('./members-v46').apply(state, 'forward');
+    let migrated = false;
+    let kimiOp;
     try {
     const snaps = external ? [] : files.map(snapshot);
-    const clientPlans = require('./client-configs').plans(clients.map(p => ({...snapshot(p.file), kind: p.kind, client: p.client})), release, root, state, nodeCommand());
+    const clientPlans = require('./client-configs').plans(clients.map(p => ({...snapshot(p.file, p.kind === 'kimi'), kind: p.kind, client: p.client})), release, root, state, nodeCommand());
     if (!releaseOnly && !(external ? files : snaps).length) throw Error('Не найден ни один существующий конфиг Claude.');
     const hook = deps.hook || (async () => {});
     if (!fs.existsSync(release)) {
@@ -279,12 +319,17 @@ async function deploy({ root, commit = 'main', configs, dryRun = false, releaseO
           },
         });
       } else await (deps.install || install)(temp, deployState);
+      if (!releaseOnly && !require('./members-kimi').supported(temp)) migrated = require('./members-v46').apply(state, 'forward');
       await probeRelease(temp, root, id, deployState, deps, hook);
+      // §5.5 (team-v58): готовый установочный файл install.cmd кладётся в каталог выпуска (с подставленным коммитом, CRLF).
+      // Шаблон tools\install.template.cmd берётся из самого архивированного выпуска (его коммит), меняется только __COMMIT__.
+      writeInstallScript(temp, id);
       await hook('publish');
       fs.renameSync(temp, release);
     } else {
       // Неизменяемый релиз повторно не устанавливается и не перезаписывается.
-      for (const n of serversForRoot(root))
+      if (!releaseOnly && !require('./members-kimi').supported(release)) migrated = require('./members-v46').apply(state, 'forward');
+      for (const n of serversForRoot(root, release))
         if (!fs.existsSync(inside(root, 'live', id, 'servers', n, 'index.js')))
           throw Error('Существующий релиз неполон.');
     }
@@ -293,9 +338,18 @@ async function deploy({ root, commit = 'main', configs, dryRun = false, releaseO
     if (previous.legacy) await probeRelease(release, root, id, deployState, deps, hook);
     expectedRoot(verifiedRelease(release), root);
     if (releaseOnly) return 'Релиз собран и прошёл пробный запуск.\n' + plan;
-    if (external) return require('./deploy-ops').start({ root, release, configs: files, restartClaude, cleanup }, deps.operation || {});
-    await switchConfigs([...configPlans(snaps, release, root, state), ...clientPlans, ...require('./agy-mcp-permissions').plans(release, root)], hook);
+    if (external) {
+      // Слово пользователя собирается ДО старта операции (для консоли — с клавиатуры в этой унаследованной консоли),
+      // чтобы попасть в запись операции и перекрыть барьер в исполнителе вне пакета.
+      const w = await resolveInstallWord(state, { word, wordChannel, wordListHash }, deps);
+      return require('./deploy-ops').start({ root, release, configs: files, restartClaude, cleanup, word: w.quote, channel: w.channel, listHash: w.listHash }, deps.operation || {});
+    }
+    // team-v57 (task9 п.6, ревью Codex 4): путь без external используется прямыми вызовами (тесты/CLI); для единообразия
+    // слово/канал/отпечаток передаются в барьер install так же, как в restart ниже (реальные установки идут через external).
+    kimiOp = await require('./members-kimi').install(state, release, { ...(deps.kimi || {}), word, channel: wordChannel, listHash: wordListHash });
+    await switchConfigs([...configPlans(snaps, release, root, state), ...require('./client-configs').plans(clients.map(p => ({...snapshot(p.file, p.kind === 'kimi'), kind: p.kind, client: p.client})), release, root, state, nodeCommand()), ...require('./agy-mcp-permissions').plans(release, root)], hook);
     activateMembers(release, root);
+    await require('./members-kimi').complete(state, kimiOp, () => probeRelease(release, root, id, deployState, deps, hook), deps.kimi || {});
     const marker = inside(root, 'live', 'deployed.json');
     try {
       atomic(marker, JSON.stringify({ commit: id, release, at: new Date().toISOString(), method: 'внешним сценарием', configs: [...files, ...clients.map(p => p.file)] }, null, 2));
@@ -304,11 +358,12 @@ async function deploy({ root, commit = 'main', configs, dryRun = false, releaseO
     }
     return 'Развёрнуто, нужен перезапуск Claude.\n' + plan;
     } catch (e) {
-      if (migrated) require('./members-v46').restore(state, registryBefore);
+      if (kimiOp && require('./members-kimi').pending(state)) require('./members-kimi').failed(state, kimiOp, e);
+      if (migrated && !require('./members-kimi').recorded(state)) require('./members-v46').restore(state, registryBefore);
       throw e;
     }
   }, deployState);
-  if (restartClaude && !external && !releaseOnly) return 'Развёрнуто.\n' + plan + '\n' + await require('./restart').restart({ root, release, state, close: true }, deps.restart || {});
+  if (restartClaude && !external && !releaseOnly) return 'Развёрнуто.\n' + plan + '\n' + await require('./restart').restart({ root, release, state, close: true, word, wordListHash }, deps.restart || {});
   return output;
 }
 
@@ -352,9 +407,10 @@ async function probeRelease(releasePath, root, id, deployState, deps, hook) {
 }
 
 async function probeWithSnapshot(isolated, releasePath, root, id, deps) {
-  const roster = { ...require('./members-store').create(path.join(root, 'state')).read({ initialize: false }) };
-  delete roster.warning; // Служебное поле чтения не входит в снимок реестра.
-  const text = JSON.stringify(roster), registry = path.join(isolated, 'members.json');
+  const sourceRegistryAbsent = require('./members-kimi').absent(path.join(root, 'state'));
+  let roster = { ...require('./members-store').create(path.join(root, 'state')).read({ initialize: false }) };
+  delete roster.warning; const sourceRegistryRev = roster.rev, sourceRegistryHash = require('./members-kimi').digest(roster); // Служебное поле чтения не входит в снимок реестра.
+  let text = JSON.stringify(roster); const registry = path.join(isolated, 'members.json');
   atomic(registry, text);
   atomic(registry + '.last-good', text);
   // Журнал реестра копируется целиком: без него проверенный снимок не считается покрытым.
@@ -365,6 +421,12 @@ async function probeWithSnapshot(isolated, releasePath, root, id, deps) {
     // Чистое состояние: снимок rev 0 получает свою init-запись, иначе журнал не покрывает снимок.
     if (roster.rev !== 0) throw Error('Реестр без журнала изменений: проба релиза невозможна.');
     fs.writeFileSync(isolatedLog, JSON.stringify({ action: 'init', rev: 0, at: new Date().toISOString(), who: 'system', reason: 'Первая инициализация (проба)', quote: null, before: null, after: roster }) + '\n');
+  }
+  if (require('./members-kimi').supported(releasePath)) {
+    const candidate = require(path.join(releasePath, 'common/members-kimi.js'));
+    candidate.apply(isolated, roster.rev, candidate.installTarget(isolated, roster, releasePath));
+    roster = require(path.join(releasePath, 'common/members-store.js')).create(isolated).read({ initialize: false });
+    text = fs.readFileSync(registry, 'utf8');
   }
   const logText = fs.readFileSync(isolatedLog, 'utf8');
   const checkSnapshot = () => {
@@ -407,7 +469,7 @@ async function probeWithSnapshot(isolated, releasePath, root, id, deps) {
       if (!sameTools(actual, expectedAll[client + ':' + n])) throw Error('Гостевой сервер предоставил неверный список инструментов.');
     }
   }
-  atomic(path.join(releasePath, 'probe-ok.json'), JSON.stringify({ commit: id, root, servers: probeNames, at: new Date().toISOString() }));
+  if (!deps.preserveMarker) atomic(path.join(releasePath, 'probe-ok.json'), JSON.stringify({ commit: id, root, servers: probeNames, sourceRegistryAbsent, sourceRegistryRev, sourceRegistryHash, targetRoster: roster, targetRegistryHash: require('./members-kimi').digest(roster), at: new Date().toISOString() }));
 }
 
 function verifiedRelease(release, allowLegacy = false) {
@@ -415,7 +477,7 @@ function verifiedRelease(release, allowLegacy = false) {
   let marker;
   try { marker = JSON.parse(fs.readFileSync(path.join(release, 'probe-ok.json'), 'utf8')); }
   catch { throw Error('Релиз не имеет метки успешного пробного запуска: ' + release); }
-  const expected = serversForRoot(marker.root);
+  const expected = serversForRoot(marker.root, release);
   if (!/^[a-f0-9]{40}$/.test(marker.commit) || path.basename(release) !== marker.commit ||
       !path.isAbsolute(marker.root || '') || !Number.isFinite(Date.parse(marker.at)) ||
       !(JSON.stringify(marker.servers) === JSON.stringify(expected) ||
@@ -469,12 +531,27 @@ async function configure(options, deps = {}) {
   const verified = verifiedRelease(release, true);
   expectedRoot(verified, root);
   const migration = require('./members-v46'), state = path.join(verified.root, 'state');
+  // §task7 п.2б/3: установка вне пакета (исполнитель, пишущий настройки клиентов) запоминает найденный путь чата Kimi.
+  if (!dryRun) try { require('./kimi-client').capture(state); } catch {}
   const before = require('./members-store').create(state).read({ initialize: false });
-  const changed = !dryRun && fs.existsSync(path.join(release, 'common/members-v46.js')) && migration.apply(state, 'forward');
+  const kimi = require('./members-kimi');
+  if (!dryRun && kimi.supported(release)) await prepare(release, options.stateDir, false, deps, options.result, root);
+  // team-v57 (ред.5): слово пользователя и канал — из записи операции (её создал deploy-ops.start по проверенному слову);
+  // барьер install перекрывается и пишет overriddenByWord в тот же файл операции (options.result).
+  let op = {}; try { if (options.result) op = JSON.parse(fs.readFileSync(options.result, 'utf8')); } catch {}
+  // team-v57 (task9 п.1): утверждённый отпечаток (installListHash) из записи операции идёт в барьер install и в перезапуск.
+  const kimiOp = !dryRun ? await kimi.install(state, release, { ...(deps.kimi || {}), word: op.installWord, channel: op.installChannel, listHash: op.installListHash, opFile: options.result }) : null;
+  const changed = !dryRun && !kimiOp && fs.existsSync(path.join(release, 'common/members-v46.js')) && migration.apply(state, 'forward');
   const progress = { configsSwitched: false };
-  try { return await configurePrepared(options, deps, progress); }
+  try {
+    const output = await configurePrepared(kimiOp ? { ...options, restartClaude: false } : options, deps, progress);
+    await kimi.complete(state, kimiOp, () => probeRelease(release, verified.root, path.basename(release), options.stateDir || path.join(verified.root, 'live/.deploy-state'), deps, deps.hook || (async () => {})), deps.kimi || {});
+    if (kimiOp && options.restartClaude) return output + '\n' + await require('./restart').restart({ root: verified.root, release, state, close: true, word: op.installWord, wordListHash: op.installListHash }, deps.restart || {});
+    return output;
+  }
   catch (e) {
-    if (changed && !progress.configsSwitched && !e.configsUncertain) migration.restore(state, before);
+    if (kimiOp && kimi.pending(state)) kimi.failed(state, kimiOp, e);
+    if (changed && !kimiOp && !progress.configsSwitched && !e.configsUncertain) migration.restore(state, before);
     throw e;
   }
 }
@@ -482,7 +559,7 @@ async function configurePrepared({ root, release, configs, stateDir, dryRun = fa
   if (!release || !configs?.length) throw Error('--config-only требует --release и --config.');
   const verified = await prepare(release, stateDir, dryRun, deps, result, root);
   const files = [...new Set(configs.map((p) => path.resolve(p)))];
-  const clients = method === 'из Claude через исполнителя вне пакета' ? require('./client-configs').paths().filter(p => fs.existsSync(p.file)) : [];
+  const clients = method === 'из Claude через исполнителя вне пакета' ? require('./client-configs').paths().filter(p => require('./client-configs').present(p)) : [];
   const plan = 'Релиз: ' + verified.release + '\n' + files.map((p) => 'Конфиг: ' + p).join('\n');
   if (dryRun) {
     files.forEach(snapshot);
@@ -493,7 +570,7 @@ async function configurePrepared({ root, release, configs, stateDir, dryRun = fa
     const rules = require('./client-rules');
     const rulePlans = method === 'из Claude через исполнителя вне пакета' ? rules.plans(deps.rules?.files) : [];
     await switchConfigs([...rulePlans.filter(p => p.next !== p.text), ...configPlans(files.map(snapshot), verified.release, verified.root, stateDir),
-      ...require('./client-configs').plans(clients.map(p => ({ ...snapshot(p.file), kind: p.kind, client: p.client })), verified.release, verified.root, path.join(verified.root, 'state'), nodeCommand()), ...require('./agy-mcp-permissions').plans(verified.release, verified.root)], deps.hook);
+      ...require('./client-configs').plans(clients.map(p => ({ ...snapshot(p.file, p.kind === 'kimi'), kind: p.kind, client: p.client })), verified.release, verified.root, path.join(verified.root, 'state'), nodeCommand()), ...require('./agy-mcp-permissions').plans(verified.release, verified.root)], deps.hook);
     progress.configsSwitched = true;
     const rulesDelivery = rules.evidence(rulePlans, result ? path.basename(result, '.json') : null);
     if (result) require('./deploy-ops').update(result, { rulesDelivery });
@@ -517,11 +594,14 @@ async function configurePrepared({ root, release, configs, stateDir, dryRun = fa
 async function configureClients({ root, release, stateDir, dryRun = false, restartClaude = false }, deps = {}) {
   if (!release) throw Error('--clients-only требует --release.');
   const verified = await prepare(release, stateDir, dryRun, deps, undefined, root), clients = require('./client-configs');
-  const files = clients.paths().filter(p => fs.existsSync(p.file));
+  if (!dryRun) try { require('./kimi-client').capture(path.join(verified.root, 'state')); } catch {}
+  const files = clients.paths().filter(p => clients.present(p));
   if (!files.length) throw Error('Не найдены файлы подключений Codex и Antigravity.');
   const state = path.join(verified.root, 'state');
   const plan = 'Релиз: ' + verified.release + '\n' + files.map(p => 'Подключения: ' + p.file).join('\n');
-  const plans = () => [...clients.plans(files.map(p => ({ ...snapshot(p.file), kind: p.kind, client: p.client })), verified.release, verified.root, state, nodeCommand()), ...require('./agy-mcp-permissions').plans(verified.release, verified.root)];
+  // team-v58 (task10, Codex 7): у чата Kimi домашняя папка уже есть (present), а mcp.json может ещё не существовать — тогда
+  // снимок берётся как необязательный (как в остальных путях установки), чтобы первое подключение создало файл, а не упало на ENOENT.
+  const plans = () => [...clients.plans(files.map(p => ({ ...snapshot(p.file, p.kind === 'kimi'), kind: p.kind, client: p.client })), verified.release, verified.root, state, nodeCommand()), ...require('./agy-mcp-permissions').plans(verified.release, verified.root)];
   if (dryRun) { plans(); return 'Проверочный режим; изменений нет.\n' + plan; }
   const run = async () => {
     await switchConfigs(plans(), deps.hook);
@@ -657,4 +737,4 @@ async function rollback({ root, configs, configOnly = false, stateDir }, deps = 
   repository(root, deployGit);
   return locked(root, run);
 }
-module.exports = { deploy, configure, configureClients, rollback, configPaths, configFor, snapshot, switchConfigs, locked };
+module.exports = { deploy, configure, configureClients, rollback, configPaths, configFor, snapshot, switchConfigs, locked, resolveInstallWord, writeInstallScript, probeRelease };

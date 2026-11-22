@@ -7,7 +7,7 @@ const { format } = require('../../common/format');
 const access = require('../../common/access');
 const grok = new Grok(), testGrok = new Grok(undefined, { test: true }), server = new McpServer({ name: 'grok', version: '0.5.9' }, require('../../common/server-instructions').options('grok'));
 function register(name, title, schema, fn) {
-  if (!access.allowed('grok', name)) return;
+  if (!access.offered('grok', name)) return;
   server.registerTool(name, { title, description: title,
     inputSchema: require('../../common/schema').compatible(schema) }, async args => {
     try {
@@ -46,6 +46,7 @@ register('grok_cancel', 'Отменить поручение Grok', { id: z.stri
 });
 async function start() {
   await require('../../common/state-migration').start(require('../../common/paths'));
+  try { require('../../common/state-migration').arm(); } catch {} // team-v63 (п.18): взвести барьер миграции до connect
   await server.connect(require('../../common/public-transport').publicTransport(new StdioServerTransport()));
   access.ready('grok');
   if (!access.guest() && process.env.MOST_PROBE_ONLY !== '1') {

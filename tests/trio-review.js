@@ -13,8 +13,9 @@ const tests = []; const test = (name,fn) => tests.push({name,fn}); let passed=0,
 const begin='# most:begin (правит team_change deploy)', end='# most:end';
 function release(id) {
   const dir=path.join(RUN,'live',id.repeat(40));
-  for(const n of ['team','codex','antigravity'])write(path.join(dir,'servers',n,'index.js'),'// подделка релиза');
-  json(path.join(dir,'probe-ok.json'),{commit:id.repeat(40),root:RUN,servers:['team','codex','antigravity'],at:new Date().toISOString()});
+  const servers = [...require('../common/members').installedServers];
+  for(const n of servers)write(path.join(dir,'servers',n,'index.js'),'// подделка релиза');
+  json(path.join(dir,'probe-ok.json'),{commit:id.repeat(40),root:RUN,servers,at:new Date().toISOString()});
   return dir;
 }
 const oldRelease=release('a'), current=release('b');
@@ -47,7 +48,7 @@ test('F1: повреждённые и повторные настоящие ме
 });
 test('F2: TOML сравнивается по разобранным значениям, форматирование сохраняется',()=>{
   const base=cc.toml('# keep\n',current,RUN,RUN,process.execPath);
-  const formatted=base.replace('startup_timeout_sec = 30','startup_timeout_sec=3_0').replaceAll(' = ', '   =   ').replace("MOST_CLIENT   =   'codex'",'MOST_CLIENT="codex"');
+  const formatted=base.replace('startup_timeout_sec = 120','startup_timeout_sec=1_20').replaceAll(' = ', '   =   ').replace("MOST_CLIENT   =   'codex'",'MOST_CLIENT="codex"');
   assert.deepEqual(cc.plans([{kind:'codex',file:'none',text:formatted}],current,RUN,RUN,process.execPath),[]);
   const previous=process.env.MOST_CODEX_CONFIG, file=path.join(RUN,'formatted.toml');
   try {write(file,formatted);process.env.MOST_CODEX_CONFIG=file;assert(cc.status().includes(path.join(current,'servers/team/index.js')));}
@@ -149,10 +150,11 @@ test('L1: перенос из двух прежних мест с сохране
   json(path.join(local,'most/codex-jobs/later.json'),{});await migrate({root,state,env});assert(fs.existsSync(path.join(state,'codex-jobs/later/card.json')));
 });
 test('L1–L2: configure и clients-only отделяют хранилище от блокировок',async()=>{
+  release('b'); // Макет соответствует реестру, мигрированному предыдущей CLI-фикстурой.
   const lockState=path.join(RUN,'only-deploy-locks');
   await d.configure({release:current,configs:[files.claude],stateDir:lockState});
   await d.configureClients({release:current,stateDir:lockState});
-  for(const n of ['team','codex','antigravity'])assert.equal(read(files.claude).mcpServers[n].env.MOST_STATE_DIR,path.join(RUN,'state'));
+  for(const n of require('../common/members').installedServers)assert.equal(read(files.claude).mcpServers[n].env.MOST_STATE_DIR,path.join(RUN,'state'));
   for(const n of ['team','codex'])assert.equal(read(files.agy).mcpServers[n].env.MOST_STATE_DIR,path.join(RUN,'state'));
   const text=fs.readFileSync(files.codex,'utf8'), servers=cc.block(text).parsed.root.mcp_servers;
   for(const n of ['team','antigravity']){assert.equal(servers[n].env.MOST_STATE_DIR,path.join(RUN,'state'));assert.equal(servers[n].default_tools_approval_mode,'approve');}
@@ -184,10 +186,12 @@ test('L1–L3: MCP принимает строки и сохраняет зап�
       assert.equal(read(path.join(root,'state/team/migrated.json')).preserved,true);
       for(const key of ['claude_usage','claude_quota']){
         const value=key==='claude_usage'?{calls:'2',written:'3',reread:'4',window_h:'5',taken_at:new Date().toISOString(),source:'test'}:{percent:'25',taken_at:new Date().toISOString(),source:'test'};
-        const r=await call({[key]:JSON.stringify(value)});assert.equal(!!r.isError,client==='codex',JSON.stringify(r));
+        // team-v58: чат ЛЮБОГО участника с доказанным происхождением (в тесте — подстановка MOST_TEST_CHAT_ORIGIN) получает
+        // полный набор дирижёра, включая диагностику team_status — поэтому разбор строк MCP проходит и у codex, и у claude.
+        const r=await call({[key]:JSON.stringify(value)});assert.equal(!!r.isError,false,JSON.stringify(r));
       }
       assert((await call({notify_test:'yes'})).isError);
-      const notify=await call({notify_test:'true'});assert.equal(!!notify.isError,client==='codex');
+      const notify=await call({notify_test:'true'});assert.equal(!!notify.isError,false);
       if(client==='claude'){
         const r=await c.callTool({name:'team_change',arguments:{action:'list',restart_claude:'false',from_char:'0'}});assert(!r.isError,JSON.stringify(r));
         assert((await c.callTool({name:'team_change',arguments:{action:'list',restart_claude:'no'}})).isError);

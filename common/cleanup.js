@@ -239,7 +239,10 @@ function clonePlan(d, plan) {
     let c;
     try { c = card(d, n); } catch (e) { plan.keep.push({ path: p, reason: 'нет карточки изменения: ' + raceReason(e) }); continue; }
     const why = cloneWhy(d, p, c, mainHash);
-    if (why) { plan.keep.push({ path: p, reason: why.reason, code: why.code }); if (!['process_busy', 'processes_unread'].includes(why.code)) tmpPlan(d, p, c, plan); }
+    // team-v58 (task5 п.2): временные папки тестов tests\.tmp-* внутри клона поштучно НЕ проверяются — клон удаляется целиком
+    // (вместе с ними) или остаётся целиком. Прежнее поштучное перечисление сотен .tmp-* в сохранённом клоне и было причиной
+    // 18-минутной уборки, повесившей сервер. Сохранённый клон держит свои .tmp-* до собственного удаления.
+    if (why) { plan.keep.push({ path: p, reason: why.reason, code: why.code }); }
     else plan.remove.push({ path: p, kind: 'клон', reason: 'слито, всё в main, живых поручений нет', parent: d.workDir,
       recheck: () => { try { return cloneWhy(d, p, card(d, n))?.reason; } catch (e) { return 'карточка не прочитана: ' + raceReason(e); } } });
   }
@@ -303,31 +306,44 @@ function makePlan(deps) {
   return plan;
 }
 
-function cleanup({ root, apply = false, owner = null }, deps = {}) {
-  root = realOrGiven(root);
-  apply = apply === true;
+// План уборки (сухой), без удаления — чтобы отдельный процесс уборки (common/cleanup-run.js) мог брать замок репозитория на
+// КАЖДЫЙ путь по отдельности, а не на всю уборку. При идущей установке — исключение (как в cleanup).
+function planFor({ root, apply = true }, deps = {}) {
+  root = realOrGiven(root); apply = apply === true;
   const d = { ...defaults(root, apply), ...deps };
   let pending;
   try { pending = d.pendingDeploy(); } catch (e) {
     if (apply) throw e;
-    return { plan: { remove: [], keep: [{ path: root, reason: raceReason(e) }], blocked: [raceReason(e)] }, removed: [], failed: [], apply, owner };
+    return { d, plan: { remove: [], keep: [{ path: root, reason: raceReason(e) }], blocked: [raceReason(e)] } };
   }
   if (pending) throw Error('Идёт установка ' + pending.id + '; уборка отложена.');
   const plan = makePlan(d);
+  if (apply && plan.remove.length) plan.recheckProcesses();
+  return { d, plan };
+}
+// Удаление одного пути плана: все условия проверяются заново непосредственно перед удалением (повторная проверка, safeChild).
+function removeOne(x, deps = {}) {
+  try {
+    const why = x.recheck();
+    if (why) return { ...x, ok: false, reason: 'повторная проверка: ' + why };
+    const bad = safeChild(x.parent, x.path, x.base);
+    if (bad) return { ...x, ok: false, reason: bad };
+    fs.rmSync(x.path, { recursive: true, force: false, maxRetries: 3 });
+    deps.afterRemove?.(x);
+    return { ...x, ok: true };
+  } catch (e) { return { ...x, ok: false, reason: e.message }; }
+}
+
+function cleanup({ root, apply = false, owner = null }, deps = {}) {
+  apply = apply === true;
+  // planFor бросает «Идёт установка» (как прежде) и переброс ошибки чтения при apply; при сухом прогоне ошибку чтения он
+  // возвращает планом-предупреждением — поведение сохранено.
+  const { d, plan } = planFor({ root, apply }, deps);
   const removed = [], failed = [];
   if (apply) {
-    if (plan.remove.length) plan.recheckProcesses();
     for (const x of plan.remove) {
-      try {
-        // Все условия этого пути проверяются заново непосредственно перед его удалением.
-        const why = x.recheck();
-        if (why) { failed.push({ ...x, reason: 'повторная проверка: ' + why }); continue; }
-        const bad = safeChild(x.parent, x.path, x.base);
-        if (bad) { failed.push({ ...x, reason: bad }); continue; }
-        fs.rmSync(x.path, { recursive: true, force: false, maxRetries: 3 });
-        removed.push(x);
-        d.afterRemove?.(x);
-      } catch (e) { failed.push({ ...x, reason: e.message }); }
+      const r = removeOne(x, d);
+      if (r.ok) removed.push(x); else failed.push({ ...x, reason: r.reason });
     }
   } else {
     for (const x of plan.remove) {
@@ -421,4 +437,4 @@ function inspect(plan, p, fn) {
 }
 function entries(plan, dir) { return inspect(plan, dir, () => fs.readdirSync(dir)) || []; }
 
-module.exports = { cleanup, cleanupText, makePlan, safeChild, windowsProcesses, cmdPaths, configPaths, refersTo, processWhy, cloneWhy, tmpWhy, defaults, liveJobsInFolder };
+module.exports = { cleanup, cleanupText, makePlan, planFor, removeOne, safeChild, windowsProcesses, cmdPaths, configPaths, refersTo, processWhy, cloneWhy, tmpWhy, defaults, liveJobsInFolder };

@@ -45,7 +45,7 @@ for (const who of ['codex', 'antigravity', 'grok']) test('12д, MCP ' + who + ':
     const schema = (await b.client.listTools()).tools.find(t => t.name === who + '_send').inputSchema.properties;
     assert(schema.role && schema.replaces && schema.opora);
     const args = { folder: project, task: 'v14-version Проверка', work: who + '-work', owner: 'test', stage: 'Итог', ...(who === 'antigravity' ? { model: 'gemini-3.1-pro-high', mode: 'text' } : {}) };
-    const bad = await call(b, who + '_send', args); assert(bad.error, bad.text); assert.match(bad.text, /role/);
+    if (who !== 'codex' && who !== 'antigravity') { const bad = await call(b, who + '_send', args); assert(bad.error, bad.text); assert.match(bad.text, /role/); } // team-v60: codex — роль необязательна (по умолчанию «совет»); team-v62: antigravity при work без роли тоже ставит «совет»; слово владельца перекрывает «role обязателен»
     const good = await call(b, who + '_send', { ...args, role: 'проверка' }); assert(!good.error, good.text);
     const jobs = require('../common/team-store').list(who, false).jobs.filter(j => (j.workName || j.work) === args.work);
     assert.equal(jobs.length, 1); const j = jobs[0]; assert.equal(j.role, 'проверка'); assert.equal(j.stageId, 'stage-permanent'); assert.equal(j.stage, j.stageId); assert.equal(j.stageTitle, 'Итог');

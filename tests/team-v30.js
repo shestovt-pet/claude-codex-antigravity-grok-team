@@ -99,9 +99,12 @@ run([
   ['А12: реестр с phase запрещает откат ниже А уже после инициализации', () => {
     const s = isolated(), r = require('../common/members-rollback');
     assert.deepEqual(r.blockers(path.dirname(s.file), []), []);
-    s.read(); assert.throws(() => r.assert(path.dirname(s.file), []), /phase A, rev 0/);
+    // Исторический реестр кандидата A до появления kimi-cli по-прежнему держит границу phase.
+    const historical = require('../common/members-default')(); historical.members = historical.members.filter(m => m.adapter !== 'kimi-cli');
+    s.read({ initialRoster: historical }); assert.throws(() => r.assert(path.dirname(s.file), []), /phase A, rev 0/);
     s.update(0, n => n.members[0].title = 'Изменение', meta);
     assert.throws(() => r.assert(path.dirname(s.file), []), /rev 1/); assert.doesNotThrow(() => r.assert(path.dirname(s.file), [path.resolve(__dirname, '..')]));
+    const current = isolated(); current.read(); assert.throws(() => r.assert(path.dirname(current.file), []), /Журнал содержит kimi-cli/);
   }],
   ['А13: DSH deploy/rollback сохраняют чужой YAML и пути live', () => {
     const d = require('../common/dsh-config'), before = '- id: personal\n  config: !!js someUserExpression\n';
@@ -145,7 +148,8 @@ run([
       const c = require('../common/member-clients').all().find(c => c.id === 'client-test'); assert(c);
       const config = require('../common/client-configs').jsonConfig({}, 'permissions', f.root, f.root, '', process.execPath, 'test', false, 'client-test');
       assert.deepEqual(config.userSettings.globalPermissionGrants.allow, require('../common/client-configs').grantsFor('client-test'));
-      assert(!config.userSettings.globalPermissionGrants.allow.includes('mcp(antigravity/antigravity_cancel)'));
+      // team-v58: новый клиент-участник известного адаптера получает полный набор дирижёра — в т.ч. antigravity_cancel.
+      assert(config.userSettings.globalPermissionGrants.allow.includes('mcp(antigravity/antigravity_cancel)'));
       const p = require('../common/client-configs').plans([{ file: c.file, text: '', config: null, kind: c.kind, client: c.id }], f.root, f.root, '', process.execPath);
       assert.match(p[0].next, /MOST_CLIENT = 'client-test'/); assert.match(require('../common/client-rules').body('client-test'), /Проверочный участник/);
     } finally { s.update(s.read().rev, n => n.members.find(m => m.id === 'client-test').state = 'removed', { ...meta, action: 'remove' }); }

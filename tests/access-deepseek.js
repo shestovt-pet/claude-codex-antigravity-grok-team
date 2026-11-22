@@ -1,6 +1,7 @@
 'use strict';
-// Внешняя семья deepseek (вводная от 20.10.2026, вариант B): гость только для чтения —
-// ни поручений (*_send), ни записи в работы, ни голоса в воротах. Неизвестный клиент по-прежнему без инструментов.
+// team-v58: чат любого зарегистрированного участника (в т.ч. семьи только для чтения deepseek) получает полный набор
+// дирижёра — в чате может быть пользователь. Роль семьи (sends=false) ограничивает её как исполнителя/голос, но не чат.
+// Признак поручения (jobSession) отсекает исполнителя; неизвестный клиент по-прежнему без инструментов.
 const assert = require('assert');
 const { run } = require('./team-v16-fixture');
 const access = require('../common/access');
@@ -18,10 +19,12 @@ function withClient(c, fn) {
   }
 }
 
-const READ_ONLY = {
-  team: ['team_status', 'team_rules', 'team_work'],
-  codex: ['codex_status', 'codex_result'],
-  antigravity: ['antigravity_status', 'antigravity_result'],
+// team-v58: полный набор дирижёра для чата участника. team — все девять инструментов; серверы участников —
+// status/send/result/cancel (+ antigravity_apply).
+const FULL = {
+  team: ['team_status', 'team_rules', 'team_members', 'team_change', 'team_word', 'team_work', 'team_inbox', 'team_ask', 'team_ask_result', 'team_scenario'],
+  codex: ['codex_status', 'codex_send', 'codex_result', 'codex_cancel'],
+  antigravity: ['antigravity_status', 'antigravity_send', 'antigravity_result', 'antigravity_apply', 'antigravity_cancel'],
 };
 
 run([
@@ -32,36 +35,38 @@ run([
       assert.equal(access.allowed('team', 'team_status'), false);
     });
   }],
-  ['П2: deepseek — гость с набором только для чтения', () => {
+  ['П2: deepseek-чат получает полный набор дирижёра (team-v58)', () => {
     withClient('deepseek', () => {
       assert.equal(access.client(), 'deepseek');
-      assert.equal(access.guest(), true);
-      for (const s of Object.keys(READ_ONLY)) {
-        assert.deepEqual(access.guestTools(s, 'deepseek'), READ_ONLY[s], 'набор для сервера ' + s);
-        for (const t of READ_ONLY[s]) {
-          assert(!/_send$/.test(t), 'deepseek не должен получать ' + t);
-          assert.equal(access.allowed(s, t), true, 'разрешено ' + t);
-        }
+      assert.equal(access.guest(), true);       // роль семьи — не дирижёр, но это чат участника
+      assert.equal(access.chatSession(), true);
+      assert.equal(access.jobSession(), false);
+      for (const s of Object.keys(FULL)) {
+        assert.deepEqual(access.guestTools(s, 'deepseek'), FULL[s], 'набор для сервера ' + s);
+        for (const t of FULL[s]) assert.equal(access.allowed(s, t), true, 'разрешено ' + t);
       }
-      assert.equal(access.allowed('codex', 'codex_send'), false);
-      assert.equal(access.allowed('antigravity', 'antigravity_send'), false);
-      assert.equal(access.allowed('team', 'team_word'), false);
-      assert.equal(access.allowed('team', 'team_change'), false);
+      // team-v58: team_word, team_change, *_send теперь в наборе чата участника.
+      assert.equal(access.allowed('team', 'team_word'), true);
+      assert.equal(access.allowed('team', 'team_change'), true);
+      assert.equal(access.allowed('team', 'team_members'), true);
+      assert.equal(access.allowed('codex', 'codex_send'), true);
+      assert.equal(access.allowed('antigravity', 'antigravity_send'), true);
     });
   }],
-  ['П3: deepseek (только чтение) не ставит поручения, не пишет и не воротит изменение связки; team_work открыт безусловно', () => {
+  ['П3: deepseek-чат ведёт team_change (все действия), пишет в работы, открывает диагностику (team-v58)', () => {
     withClient('deepseek', () => {
-      assert.throws(() => access.guard('team', 'team_change', { action: 'merge' }), /запрещено/);
-      // team-v48e Г4b: team_work-изменение гостю открыто безусловно (тумблер MOST_GUEST_STRICT удалён).
+      // team-v58: прочие действия team_change больше не закрываются гостю — чат ведёт полное управление (merge/start/deploy).
+      assert.doesNotThrow(() => access.guard('team', 'team_change', { action: 'merge' }), 'team_change merge открыт чату');
+      assert.doesNotThrow(() => access.guard('team', 'team_change', { action: 'deploy' }), 'team_change deploy открыт чату');
+      assert.doesNotThrow(() => access.guard('team', 'team_change', { action: 'start' }), 'team_change start открыт чату');
       assert.doesNotThrow(() => access.guard('team', 'team_work', { action: 'update' }), 'team_work открыт');
       assert.doesNotThrow(() => access.guard('team', 'team_work', { action: 'create' }));
-      // deepseek — семья только для чтения (roles.sends=false): *_send недоступны (нет в guestTools), а не из-за тумблера.
-      assert.throws(() => access.guard('codex', 'codex_send', { write: true }), /запрещено/);
-      assert.throws(() => access.guard('codex', 'codex_send', { role: 'совет' }), /запрещено/);
-      assert.throws(() => access.guard('antigravity', 'antigravity_send', { task: 't' }), /запрещено/);
       assert.doesNotThrow(() => access.guard('team', 'team_work', { action: 'list' }));
       assert.doesNotThrow(() => access.guard('team', 'team_work', { action: 'get' }));
       assert.doesNotThrow(() => access.guard('team', 'team_status', {}));
+      // team-v58: диагностика team_status (quota/usage) открыта чату участника.
+      assert.doesNotThrow(() => access.guard('team', 'team_status', { claude_quota: true }), 'диагностика quota открыта чату');
+      assert.doesNotThrow(() => access.guard('team', 'team_status', { claude_usage: true }), 'диагностика usage открыта чату');
     });
   }],
   ['П2б (04be41a §2.2/4e): Claude-исполнитель (claude-print) отменяет codex/deepseek/antigravity-потомков, свой сервер claude — нет', () => {
@@ -94,14 +99,14 @@ run([
       }
     });
   }],
-  ['П5: наборы codex и antigravity не изменились', () => {
+  ['П5: наборы codex и antigravity на team — полный набор дирижёра (team-v58); серверы семьи получают cancel/apply', () => {
     withClient('codex', () => {
-      assert.deepEqual(access.guestTools('team', 'codex'), ['team_status', 'team_rules', 'team_work', 'team_ask', 'team_ask_result', 'team_word']);
-      assert.deepEqual(access.guestTools('antigravity', 'codex'), ['antigravity_status', 'antigravity_send', 'antigravity_result', 'antigravity_apply']);
-      assert.deepEqual(access.guestTools('codex', 'codex'), ['codex_status', 'codex_send', 'codex_result', 'codex_cancel']);
+      assert.deepEqual(access.guestTools('team', 'codex'), FULL.team);
+      assert.deepEqual(access.guestTools('antigravity', 'codex'), FULL.antigravity);
+      assert.deepEqual(access.guestTools('codex', 'codex'), FULL.codex);
     });
     withClient('antigravity', () => {
-      assert.deepEqual(access.guestTools('team', 'antigravity'), ['team_status', 'team_rules', 'team_work', 'team_ask', 'team_ask_result', 'team_word']);
+      assert.deepEqual(access.guestTools('team', 'antigravity'), FULL.team);
     });
     withClient('claude', () => {
       assert.equal(access.guest(), false);

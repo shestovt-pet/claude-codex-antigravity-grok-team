@@ -380,14 +380,15 @@ test('review: подпоручение не засчитывается голо�
 test('Профили DeepSeek: MCP most-read/most-write/most-full, env сохраняет номер поручения', () => {
   const dir = path.join(f.RUN, 'dsh'), profiles = require('../common/dsh-profiles');
   profiles.generate({}, dir, { release: ROOT, root: f.root, node: process.execPath });
+  const connected = require('../common/members').servers.filter(n => n !== 'deepseek');
   for (const name of ['most-read', 'most-write', 'most-review', 'most-full']) {
     const patch = fs.readFileSync(path.join(dir, 'profiles', name, 'cordis.patch.yml'), 'utf8');
     if (name === 'most-review') assert.doesNotMatch(patch, /dsh-mcp-client|mcp-most-/);
     else {
-      for (const who of ['team', 'codex', 'antigravity']) assert(patch.includes('id: mcp-most-' + who), who);
+      for (const who of connected) assert(patch.includes('id: mcp-most-' + who), who);
       assert(!patch.includes('id: mcp-most-deepseek'));
-      assert.equal((patch.match(/MOST_CLIENT: deepseek/g) || []).length, 3);
-      assert.equal((patch.match(/MOST_JOB_ID: !!js process.env.MOST_JOB_ID \|\| ""/g) || []).length, 3);
+      assert.equal((patch.match(/MOST_CLIENT: deepseek/g) || []).length, connected.length);
+      assert.equal((patch.match(/MOST_JOB_ID: !!js process.env.MOST_JOB_ID \|\| ""/g) || []).length, connected.length);
       assert(patch.includes(JSON.stringify(process.execPath))); assert(patch.includes(JSON.stringify(f.root)));
     }
   }
@@ -569,8 +570,8 @@ test('Р8: guestTools для всех шести направлений и MOST_
     for (const suffix of ['send', 'result', 'status']) assert(access.guestTools(server, client).includes(server + '_' + suffix), client + ' → ' + server + '_' + suffix);
   const configs = require('../common/client-configs');
   const config = configs.block(configs.toml('', ROOT, f.root, path.join(f.root, 'state'), process.execPath)).parsed.root;
-  assert.deepEqual(Object.keys(config.mcp_servers).sort(), [...members.servers].sort());
-  for (const server of members.servers) {
+  assert.deepEqual(Object.keys(config.mcp_servers).sort(), [...members.installedServers].sort());
+  for (const server of members.installedServers) {
     assert.deepEqual(config.mcp_servers[server].env_vars, ['MOST_JOB_ID'], server);
     assert.equal(config.mcp_servers[server].env.MOST_CLIENT, 'codex');
   }

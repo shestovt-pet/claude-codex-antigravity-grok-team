@@ -16,9 +16,10 @@ function probeRelease() {
 }
 function releaseFiles(release) {
   const root = path.resolve(__dirname, '..');
-  for (const name of members.servers) f.write(path.join(release, 'servers', name, 'index.js'),
+  const roster = require('../common/members-v46').forward(members.snapshot());
+  for (const name of members.serversForInstall(roster)) f.write(path.join(release, 'servers', name, 'index.js'),
     'const app = require(' + JSON.stringify(path.join(root, 'servers', name, 'index.js')) + ');' +
-    (name === 'team' ? 'app.server.connect(new (require(' + JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/stdio.js')) + ').StdioServerTransport)());' : ''));
+    (name === 'team' ? 'app.server.connect(new (require(' + JSON.stringify(require.resolve('@modelcontextprotocol/sdk/server/stdio.js')) + ').StdioServerTransport)());' : name === 'kimi' ? 'app.start();' : ''));
   f.write(path.join(release, 'common/access.js'), 'module.exports = require(' + JSON.stringify(path.join(root, 'common/access.js')) + ');');
 }
 function releaseCli(root) { return path.join(v43.release(root, 'c'.repeat(40)), 'tools', 'deploy.js'); }
@@ -77,7 +78,7 @@ f.run([
           return require('../common/probe').probe(file, env);
         },
       }, async () => {});
-      assert.equal(calls.filter(([c, guest]) => c === 'zzz' && guest === 'full').length, 3);
+      assert.equal(calls.filter(([c, guest]) => c === 'zzz' && guest === 'full').length, members.installedServers.length);
       assert.equal(JSON.parse(fs.readFileSync(path.join(release, 'probe-ok.json'))).commit, 'a'.repeat(40));
     } finally { change(n => n.members.find(m => m.id === 'zzz').state = 'removed'); }
   }],
@@ -135,11 +136,11 @@ f.run([
         '--state-dir', path.join(f.RUN, 'cli-other-locks')], { encoding: 'utf8', windowsHide: true, timeout: 20000,
         env: { ...process.env, MOST_STATE_DIR: path.join(root, 'state') } });
     assert.notEqual(cli.status, 0, cli.stdout + cli.stderr);
-    assert.match(cli.stderr, /Откат ниже кандидата А запрещён.*phase A, rev 0/);
+    assert.match(cli.stderr, /Откат ниже кандидата А запрещён.*kimi-cli/);
     assert.deepEqual(JSON.parse(fs.readFileSync(file)), { marker: 'current' });
     for (const corrupt of [false, true]) {
       if (corrupt) fs.writeFileSync(s.file, '{');
-      await assert.rejects(() => deploy.rollback({ root, configs: [file], configOnly: true, stateDir: path.join(f.RUN, 'other-locks') }), /Откат ниже кандидата А запрещён.*phase A, rev 0/);
+      await assert.rejects(() => deploy.rollback({ root, configs: [file], configOnly: true, stateDir: path.join(f.RUN, 'other-locks') }), /Откат ниже кандидата А запрещён.*kimi-cli/);
       assert.deepEqual(JSON.parse(fs.readFileSync(file)), { marker: 'current' });
     }
     fs.writeFileSync(s.good, '{');
@@ -165,7 +166,7 @@ f.run([
           MOST_DSH_RULES: path.join(root, 'absent-dsh.md'), MOST_AGY_CLI_SETTINGS: path.join(root, 'absent-settings.json') },
       });
     assert.notEqual(output.status, 0, output.stdout + output.stderr);
-    assert.match(output.stderr, /Откат ниже кандидата А запрещён.*phase A, rev 0/);
+    assert.match(output.stderr, /Откат ниже кандидата А запрещён.*kimi-cli/);
     assert.equal(fs.readFileSync(file, 'utf8'), current);
     assert.equal(fs.readFileSync(file + '.prev', 'utf8'), previous);
     assert(!fs.existsSync(path.join(ambient, 'state/members.json')));
@@ -186,7 +187,7 @@ f.run([
     assert(helpers.includes('Работу проверяют две внешние голосующие семьи из team_status, кроме семей авторов'));
     assert(helpers.includes('Автор я: после разбора хватает «ПРИНЯТО» двух внешних голосующих семей из team_status; отклонённое замечание идёт пользователю особым мнением.'));
     const fallback = fs.readFileSync(path.resolve(__dirname, '../rules/fallback.md'), 'utf8');
-    assert(fallback.includes('проверяют две внешние голосующие семьи из team_status («2 из 3»), кроме семей авторов'));
+    assert(fallback.includes('проверяют две внешние голосующие семьи из team_status («две внешние семьи кроме авторов»), кроме семей авторов'));
   }],
   ['Р5: частичный сбой DSH и повтор возвращают одну цель, .prev неизменна', async () => {
     const root = path.join(f.RUN, 'rollback-dsh-partial'), file = path.join(root, 'cordis.patch.yml');
@@ -228,7 +229,7 @@ f.run([
     const root = path.join(f.RUN, 'rollback-allowed'), state = path.join(root, 'state');
     require('../common/members-store').create(state).read();
     const release = path.join(root, 'live', 'a'.repeat(40));
-    for (const name of members.servers) f.write(path.join(release, 'servers', name, 'index.js'), '');
+    for (const name of members.installedServers) f.write(path.join(release, 'servers', name, 'index.js'), '');
     for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js'])
       f.write(path.join(release, 'common', name), fs.readFileSync(path.resolve(__dirname, '../common', name)));
     const file = path.join(root, 'claude.json'), target = path.join(release, 'servers/team/index.js');

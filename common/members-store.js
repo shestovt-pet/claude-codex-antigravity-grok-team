@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const ROLES = ['conductor', 'fallback_conductor', 'voter', 'writer', 'literary', 'receives', 'sends'];
-const ADAPTERS = ['codex-cli', 'agy-cli', 'dsh-headless', 'claude-print'];
+const ADAPTERS = ['codex-cli', 'agy-cli', 'dsh-headless', 'claude-print', 'kimi-cli'];
 const MCP_MASK = /^[a-zA-Z0-9_-]+\/(?:[a-zA-Z0-9_.-]+|\*)$/;
 const fail = message => Object.assign(Error('Реестр участников: ' + message), { code: 'MEMBERS_UNAVAILABLE' });
 function validate(value) {
@@ -140,7 +140,7 @@ function create(state = require('./paths').stateDir) {
     const fd = fs.openSync(log, 'a');
     try { fs.writeFileSync(fd, JSON.stringify(entry) + '\n'); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   }
-  function existing(publish = false) {
+  function existing(publish = false, initialRoster) {
     // Первый запуск нескольких серверов может совпасть с публикацией начального снимка.
     for (let i = 0; i < 100 && fs.existsSync(lock) && !fs.existsSync(file) && !fs.existsSync(good); i++) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     let current, verified;
@@ -189,7 +189,7 @@ function create(state = require('./paths').stateDir) {
       value = entries[entries.length - 1].after;
       replayed = true;
     } else if (!value) {
-      value = validate(require('./members-default')());
+      value = validate(initialRoster ? structuredClone(initialRoster) : require('./members-default')());
       if (publish) append({ action: 'init', rev: value.rev, at: new Date().toISOString(), who: 'system', reason: 'Первая инициализация', quote: null, before: null, after: value });
       replayed = true;
     } else if (entries[entries.length - 1].rev > value.rev) {
@@ -205,7 +205,14 @@ function create(state = require('./paths').stateDir) {
     if (logStateValue.torn) notes.push('журнал изменений: недописанная последняя строка отброшена');
     return { ...value, warning: notes.length ? notes.join('. ') : null };
   }
-  function read({ initialize = true } = {}) {
+  function read({ initialize = true, initialRoster } = {}) {
+    // Установщик заранее журналирует точный init: после сбоя он воспроизводится без новых дат.
+    // Для существующей цепочки это значение никогда не заменяет проверенный снимок.
+    if (initialRoster) {
+      initialRoster = { rev: initialRoster.rev, phase: initialRoster.phase, members: initialRoster.members };
+      validate(initialRoster);
+      if (initialRoster.rev !== 0) throw fail('начальный снимок должен иметь rev 0');
+    }
     // Замок, оставленный погибшим первым писателем, не должен запирать чистый реестр.
     if (fs.existsSync(lock) && stale(lock) && ![file, good, log].some(f => fs.existsSync(f))) drop(lock);
     if (![file, good, log, lock].some(f => fs.existsSync(f))) {
@@ -213,15 +220,15 @@ function create(state = require('./paths').stateDir) {
       // первый сервер/писатель фиксирует тот же снимок под замком.
       if (!initialize) return { ...validate(require('./members-default')()), warning: null };
       return locked(() => {
-      if ([file, good, log].some(f => fs.existsSync(f))) return existing(true);
-      const value = validate(require('./members-default')());
+      if ([file, good, log].some(f => fs.existsSync(f))) return existing(true, initialRoster);
+      const value = validate(initialRoster ? structuredClone(initialRoster) : require('./members-default')());
       append({ action: 'init', rev: value.rev, at: new Date().toISOString(), who: 'system', reason: 'Первая инициализация', quote: null, before: null, after: value });
       atomic(good, value); atomic(file, value);
       return { ...value, warning: null };
       });
     }
     const result = existing();
-    return initialize && result.warning?.startsWith('Восстановлена редакция') ? locked(() => existing(true)) : result;
+    return initialize && result.warning?.startsWith('Восстановлена редакция') ? locked(() => existing(true, initialRoster)) : result;
   }
   function update(expectedRev, mutate, meta, options = {}) {
     if (!meta || !['action', 'who', 'reason'].every(k => typeof meta[k] === 'string' && meta[k].trim()) ||

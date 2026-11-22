@@ -148,8 +148,22 @@ async function resolveId(id) {
 function reply(j, body, next = 'Проверьте результат.', error = false) {
   return { content: [{ type: 'text', text: format('Codex', j, body, next) }], ...(error ? { isError: true } : {}) };
 }
+// team-v56 И8 (ревью Gemini-А 3): повтор request_id без карточки на диске не рапортует молча 'queued'. Различаем
+// recovery_required (с recoveryId), идущую постановку (владелец жив) и исчезнувшую постановку (владелец мёртв — явная ошибка).
+async function duplicateReply(r, requestId) {
+  const rec = r.record || {};
+  if (rec.phase === 'recovery_required')
+    return reply({ id: r.jobId, status: 'failed', requestId }, 'Повтор request_id ' + requestId + ': прежняя постановка требует восстановления (recovery_required' + (rec.recoveryId ? ' ' + rec.recoveryId : '') + '); карточка не создана.', 'Разберите незавершённую постановку.', true);
+  if (rec.committed)
+    return reply({ id: r.jobId, status: 'delivery_unclear', requestId }, 'Повтор request_id ' + requestId + ': поручение ' + r.jobId + ' постановлено, но карточка недоступна; доставка ответа неясна.', 'Запросите результат позже.', true);
+  let owner = 'unknown'; try { owner = await locks.ownerState(rec.owner); } catch {}
+  if (owner === 'alive' || owner === 'self')
+    return reply({ id: r.jobId, status: 'queued', requestId }, 'Повтор request_id ' + requestId + ': постановка ещё идёт (владелец активен); повторите запрос позже.');
+  return reply({ id: r.jobId, status: 'failed', requestId }, 'Повтор request_id ' + requestId + ': прежняя постановка оборвалась до публикации (владелец ' + owner + '); карточки нет. Повторите с новым request_id.', 'Повторите запрос.', true);
+}
 
 function view(j, offset = 0) {
+  const ml = j.modelChoiceLine ? j.modelChoiceLine + '\n' : ''; // team-v59 ч4: строка выбора модели — в карточке и ответе
   let body = j.error || '';
   if (j.status === 'queued') body = access.queued + (j.fallbackHold ? '. Ждёт: ' + j.fallbackHold : '');
   if (j.archived) {
@@ -162,13 +176,13 @@ function view(j, offset = 0) {
     const s = fs.readFileSync(j.resultFile, 'utf8');
     body += '\n' + s.slice(offset, offset + 24000);
     if (offset + 24000 < s.length)
-      return reply(j, body, 'Вызовите codex_result: id ' + j.id + ', from_char ' + (offset + 24000) + '.');
+      return reply(j, ml + body, 'Вызовите codex_result: id ' + j.id + ', from_char ' + (offset + 24000) + '.');
   }
   if (j.status === 'waiting_quota')
     body += '\nСледующая проба: ' + j.nextAttemptAt + '; попыток: ' + (j.quotaAttempts || 0) + '.';
   return reply(
     j,
-    body,
+    ml + body,
     j.status === 'needs_decision'
       ? 'Проверьте изменения и решите, продолжать ли через continue_id.'
       : j.status === 'running'
@@ -264,7 +278,7 @@ async function execute(job, folderLock) {
           c.threadId = e.thread_id;
         }).catch(logFailure);
       }
-      if (e.type === 'turn.completed') completed = true;
+      if (e.type === 'turn.completed') { completed = true; const t = require('../../common/usage').codexTokens(e); if (t) job.tokens = { ...(job.tokens || {}), ...t }; }
       const f = classifyCodex(e);
       if (f.kind !== 'none') failure = f;
     } catch {}
@@ -302,6 +316,17 @@ async function execute(job, folderLock) {
         c.provenance = provenance.forJob(job, 'codex');
         c.finishedAt = new Date().toISOString();
         c.exitCode = code;
+        // team-v63 (п.6): объём ответа, секунды и токены (если CLI сообщил usage).
+        try { const rt = c.resultFile && fs.existsSync(c.resultFile) ? fs.readFileSync(c.resultFile, 'utf8') : undefined; require('../../common/usage').finalize(c, { resultText: rt }); } catch {}
+        if (job.tokens) c.tokens = job.tokens;
+        if (Number.isFinite(c.chars_out)) c.sessionCharsOut = (c.sessionCharsOut || 0) + c.chars_out;
+        // team-v59 (Codex №1): поручение снято словом владельца на ходу (close/stop_confirm форсом) — поздний результат
+        // исполнителя карточку НЕ воскрешает: статус остаётся снятым, done/needs_decision не выставляется, голосом результат
+        // не считается, замок записи не возвращается. Процесс уже убит опросом (killByWord). Фиксируем лишь факт завершения.
+        if (require('../../common/live-jobs').closedByOwnerWord(c)) {
+          c.lateResult = { at: c.finishedAt, exitCode: code, completed: !!completed }; c.voteEligible = false;
+          return;
+        }
         const deadlines = require('../../common/chain-deadline');
         if (c.status === 'running' && (deadlines.parentTerminal(c) || deadlines.deadlinePassed(c))) {
           c.status = 'cancelling'; c.stopReason = deadlines.parentTerminal(c) ? 'parent' : 'timeout';
@@ -466,6 +491,7 @@ async function execute(job, folderLock) {
       guarded(function pollJob() {
         const j = load(job.id);
         if (require('../../common/chain-deadline').parentTerminal(j)) stop(job.id, 'parent').catch(logFailure);
+        else if (require('../../common/live-jobs').closedByOwnerWord(j)) killByWord(job.id); // снято словом владельца — штатный kill дерева
         else if (j.status === 'cancelling') stop(job.id, j.stopReason).catch(logFailure);
         else if (require('../../common/chain-deadline').deadlinePassed(j)) stop(job.id, 'timeout').catch(logFailure);
         else if (job.threadId && j.threadId !== job.threadId)
@@ -486,6 +512,7 @@ async function execute(job, folderLock) {
         'Не обходи ограничения. Отвечай по-русски.',
         job.task,
         job.textFile ? 'Материал в файле: ' + job.textFile : '',
+        ...require('../../common/attachments').promptTail(job),
       ].join('\n'),
     );
   } catch (e) {
@@ -543,18 +570,63 @@ async function stop(id, reason = 'cancel') {
   ).unref();
 }
 
+// team-v59 (Codex №1): карточка уже снята словом владельца (статус терминален) — процесс останавливаем, но статус не трогаем
+// (его выставило слово). Штатный kill дерева тот же, что в stop(); finish затем сохранит снятое состояние (closedByOwnerWord).
+function killByWord(id) {
+  const e = active.get(id);
+  if (!e || e.stopping) return;
+  e.stopping = true;
+  try {
+    if (process.platform === 'win32')
+      execFileSync('taskkill.exe', ['/PID', String(e.child.pid), '/T', '/F'], { windowsHide: true, timeout: 10000, stdio: 'pipe' });
+    else process.kill(-e.child.pid, 'SIGKILL');
+  } catch {
+    try { e.child.kill('SIGKILL'); } catch {}
+  }
+}
+
+function changeReview(a) {
+  if (a.change === undefined) return undefined;
+  if (a.role !== 'проверка' || a.write || a.continue_id)
+    throw Error('Параметр change допустим для нового поручения Codex с ролью «проверка» и без записи.');
+  const { inside, name } = require('../../common/team-git');
+  const id = name(a.change);
+  const file = inside(stateDir, 'changes', id + '.json');
+  let card;
+  try { card = JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (e) { if (e.code === 'ENOENT') throw Error('Изменение связки не найдено: ' + id); throw e; }
+  if (card?.name !== id || !card.base || !card.candidate || ['слито', 'закрыто без слияния'].includes(card.status))
+    throw Error('Нужна открытая карточка изменения связки: ' + id);
+  return { name: id, base: card.base, candidate: card.candidate };
+}
+
 async function send(a) {
   access.guard('codex', 'codex_send', a);
   const refusal = fullAccessRefusal(a);
   if (refusal) throw Error(refusal);
+  a.changeReview = changeReview(a);
   const support = require('../../common/brief-support');
   const extra = support.text(support.support(a.folder, a.opora));
   if (extra) a.text = (a.text || '') + extra;
   if (!currentBinary() && !access.guest()) throw Error('Исполнитель Codex не найден. Укажите CODEX_PATH.');
   if (closing) throw Error('Сервер останавливается.');
-  if (!path.isAbsolute(a.folder) || !fs.statSync(a.folder).isDirectory())
+  // team-v63 (п.5): не запускать CLI при действующей отметке «лимит исчерпан» (меньше 10 минут, без позднего успеха);
+  // force — пробовать всегда. Позже окно могло закончиться — пропускаем и пробуем по-настоящему.
+  // team-v63 (п.19): продолжение (continue_id) при СВЕЖЕЙ отметке тоже упирается в быстрый отказ (кроме force) — иначе
+  // единственный участник сценария под лимитом всё равно запускался бы на продолжении. Проверка общая для нового и продолжения.
+  if (a.force !== true && !access.guest()) {
+    const qm = require('../../common/quota-mark').blocked(list());
+    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('Codex', qm.at), 'Дождитесь сброса или передайте force: true.');
+  }
+  // team-v63 (п.1): вложения читаются мостом сейчас (отказ на нечитаемом файле — до постановки).
+  // team-v63 (п.16): гостю-исполнителю без полного доступа вложения ограничены его папкой поручения; владельцу/доказанному чату — без пределов.
+  const _att = require('../../common/attachments');
+  const attachData = _att.read(a.files, { authorize: _att.guestAuthorizer({ guest: access.guest() && !access.chatSession(), folder: a.folder, fullAccess: a.full_access === true }) });
+  // team-v59 (часть 3 п.3в): роль «совет»/«текст» без записи и «проверка» text — папка необязательна (служебная пустая).
+  require('../../common/scratch-folder').ensure(a);
+  if (!path.isAbsolute(a.folder || '') || !fs.statSync(a.folder).isDirectory())
     throw Error('Нужна абсолютная существующая папка.');
-  if (a.work && !a.stage) throw Error('Для работы укажите этап.');
+  if (a.work && !a.stage && a.role !== 'совет') throw Error('Для работы укажите этап.'); // team-v59 ч3: совет — этап не обязателен (незарегистрированная работа примется ярлыком)
   // team-v46 п.5а: общее правило папок для любой записи (дирижёр, гость, подпоручение).
   if (a.write) {
     const fref = writeFolder.refusal(a.folder, { client: access.client(), guest: access.guest(), fullAccess: a.full_access === true, owner: a.owner });
@@ -564,8 +636,28 @@ async function send(a) {
     id = randomUUID();
   let prior = null,
     priorLock = null,
-    folderLock = null;
+    folderLock = null,
+    admId = null,
+    requestId = null,
+    published = false;
   try {
+    // team-v56 Б0 (этап 2): устойчивая admission ВСЕГДА до захвата замка/публикации. request_id необязателен — при
+    // отсутствии сервер выдаёт новый и показывает его в ответе; повтор того же ID возвращает тот же jobId, иные параметры
+    // того же ключа — REQUEST_ID_CONFLICT без карточки, замка и следов на диске.
+    {
+      const adm = require('../../common/job-admission');
+      const txt = a.text === undefined ? undefined : require('crypto').createHash('sha256').update(a.text).digest('hex');
+      const values = [['folder', require('../../common/scratch-folder').folderValue(a, folder)], ['task', a.task], ['text', txt], ['role', a.role], ['write', a.write === true],
+        ['full_access', a.full_access === true], ['model', a.model], ['effort', a.effort], ['level', a.level], ['files', attachData?.hash], ['continue_id', a.continue_id],
+        ['work', a.work], ['stage', a.stage], ['stageId', a.stageId], ['stageTitle', a.stageTitle], ['gateOrder', a.gateOrder],
+        ['scopeTask', a.scopeTask], ['replaces', a.replaces], ['replacementEvidence', a.replacementEvidence], ['owner', a.owner],
+        ['parentJob', require('../../common/job-chain').fields(a).parentJob], ['opora', a.opora]];
+      if (a.changeReview) values.push(['change', a.changeReview]);
+      const r = await adm.begin({ adapter: 'codex-cli', access, requestId: a.request_id, values, newJobId: id });
+      requestId = r.requestId;
+      if (r.duplicate) { require('../../common/scratch-folder').discard(a); try { return view(load(r.jobId)); } catch {} return await duplicateReply(r, requestId); }
+      admId = r.admissionId;
+    }
     if (a.continue_id) {
       const full = await resolveId(a.continue_id);
       priorLock = await locks.tryLock('codex_queue', full, { jobId: id });
@@ -584,9 +676,9 @@ async function send(a) {
         (prior.fullAccessApplied === true) !== (a.full_access === true))
         throw Error('Сохраните папку, режим записи и доступ предыдущего поручения.');
     }
+    // team-v56 Б0 п.1: все проверки без побочных эффектов, медленное чтение (обход карточек с normalized), модель,
+    // stage/chain/срок — ДО захвата write-lock. В интервале acquire → save не остаётся долгих/ошибкоопасных операций.
     if (a.write) {
-      folderLock = await writeLock.acquire(folder, { jobId: id });
-      if (!folderLock.ok) throw Error(folderLock.needsDecision ? 'Нужно решение: остановка прежнего исполнителя не подтверждена; замок записи сохранён.' : 'В этой папке (или вложенной) уже идёт поручение с записью.');
       for (const old of list()) {
         if (old.write && old.folder && fs.existsSync(old.folder) && canon(old.folder) === canon(folder)) {
           const current = await normalized(old.id);
@@ -597,25 +689,38 @@ async function send(a) {
         }
       }
     }
-    a.model ??= prior?.model; a.effort ??= prior?.effort;
+    const mc = require('../../common/model-choice');
+    if (!mc.levelOf(a)) { a.model ??= prior?.model; a.effort ??= prior?.effort; }
+    // team-v59 ч4: если ни модель, ни уровень не названы (и не унаследованы при продолжении) — их выбирает мост по классу
+    // задачи (common/model-choice). Названное вызывающим не подменяется (слово вызывающего и владельца сильнее таблицы).
     if (a.model !== undefined && !/^[A-Za-z0-9._:-]+$/.test(a.model)) throw Error('Недопустимая модель Codex.');
     if (a.effort !== undefined && !['low', 'medium', 'high', 'xhigh'].includes(a.effort)) throw Error('Недопустимый уровень Codex.');
     if (!access.guest() && restartServer) restartHold.assertAdmitted(stateDir, restartServer, { early: true });
     await require('../../common/stage-gate').prepareJob(a, 'codex');
+    const modelChoice = mc.choose('codex', a);
+    if (!modelChoice.named) { a.model = modelChoice.model; a.effort = modelChoice.effort; }
+    const modelChoiceLine = mc.line('codex', modelChoice, modelChoice.named, a.model, a.effort);
     const chainFields = require('../../common/job-chain').fields(a);
     const dl = require('../../common/chain-deadline').applyDeadline(chainFields, access.client(), 'codex');
     if (dl.error) throw Error(dl.error);
+    // Захват замка — последний шаг перед публикацией: дальше только построение карточки, запись входа и save/commit.
+    if (a.write) {
+      folderLock = await writeLock.acquire(folder, { jobId: id });
+      if (!folderLock.ok) throw Error(folderLock.needsDecision ? 'Нужно решение: остановка прежнего исполнителя не подтверждена; замок записи сохранён.' : 'В этой папке (или вложенной) уже идёт поручение с записью.');
+    }
     const job = {
       id,
       folder,
       write: a.write,
       fullAccess: a.full_access === true,
-      model: a.model, effort: a.effort,
+      model: a.model, effort: a.effort, modelChoiceLine,
+      changeReview: a.changeReview,
       requestedSettings: { model: a.model || 'unknown', effort: a.effort || 'unknown' },
       confirmedSettings: { model: 'unknown', effort: 'unknown' },
       task: a.task,
       stage: a.stage, stageTitle: a.stageTitle, stageId: a.stageId, gateOrder: a.gateOrder, scopeTask: a.scopeTask, role: a.role, replaces: a.replaces, replacementEvidence: a.replacementEvidence,
       work: a.work,
+      workLabel: a.workLabel, workUnbound: a.workUnbound, // team-v62: имя работы-ярлыка (нелатинская/незарегистрированная) сохраняется для сводки и *_result
       from: require('../../common/job-identity').memberId(access.client()) || access.client(),
       ...chainFields,
       ...(access.guest() && access.client() === 'codex' && !chainFields.parentJob ? { fromChat: 'codex' } : {}),
@@ -637,9 +742,29 @@ async function send(a) {
       job.textFile = path.join(dir, id + '.input.txt');
       fs.writeFileSync(job.textFile, a.text);
     }
+    // team-v63 (п.1): вложения — отдельным файлом (карточку не раздуваем); инлайн в stdin делает execute.
+    const attachChars = require('../../common/attachments').attach(job, attachData, path.join(dir, id + '.attach.txt')).chars;
+    // team-v63 (п.6): объём входа в знаках (задача + материал + вложения).
+    job.chars_in = require('../../common/usage').charsIn(a, attachChars);
+    // team-v63 (п.2): продолжение — штатный режим; номер хода в сеансе и накопленный объём входа/выхода в знаках.
+    if (prior) {
+      job.sessionTurn = (prior.sessionTurn || 1) + 1;
+      job.sessionCharsIn = (prior.sessionCharsIn || prior.chars_in || 0) + job.chars_in;
+      job.sessionCharsOut = prior.sessionCharsOut || prior.chars_out || 0;
+    } else { job.sessionTurn = 1; job.sessionCharsIn = job.chars_in; job.sessionCharsOut = 0; }
+    job.requestId = requestId;
     job.provenance = provenance.forJob(job, 'codex');
+    // team-v56 Б0 п.2/п.4: публикация карточки и commit admission — одной короткой секцией, без долгих операций между ними;
+    // published отмечает состоявшуюся публикацию (восстановимая пара save/commit: по карточке состояние однозначно).
     if (access.guest()) save(job);
     else await restartHold.locked(stateDir, () => { admitExecution(); save(job); });
+    published = true;
+    // team-v56 И7 (ревью Codex 5): если постановка отозвана (release_orphan) под замком постановки — commit вернёт null;
+    // карточку не запускаем. Переводим в cancelled и прекращаем (замок снимет защищённый release в finally).
+    if (admId && !require('../../common/job-admission').commit(stateDir, admId, { instance: folderLock?.owner?.instance })) {
+      try { await mutate(job.id, c => { c.status = 'cancelled'; c.error = 'Постановка отозвана (release_orphan) до запуска.'; }); } catch {}
+      throw Error('Постановка отозвана (release_orphan); запуск отменён.');
+    }
     if (prior?.status === 'waiting_quota')
       await mutate(prior.id, (c) => {
         if (c.status === 'waiting_quota') {
@@ -653,8 +778,12 @@ async function send(a) {
     await execute(job, lock);
     return view(load(job.id));
   } finally {
+    // team-v56 Б0 п.3: до публикации — узкий откат admission и точного замка по его instance (без обхода чужих хранилищ);
+    // при неудаче снятия замка releaseUnpublished сам ставит recovery_required с диагностическим ID. После публикации —
+    // no-op; опубликованный замок (гость/queued) снимает обычный защищённый release.
+    if (admId) try { require('../../common/job-admission').releaseUnpublished(stateDir, admId, { lock: folderLock?.ok ? { instance: folderLock.owner.instance, folder, jobId: id } : undefined, published }); } catch {}
     if (priorLock?.ok) await priorLock.release();
-    if (folderLock?.ok) await folderLock.release();
+    if (folderLock?.ok && published) await folderLock.release();
   }
 }
 
@@ -753,9 +882,13 @@ async function queue() {
 }
 const server = new McpServer({ name: 'codex', version: VERSION }, require('../../common/server-instructions').options('codex'));
 function register(name, title, description, inputSchema, fn) {
-  if (!access.allowed('codex', name)) return;
+  if (!access.offered('codex', name)) return;
   server.registerTool(name, { title, description, inputSchema: require('../../common/schema').compatible(inputSchema) }, async (a) => {
     try {
+      // team-v62 (взгляд участников): обработчику нужно перенесённое состояние — дождёмся конца первичной миграции (с
+      // пределом). initialize/tools/list сюда не попадают. По превышении — понятный текст с предложением повторить.
+      const hold = await require('../../common/state-migration').awaitPrimary();
+      if (hold) throw Error(hold);
       access.guard('codex', name, a);
       if (name === 'codex_send') {
         const refusal = fullAccessRefusal(a);
@@ -777,10 +910,13 @@ register(
   'Поручить Codex',
   'Начать отдельное поручение или явно продолжить сеанс.',
   {
-    folder: z.string().describe('Абсолютная папка проекта.'),
+    folder: z.string().optional().describe('Абсолютная папка проекта; для роли «совет»/«текст» без записи необязательна — мост берёт служебную папку.'),
     ...require('../../common/stage-schema').send,
     task: z.string().min(1).describe('Поручение.'),
     text: z.string().optional().describe('Материал для работы.'),
+    files: z.array(z.union([z.string(), z.object({ path: z.string(), lines: z.string().optional() })])).optional().describe('Вложения: абсолютные пути (строка или { path, lines }); мост читает и вкладывает их в поручение, файлы открывать не нужно.'),
+    level: z.enum(['fast', 'normal', 'strong']).optional().describe('Уровень модели: fast | normal | strong; не меняет роль и права. model/effort сильнее.'),
+    force: z.boolean().optional().describe('Пробовать даже при действующей отметке «лимит исчерпан».'),
     write: z.boolean().default(false).describe('Разрешить изменения по поручению.'),
     full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя; при write=true, роли текст или совет и абсолютной существующей папке.'),
     model: z.string().regex(/^[A-Za-z0-9._:-]+$/).optional().describe('Запрошенная модель; продолжение наследует прежнюю, если не задана.'),
@@ -789,6 +925,8 @@ register(
     stage: z.string().optional().describe('Этап.'),
     owner: z.string().optional().describe('Метка сеанса владельца работы.'),
     work: z.string().optional().describe('Работа.'),
+    change: z.string().optional().describe('Имя открытого изменения из team_change для нового поручения с ролью «проверка», без записи.'),
+    request_id: z.string().optional().describe('Идентификатор запроса для идемпотентного повтора (team-v56 Б0); повтор того же request_id возвращает тот же номер.'),
   },
   send,
 );
@@ -808,6 +946,12 @@ register(
       await sleep(100);
       j = await normalized(id);
     }
+    // team-v56 Л2 (ревью круг 5, М1; круг 6): если готовый результат этого поручения-потомка выдаётся его родителю (например
+    // Kimi-отправителю, у которого parentJob потомка == его поручение), фиксируем в карточке потомка факт выдачи
+    // (кому/когда/sha) — доказуемый след получения результата для приёмки Kimi. Отметку строим по тому же снимку j и
+    // from_char, что уходят в view: иначе гонка (снимок running, карточка уже done) засчитала бы невыданный результат.
+    // Служебный след; не ломает выдачу.
+    await require('../../common/result-receipt').record({ mutate, id, snapshot: j, fromChar: from_char });
     return view(j, from_char);
   },
 );
@@ -869,7 +1013,6 @@ async function shutdown() {
 }
 
 (async () => {
-  await require('../../common/state-migration').start(require('../../common/paths'));
   restartServer = access.guest() ? null : restartHold.serverAsync(stateDir, 'codex');
   process.stdin.on('close', guarded(shutdown));
   const owner = await locks.startOwner({ version: VERSION, file: __filename });
@@ -878,12 +1021,21 @@ async function shutdown() {
   process.on('SIGINT', guarded(shutdown));
   process.on('SIGTERM', guarded(shutdown));
   server.server.onclose = guarded(shutdown);
+  try { require('../../common/state-migration').arm(); } catch {} // team-v63 (п.18): взвести барьер миграции до connect
   await server.connect(require('../../common/public-transport').publicTransport(new StdioServerTransport()));
   access.ready('codex');
-  if (!access.guest() && process.env.MOST_PROBE_ONLY !== '1') {
-    await queue().catch(logFailure);
-    setInterval(guarded(queue), Math.min(30000, Number(process.env.MOST_QUEUE_TICK_MS || 1000))).unref();
-  }
+  try { require('../../common/chat-origin').primeAsync(); } catch {} // team-v59 (task2): происхождение чата — в фоне после connect
+  // team-v62 (task4): миграция хранилища и первая сверка очереди — в ФОНЕ после ответа на initialize/tools/list.
+  // Прежде общий замок миграции (один на все серверы) держался ДО server.connect: шесть серверов моста подключались
+  // по очереди (стагер в секунды-десятки секунд), поздние не попадали в первый проход привязки приложения и их
+  // инструменты появлялись минутами позже. Очередь по-прежнему стартует только после миграции (барьер сохранён).
+  (async () => {
+    await require('../../common/state-migration').start(require('../../common/paths'));
+    if (!access.guest() && process.env.MOST_PROBE_ONLY !== '1') {
+      await queue().catch(logFailure);
+      setInterval(guarded(queue), Math.min(30000, Number(process.env.MOST_QUEUE_TICK_MS || 1000))).unref();
+    }
+  })().catch(logFailure);
 })().catch((e) => {
   logFailure(e);
   process.exit(1);

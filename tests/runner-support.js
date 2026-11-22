@@ -2,8 +2,13 @@
 const path = require('path'), fs = require('fs'), cp = require('child_process');
 function environment(parent, temp) {
   const env = Object.fromEntries(Object.entries(parent).filter(([k]) => !/^MOST_/i.test(k)));
-  Object.assign(env, { MOST_NOTIFY: 'off', MOST_AFTER_DEPLOY: 'off', MOST_TEST_KEEP: '1',
-    MOST_CODEX_JOBS_DIR: '', MOST_CODEX_ARCHIVE_DIR: '', TEMP: temp, TMP: temp, TMPDIR: temp,
+  // team-v58 Г: наборы запускают серверы моста из тестового процесса (клон, а не приложение-клиента), поэтому доказанной
+  // цепочки предков у них нет. Подстановка происхождения для ВСЕХ тестовых процессов и дочерних серверов — «доказанный чат»
+  // по умолчанию; common/chat-origin honoursEnv() игнорирует её, если выпуск запущен из установленного E:\most\live, поэтому
+  // боевой сервер её никогда не учитывает. Точечные проверки четырёх условий ставят вход через внутренние зависимости
+  // (chat-origin.setTest/withOrigin), а не через эту переменную.
+  Object.assign(env, { MOST_NOTIFY: 'off', MOST_AFTER_DEPLOY: 'off', MOST_TEST_KEEP: '1', MOST_TEST_CHAT_ORIGIN: 'proven',
+    MOST_KIMI_WORK_ROOT: path.join(temp, 'kimi-work'), MOST_KIMI_TEMP_ROOT: path.join(temp, 'kimi-temp'), MOST_CODEX_JOBS_DIR: '', MOST_CODEX_ARCHIVE_DIR: '', TEMP: temp, TMP: temp, TMPDIR: temp,
     // team-v46 п.5а: папки записи тестов — вне любого репозитория связки (системный TEMP до подмены).
     MOST_TEST_OUTSIDE: path.join(parent.TEMP || parent.TMP || require('os').tmpdir(), 'most-tests-outside') });
   for (const [name, file] of Object.entries({ AGY_CLI_SETTINGS: 'settings.json', CODEX_RULES: 'codex.md', AGY_RULES: 'agy.md',
@@ -32,8 +37,12 @@ async function serverReady(stateDir, pid, ms = 120000) {
   }
   throw Error('Сервер моста не подготовился за ' + ms + ' мс: нет маркера ' + file);
 }
-function logPath(dir, name) {
-  if (!name || name === '.' || name === '..' || /[\\/:]/.test(name) || path.basename(name) !== name) throw Error('MOST_TEST_OUTPUT: допустимо только имя файла внутри tests.');
+function logPath(dir, name, outputDir) {
+  if (!name || name === '.' || name === '..' || /[\\/:]/.test(name) || path.basename(name) !== name) throw Error('MOST_TEST_OUTPUT: допустимо только имя файла.');
+  if (outputDir !== undefined) {
+    if (!path.isAbsolute(outputDir) || !fs.statSync(outputDir).isDirectory()) throw Error('MOST_TEST_OUTPUT_DIR: нужна абсолютная существующая папка.');
+    dir = outputDir;
+  }
   return path.join(dir, name);
 }
 function mainBranch(root, run = cp.spawnSync) {

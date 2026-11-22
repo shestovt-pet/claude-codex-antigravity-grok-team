@@ -189,8 +189,11 @@ test('Р5: отключение уборки доходит до карточк�
 test('Р5: строка уборки в сводке', () => {
   const now = Date.parse('2026-09-28T01:00:00Z');
   assert.equal(ops.cleanupLine({ state: 'отключена' }), 'уборка: отключена');
-  assert.equal(ops.cleanupLine({ state: 'идёт', started: '2026-09-28T00:50:00Z' }, now), 'уборка: идёт');
+  assert.equal(ops.cleanupLine({ state: 'идёт', started: '2026-09-28T00:50:00Z' }, now), 'уборка: идёт с 2026-09-28T00:50:00Z');
   assert.equal(ops.cleanupLine({ state: 'идёт', started: '2026-09-28T00:10:00Z' }, now), 'уборка: прервана');
+  // team-v58: PID уборки мёртв — «идёт» распознаётся как прервана даже в пределах времени (снимок вроде 38b0578e).
+  assert.equal(ops.cleanupLine({ state: 'идёт', started: '2026-09-28T00:50:00Z', pid: 2147483000 }, now, { alive: () => false }), 'уборка: прервана');
+  assert.equal(ops.cleanupLine({ state: 'прервана', reason: 'предел времени' }), 'уборка: прервана: предел времени');
   assert.equal(ops.cleanupLine({ state: 'ошибка', reason: 'x' }), 'уборка: ошибка: x');
   assert.equal(ops.cleanupLine({ state: 'готово', removed: 0, failed: 0, blocked: [] }), 'уборка: удалено 0, не удалено 0');
   assert.equal(ops.cleanupLine({ state: 'готово', removed: 3, failed: 1, blocked: ['процессы не прочитаны'] }), 'уборка: удалено 3, не удалено 1 · релизы не удалялись: процессы не прочитаны');
@@ -203,7 +206,7 @@ test('Р5: deploy без перезапуска вызывает уборку т
   let after = 0; team.afterDeploy = async () => { after++; return 'уборка: удалено 1, не удалено 0'; };
   try {
     deployer.deploy = async () => 'Установка op: завершено. Конфиги обновлены';
-    assert.match(await team.change({ action: 'deploy', owner: 'o', commit: 'main' }), /завершено\. Конфиги обновлены\nуборка: удалено 1/);
+    assert.match(await team.change({ action: 'deploy', owner: 'o', commit: 'main' }), /завершено\. Конфиги обновлены\n(чат Kimi[^\n]*\n)?уборка: удалено 1/);
     assert.equal(after, 1);
     await team.change({ action: 'deploy', owner: 'o', commit: 'main', restart_claude: true });
     assert.equal(after, 1, 'с перезапуском уборку делает новый сервер');

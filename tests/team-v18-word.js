@@ -95,18 +95,20 @@ test('22: поля team_word проходят MCP-схему; запись ви�
     const tool = (await s.client.listTools()).tools.find(t => t.name === 'team_word');
     assert(tool, 'инструмент есть у клиента claude');
     // team-v19 К2: схема расширена словом о Claude (who_down=claude; return, handover, rebind); слово о себе Claude отклоняет сервер.
-    assert.deepEqual(tool.inputSchema.properties.action.enum, ['record', 'list', 'return', 'handover', 'rebind', 'stop_confirm', 'close']);
+    assert.deepEqual(tool.inputSchema.properties.action.enum, ['record', 'list', 'return', 'handover', 'rebind', 'stop_confirm', 'close', 'release_orphan']);
+    // team-v56 Б0: добавлены параметры release_orphan; существующие поля сохранены.
+    assert(tool.inputSchema.properties.lock_instance && tool.inputSchema.properties.folder && tool.inputSchema.properties.admission, 'поля release_orphan в схеме');
     assert.equal(tool.inputSchema.properties.job_ids.type, 'array');
     assert.equal(tool.inputSchema.properties.job_ids.minItems, 1);
     assert.equal(tool.inputSchema.properties.job_ids.items.minLength, 8);
-    // Схема перечисляет ровно действующих голосующих и запасных дирижёров; Grok — только история.
-    const wordWho = [...new Set([...require('../common/members').seatIds, ...require('../common/members').fallbackIds]), 'grok', 'claude'];
+    // Схема включает известных голосующих и запасных дирижёров, в том числе на паузе; Grok — только история.
+    const wordWho = [...new Set([...require('../common/members').knownSeatIds, ...require('../common/members').knownFallbackIds]), 'grok', 'claude'];
     assert.deepEqual(tool.inputSchema.properties.who_down.enum, wordWho);
     const unknown = await s.call('team_word', { action: 'record', who_down: 'nonexistent', quote: 'x' }).catch(e => ({ error: true, text: e.message }));
     assert(unknown.error, 'неизвестный участник отклонён схемой'); assert.match(unknown.text, /who_down|Invalid enum|Invalid option/);
     assert(tool.inputSchema.properties.quote);
     const change = (await s.client.listTools()).tools.find(t => t.name === 'team_change').inputSchema.properties;
-    assert(change.action.enum.includes('grok_slot')); assert.deepEqual(change.slot.enum, [...require('../common/members').seatIds]);
+    assert(change.action.enum.includes('grok_slot')); assert.deepEqual(change.slot.enum, [...require('../common/members').knownSeatIds]);
     const badSlot = await s.call('team_change', { action: 'grok_slot', slot: 'nonexistent', phase: 'design' }).catch(e => ({ error: true, text: e.message }));
     assert(badSlot.error, 'неизвестное место отклонено схемой'); assert.match(badSlot.text, /slot|Invalid enum|Invalid option/);
     assert.deepEqual(change.phase.enum, ['design', 'verdict']);
@@ -284,6 +286,116 @@ test('К7: precheck — голоса по функции мест; систем�
   assert.deepEqual(pc.systemicWarnings(c, diff), []);
   const r = pc.precheck({ folder: RUN, designFile: null, lessonsDiff: diff, change: c });
   assert(!r.warnings.some(w => w.includes('1523272e-bbbb')));
+});
+
+test('team-v56 Б0: release_orphan снимает замок без карточки по точному instance; идемпотентно; защищает карточку и живого владельца', async () => {
+  const { Team } = lib('team'), words = lib('user-word'), wl = lib('write-lock'), paths = lib('paths');
+  const team = new Team(RUN);
+  const mkDir = name => { const d = path.join(RUN, name); fs.mkdirSync(d, { recursive: true }); return fs.realpathSync(d); };
+  const deadPid = () => require('child_process').spawnSync(process.execPath, ['-e', '0']).pid;
+  const mkLock = (dir, instance, jobId, pid) => { const cf = paths.canon(dir); fs.mkdirSync(wl.dir(), { recursive: true });
+    fs.writeFileSync(wl.entryFile(cf), JSON.stringify({ folder: cf, jobId, instance, pid, since: new Date().toISOString() })); return cf; };
+
+  // 1) Осиротевший замок: нет карточки, владелец мёртв — снимается, слово записано.
+  const d1 = mkDir('orphan-1'), inst1 = crypto.randomUUID(), job1 = 'orphan-' + crypto.randomUUID().slice(0, 8);
+  mkLock(d1, inst1, job1, deadPid());
+  const r1 = await team.word({ action: 'release_orphan', lock_instance: inst1, job_ids: [job1], folder: d1, quote: 'сними осиротевший замок cf41' });
+  assert.match(r1, /Снят осиротевший замок/);
+  assert(!wl.entries().some(e => e.entry.instance === inst1), 'замок снят');
+  const rec = words.lines().find(r => r.kind === 'release_orphan' && r.lock_instance === inst1);
+  assert(rec && rec.job_id === job1 && rec.folder === d1, 'слово release_orphan записано с точными полями');
+  assert.match(await new Team(RUN).word({ action: 'list' }), /снятие осиротевшего замка/);
+
+  // 2) Идемпотентный повтор: замка нет — «уже снято», новой записи журнала нет.
+  const before = words.lines().length;
+  assert.match(await team.word({ action: 'release_orphan', lock_instance: inst1, job_ids: [job1], folder: d1, quote: 'сними осиротевший замок cf41' }), /уже снято/);
+  assert.equal(words.lines().length, before, 'повтор не добавляет запись слова');
+
+  // 3) Есть опубликованная карточка этого поручения — отказ, замок не трогается.
+  const d2 = mkDir('orphan-2'), inst2 = crypto.randomUUID(), job2 = 'orphan-' + crypto.randomUUID().slice(0, 8);
+  mkLock(d2, inst2, job2, deadPid());
+  json(path.join(STATE, 'codex-jobs', job2 + '.json'), { id: job2, status: 'running' });
+  await assert.rejects(team.word({ action: 'release_orphan', lock_instance: inst2, job_ids: [job2], folder: d2, quote: 'x' }), /Карточка поручения/);
+  assert(wl.entries().some(e => e.entry.instance === inst2), 'замок сохранён при живой карточке');
+  fs.unlinkSync(path.join(STATE, 'codex-jobs', job2 + '.json'));
+
+  // 5) Папка не совпадает с замком instance — отказ (проверяется до аливости владельца; замок цел).
+  const d3 = mkDir('orphan-3'), inst3 = crypto.randomUUID(), job3 = 'orphan-' + crypto.randomUUID().slice(0, 8);
+  mkLock(d3, inst3, job3, process.pid);
+  await assert.rejects(team.word({ action: 'release_orphan', lock_instance: inst3, job_ids: [job3], folder: d1, quote: 'x' }), /Папка не совпадает/);
+  assert(wl.entries().some(e => e.entry.instance === inst3), 'при несовпадении папки замок цел');
+
+  // 4) team-v59: живой владелец — слово владельца снимает замок и называет риск (прежде был отказ «жив»).
+  const r3 = await team.word({ action: 'release_orphan', lock_instance: inst3, job_ids: [job3], folder: d3, quote: 'сними при живом владельце' });
+  assert.match(r3, /Снят осиротевший замок/); assert.match(r3, /был жив/);
+  assert(!wl.entries().some(e => e.entry.instance === inst3), 'замок снят словом при живом владельце');
+
+  // 6) team-v56 И7 (ревью Codex 5/Kimi 5): отсутствующий (или опечатанный) instance НЕ отзывает чужую незавершённую
+  // постановку того же jobId и не пишет слово — отказ с понятной причиной, если нет точной прежней записи освобождения.
+  const adm = lib('job-admission'), d6 = mkDir('orphan-6'), jobX = 'orphan-' + crypto.randomUUID().slice(0, 8);
+  const aX = await adm.reserve({ adapter: 'codex-cli', principal: 'chat:claude', requestId: 'ro-' + crypto.randomUUID().slice(0, 8), hash: adm.requestHash([['folder', d6]]), newJobId: jobX });
+  const linesBefore6 = words.lines().length;
+  await assert.rejects(team.word({ action: 'release_orphan', lock_instance: crypto.randomUUID(), job_ids: [jobX], folder: d6, quote: 'x' }), /не найден/);
+  assert.equal(words.lines().length, linesBefore6, 'отсутствующий instance не пишет слово');
+  assert(adm.read(STATE, aX.admissionId), 'незавершённая постановка НЕ отозвана отсутствующим instance');
+
+  // 7) team-v56 И7: тот же instance, переиспользованный новым замком другой папки/поручения — конфликт записи освобождения.
+  const d7 = mkDir('orphan-7'), inst7 = crypto.randomUUID(), job7 = 'orphan-' + crypto.randomUUID().slice(0, 8);
+  mkLock(d7, inst7, job7, deadPid());
+  assert.match(await team.word({ action: 'release_orphan', lock_instance: inst7, job_ids: [job7], folder: d7, quote: 'сними 7' }), /Снят осиротевший замок/);
+  const d7b = mkDir('orphan-7b'), job7b = 'orphan-' + crypto.randomUUID().slice(0, 8);
+  mkLock(d7b, inst7, job7b, deadPid());
+  await assert.rejects(team.word({ action: 'release_orphan', lock_instance: inst7, job_ids: [job7b], folder: d7b, quote: 'сними 7b' }), /конфликт release_orphan/);
+
+  // 8) team-v56 К2 (ревью Codex 5/Kimi 5 круг 3): замок БЕЗ собственного jobId + живая чужая неопубликованная постановка
+  // того же запрошенного номера → сам замок снимается (мёртвый владелец), но постановка НЕ отзывается (связь не доказана);
+  // это явно и в ответе, и в записи слова (revoked_admission=false).
+  const d8 = mkDir('orphan-8'), inst8 = crypto.randomUUID(), job8 = 'orphan-' + crypto.randomUUID().slice(0, 8), cf8 = paths.canon(d8);
+  fs.mkdirSync(wl.dir(), { recursive: true });
+  fs.writeFileSync(wl.entryFile(cf8), JSON.stringify({ folder: cf8, instance: inst8, pid: deadPid(), since: new Date().toISOString() })); // без jobId
+  const a8 = await adm.reserve({ adapter: 'codex-cli', principal: 'chat:claude', requestId: 'ro8-' + crypto.randomUUID().slice(0, 8), hash: adm.requestHash([['folder', d8]]), newJobId: job8 });
+  const r8 = await team.word({ action: 'release_orphan', lock_instance: inst8, job_ids: [job8], folder: d8, quote: 'сними 8' });
+  assert.match(r8, /Снят осиротевший замок/); assert.match(r8, /НЕ отзыв/, 'ответ явно: постановка не отзывалась');
+  assert(!wl.entries().some(e => e.entry.instance === inst8), 'замок без jobId снят');
+  assert(adm.read(STATE, a8.admissionId), 'чужая постановка того же номера НЕ отозвана (связь замка не доказана)');
+  const rec8 = words.lines().find(r => r.kind === 'release_orphan' && r.lock_instance === inst8);
+  assert(rec8 && rec8.revoked_admission === false, 'запись слова фиксирует: постановка не отзывалась');
+
+  // 9) team-v56 К2: доказанная связь — у замка есть собственный jobId=запрошенному, владелец мёртв → постановка отзывается.
+  const d9 = mkDir('orphan-9'), inst9 = crypto.randomUUID(), job9 = 'orphan-' + crypto.randomUUID().slice(0, 8);
+  mkLock(d9, inst9, job9, deadPid());
+  const a9 = await adm.reserve({ adapter: 'codex-cli', principal: 'chat:claude', requestId: 'ro9-' + crypto.randomUUID().slice(0, 8), hash: adm.requestHash([['folder', d9]]), newJobId: job9 });
+  const r9 = await team.word({ action: 'release_orphan', lock_instance: inst9, job_ids: [job9], folder: d9, quote: 'сними 9' });
+  assert.match(r9, /отозвана постановка/, 'доказанная связь: постановка отзывается');
+  assert.equal(adm.read(STATE, a9.admissionId), null, 'постановка доказанного поручения отозвана');
+  const rec9 = words.lines().find(r => r.kind === 'release_orphan' && r.lock_instance === inst9);
+  assert(rec9 && rec9.revoked_admission === true, 'запись слова: постановка отозвана');
+
+  // 10) team-v56 К2: несовпадение папки — отказ, замок и постановка целы (у admission нет поля папки — папку доказывает замок).
+  const d10 = mkDir('orphan-10'), inst10 = crypto.randomUUID(), job10 = 'orphan-' + crypto.randomUUID().slice(0, 8);
+  mkLock(d10, inst10, job10, deadPid());
+  const a10 = await adm.reserve({ adapter: 'codex-cli', principal: 'chat:claude', requestId: 'ro10-' + crypto.randomUUID().slice(0, 8), hash: adm.requestHash([['folder', d10]]), newJobId: job10 });
+  await assert.rejects(team.word({ action: 'release_orphan', lock_instance: inst10, job_ids: [job10], folder: d9, quote: 'x' }), /Папка не совпадает/);
+  assert(wl.entries().some(e => e.entry.instance === inst10), 'при несовпадении папки замок не снят');
+  assert(adm.read(STATE, a10.admissionId), 'при несовпадении папки постановка не отозвана');
+});
+
+test('team-v58: release_orphan — из поручения отказ (признак поручения), из чата участника и в запасном режиме доступ открыт', async () => {
+  const ro = lib('release-orphan');
+  const args = () => ({ action: 'release_orphan', lock_instance: crypto.randomUUID(), job_ids: ['orphan-12345678'], folder: fs.realpathSync(RUN), quote: 'x' });
+  // Поручение-сеанс (MOST_JOB_ID либо клиент job) — отказ по признаку поручения, первым.
+  process.env.MOST_CLIENT = 'claude'; process.env.MOST_JOB_ID = 'job-1';
+  await assert.rejects(ro.run(args()), /из поручения запрещено/);
+  delete process.env.MOST_JOB_ID; process.env.MOST_CLIENT = 'job';
+  await assert.rejects(ro.run(args()), /из поручения запрещено/);
+  // Чат участника (codex) вне поручения: признак поручения снят — authority пропускает; дальше отказ лишь по отсутствию замка.
+  process.env.MOST_CLIENT = 'codex';
+  await assert.rejects(ro.run(args()), /не найден|снимать нечего/);
+  // Запасной режим (authority=user) чат Claude: тоже проходит authority (режим чат не ограничивает), упирается в отсутствие замка.
+  process.env.MOST_CLIENT = 'claude';
+  write(path.join(process.env.MOST_FALLBACK_DIR, 'session.json'), JSON.stringify({ authority: 'user', mode: 'fallback' }));
+  await assert.rejects(ro.run(args()), /не найден|снимать нечего/);
+  fs.rmSync(path.join(process.env.MOST_FALLBACK_DIR, 'session.json'), { force: true });
 });
 
 async function main() {

@@ -35,7 +35,10 @@ function cards({ stateDir, who: only, strictStores = false }) {
       const file = path.join(dir, entry.name, ...(entry.isDirectory() ? ['card.json'] : []));
       let j;
       try { j = JSON.parse(fs.readFileSync(file).toString('utf8').replace(/^\uFEFF/, '')); if (!j || typeof j !== 'object') throw Error('неверная карточка'); }
-      catch (e) { throw Error('Не удалось проверить поручения: ' + file + ': ' + e.message); }
+      catch (e) {
+        if (entry.isDirectory() && e.code === 'ENOENT') continue; // Рабочая папка, не карточка; плоская читается отдельно.
+        throw Error('Не удалось проверить поручения: ' + file + ': ' + e.message);
+      }
       let mtimeMs = 0;
       try { mtimeMs = fs.statSync(file).mtimeMs; } catch {}
       result.push({ who, j, entry: entry.name, file, store: sub, mtimeMs });
@@ -51,6 +54,7 @@ function cardPids(j) {
   const out = [];
   const push = v => { if (Number.isInteger(v) && v > 0) out.push(v); };
   push(j.pid); push(j.childPid); push(j.owner?.pid); push(j.apply?.owner?.pid); push(j.stopUnconfirmed?.pid);
+  if (Array.isArray(j.observedPids)) j.observedPids.forEach(push);
   return [...new Set(out)];
 }
 // Дочерние процессы поручения (без pid сервера-владельца): для исторических карточек выключенного адаптера.
@@ -58,6 +62,7 @@ function liveChildPids(j) {
   const out = [];
   const push = v => { if (Number.isInteger(v) && v > 0) out.push(v); };
   push(j.pid); push(j.childPid); push(j.stopUnconfirmed?.pid);
+  if (Array.isArray(j.observedPids)) j.observedPids.forEach(push);
   return [...new Set(out)];
 }
 function memberAdapter(who) {
@@ -76,6 +81,13 @@ function confirmation(j, who, mtimeMs) {
 function confirmed(j, who, mtimeMs) {
   if (mtimeMs === undefined && j.cardFile) { try { mtimeMs = fs.statSync(j.cardFile).mtimeMs; } catch {} }
   return !!confirmation(j, who, mtimeMs);
+}
+// team-v59: карточка, снятая словом владельца на ходу (close → closedByWord; stop_confirm форсом → stopConfirmed с основанием
+// «слово пользователя» и уже терминальным статусом). Поздний результат исполнителя такую карточку НЕ воскрешает: статус остаётся
+// снятым, голосом результат не считается, замок записи не возвращается. Используют finish адаптеров и их опрос (kill процесса).
+function closedByOwnerWord(j) {
+  return !!(j && (j.closedByWord ||
+    (j.stopConfirmed && j.stopConfirmed.basis === 'слово пользователя' && (j.status === 'cancelled' || j.status === 'needs_decision'))));
 }
 // Одно правило перехода для claim, сводок и защиты папок.
 function effectiveStatus(j, ownerState) {
@@ -100,7 +112,7 @@ async function scan({ stateDir }) {
     if (!['running', 'applying', 'cancelling', 'cancel_requested', 'stop_unconfirmed'].includes(j.status) && !j.stopUnconfirmed) continue;
     const row = { who, id: String(j.id || entry).slice(0, 8), folder: j.folder || j.cwd || j.papka || 'не указана',
       duration: require('./format').duration(Date.now() - Date.parse(j.startedAt || j.createdAt || new Date())),
-      from: j.from || j.sender || 'не указан', work: j.workName || (typeof j.work === 'string' && j.work) || 'не указана' };
+      from: j.from || j.sender || 'не указан', work: j.workName || (typeof j.work === 'string' && j.work) || (j.workUnbound && j.workLabel ? j.workLabel + ' (без привязки)' : null) || 'не указана' };
     const basis = confirmation(j, who, mtimeMs);
     if (basis) { stale.push({ ...row, note: 'старая запись: остановка подтверждена (' + basis + ')' }); continue; }
     // Смерть сервера не подтверждает остановку дочернего процесса (ред. 3: дерево не обходится).
@@ -117,4 +129,4 @@ async function staleRecords({ stateDir }) {
 function describe(jobs) {
   return jobs.map(j => `${j.who} ${j.id}, папка ${j.folder}, идёт ${j.duration}, отправитель ${j.from}, работа ${j.work}`).join('; ');
 }
-module.exports = { running, staleRecords, describe, unfinished, confirmation, confirmed, effectiveStatus, holdsFolder, cards, cardPids, bootAt, GROK_DISABLED_AT };
+module.exports = { running, staleRecords, describe, unfinished, confirmation, confirmed, effectiveStatus, holdsFolder, cards, cardPids, bootAt, closedByOwnerWord, GROK_DISABLED_AT };

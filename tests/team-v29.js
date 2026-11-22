@@ -99,8 +99,11 @@ function statusFixture(root, crowded) {
   json(path.join(root, 'state/team/claude-quota.json'), { calls: 20, written: 1000, reread: 2000000, window_h: 5, taken_at: ago(0), source: 'снимок' });
   for (let i = 0; i < (crowded ? 60 : 1); i++) json(path.join(root, 'works/closed-' + i + '.json'), work('closed-' + i, { closed: true,
     stages: [{ title: 'Завершённый', state: 'выдан без принятия', weight: 100, gate: { files: ['file'], reasons: ['причина'] } }] }));
+  // team-v62: team-v61 (Codex №4) — предупреждение этапа стало ЧАСТЬЮ блока работы (а не отдельной всегда-видимой строкой).
+  // Поэтому вешаем его на САМУЮ СВЕЖУЮ работу (open-24): при переполнении её блок сохраняется (team-v47 О10) и предупреждение
+  // видно; у вытесняемых старых работ предупреждение уходит вместе с блоком.
   if (crowded) for (let i = 0; i < 25; i++) json(path.join(root, 'works/open-' + i + '.json'), work('open-' + i, { updated_at: ago(25 - i),
-    stages: [{ title: 'Этап ' + i, state: 'выдан без принятия', weight: 100, gate: { files: ['file'], reasons: ['причина'], ...(i === 0 ? { warning: 'ПРЕДУПРЕЖДЕНИЕ-ДАВНЕГО' } : {}) } }] }));
+    stages: [{ title: 'Этап ' + i, state: 'выдан без принятия', weight: 100, gate: { files: ['file'], reasons: ['причина'], ...(i === 24 ? { warning: 'ПРЕДУПРЕЖДЕНИЕ-ДАВНЕГО' } : {}) } }] }));
   // remind — работа-напоминание владельца: не самая свежая активная работа (её updated старше open-24),
   // чтобы при переполнении сохранялся именно блок самой свежей открытой работы (team-v47 О10).
   json(path.join(root, 'works/remind.json'), work('remind', { owner: 'status-owner', created_at: ago(2), updated_at: ago(2), status_sent_at: ago(1) }));
@@ -116,17 +119,32 @@ test('О10: настоящий MCP, текущий состав квот, пер
   for (const crowded of [true, false]) {
     const root = path.join(RUN, crowded ? 'crowded' : 'small'); statusFixture(root, crowded); const server = await mcp(root);
     try {
+      // team-v62: team-v60 «краткая сводка за секунды» — ВНЕШНИЕ части квоты (codex/agy, с составом моделей) берутся из
+      // дискового кэша, а не считаются синхронно на пути ответа (иначе краткая сводка упиралась бы в app-server). Поэтому
+      // прогреваем кэш состава квот так же, как это делает фоновый досчёт (quota-refresh): из фикстуры Antigravity
+      // (MOST_AGY_QUOTA_FILE) и подставного codex. Тогда краткая сводка показывает полный состав (как было до v60).
+      await require('../common/quota-line').refreshLineCache({ state: path.join(root, 'state/team'), binary: path.join(__dirname, 'fake-codex.js') });
       const text = await server.call(false); console.log('О10 ' + (crowded ? 'с избытком' : 'без лишнего') + ': ' + text.length + ' знаков');
       assert(text.length <= 3000, text);
       for (const marker of ['Квоты:', 'Claude Desktop', 'Gemini 4 Argon', 'Gemini 3.8 Flash', 'Claude Opus 5.5', 'Claude Sonnet 5.5', 'GPT-OSS 120B', 'обычное распределение',
         'Запасной режим: дирижёр Codex', 'Статус пользователю', 'Работы: завершено', 'нужно решение по 30', 'running-', 'applying', '#45e7aa10', 'Изменение в работе', 'broken', 'перезапуск не запущен', 'Пауза перезапуска: операция pause-o10', 'исполнитель жив', 'старые серверы не принимают новые поручения', 'Расхождения подключений', 'Дальше:']) assert(text.includes(marker), marker + '\n' + text);
       assert.equal((text.match(/Статус пользователю/g) || []).length, 1);
       if (crowded) {
-        assert.match(text, /Ещё не показано/); assert.match(text, /open-0: Этап 0 — ПРЕДУПРЕЖДЕНИЕ-ДАВНЕГО/);
+        // team-v62: переполнение случилось; самая старая работа (open-0) не показана в любом случае.
+        assert.match(text, /Ещё не показано/);
         assert(!text.includes('open-0: принято')); assert(!text.includes('open-0: Этап 0 — выдан')); assert(!text.includes('open-0: Этап 0 — место'));
         const shown = [...text.matchAll(/open-(\d+): принято/g)].map(m => Number(m[1]));
-        assert(shown.length > 0, 'должен остаться блок самой свежей работы');
-        assert.deepEqual(shown.sort((a,b) => a-b), Array.from({ length: 25 - Math.min(...shown) }, (_, i) => Math.min(...shown) + i));
+        if (shown.length) {
+          // Есть место для работ → по правилу fit() (common/summary) сохраняется именно блок САМОЙ СВЕЖЕЙ работы (контигуально
+          // до open-24), и в нём видно предупреждение этапа (team-v61: предупреждение — часть блока работы).
+          assert(shown.includes(24), 'сохранён блок самой свежей работы open-24');
+          assert.deepEqual(shown.sort((a,b) => a-b), Array.from({ length: 25 - Math.min(...shown) }, (_, i) => Math.min(...shown) + i));
+          assert.match(text, /open-24: Этап 24 — ПРЕДУПРЕЖДЕНИЕ-ДАВНЕГО/);
+        } else {
+          // team-v62: при ПОЛНОМ составе квот (team-v60) вместе с запасным режимом инфраструктура одна занимает бюджет оболочки
+          // — fit() (common/summary, стр. 78 «если даже самый свежий не влезает — снимается и он») убирает все блоки работ.
+          assert.match(text, /Ещё не показано: \d+ строк \(из них работ: (?:2[0-9]|1[0-9])\)/, 'все работы в переполнении: ' + text);
+        }
       } else {
         // team-v47 (решение пользователя по О10): обязательные предупреждения restart-hold (team-v46) могут чуть превысить
         // бюджет и в «без лишнего» — вытесняются только НЕработы (из них работ: 0), блок самой свежей работы сохраняется.
@@ -206,14 +224,95 @@ test('О1–О2: прямое хранилище, живой/мёртвый/не
   for (const owner of [mine, null]) { json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'running', owner }); assert.equal((await live.running({ stateDir: state })).length, 1); }
   write(path.join(state, 'jobs/b/card.json'), '{'); await assert.rejects(live.running({ stateDir: state }), /Не удалось проверить поручения/);
 });
-test('О1–О2: team deploy отказывает до установщика; без перезапуска Р1 не вызывается', async () => {
+test('О1–О2: team deploy отказывает до установщика; без перезапуска Р1 не вызывается; слово владельца перекрывает и раннюю проверку restart_claude', async () => {
   const root = fresh('team-deploy'), state = path.join(root, 'state'), t = new Team(root, path.join(state, 'team'));
   json(path.join(state, 'codex-jobs/a.json'), { id: 'foreign-job', status: 'running', owner: locks.owner(), folder: 'чужая-папка', startedAt: ago(1) });
-  const deployer = require('../common/deploy'), old = deployer.locked; let calls = 0;
+  const deployer = require('../common/deploy'), old = deployer.locked, migration = require('../common/members-kimi'); let calls = 0;
   deployer.locked = async () => { calls++; throw Error('установщик вызван'); };
-  try { await assert.rejects(t.changeInner({ action: 'deploy', restart_claude: true }), /не начата.*foreign-.*чужая-папка.*идёт/); assert.equal(calls, 0);
-    await assert.rejects(t.changeInner({ action: 'deploy', restart_claude: false }), /установщик вызван/); assert.equal(calls, 1);
-  } finally { deployer.locked = old; }
+  const envJob = process.env.MOST_JOB_ID; delete process.env.MOST_JOB_ID; // слово принимается только в основном чате (не поручение)
+  try {
+    // team-v57 (ред.7): прежняя РАННЯЯ проверка идущих поручений при restart_claude (не глядя на слово) снята. Без слова
+    // deploy и с перезапуском, и без него отказывает ОДНИМ отказом deployGate — полный список + отпечаток, без вызова
+    // установщика (deployer.locked). Отказ возвращается строкой (первый шаг двухшагового канала), не исключением.
+    for (const restart_claude of [true, false]) {
+      const refusal = await t.changeInner({ action: 'deploy', restart_claude });
+      assert.match(refusal, /Установка не начата/, 'restart_claude=' + restart_claude);
+      assert.match(refusal, /foreign-job.*чужая-папка.*идёт/, 'полный список идущего поручения');
+      assert.match(refusal, /list_hash/); assert.match(refusal, /будут оборваны/);
+    }
+    assert.equal(calls, 0, 'установщик не вызван без слова');
+    // Со словом пользователя и верным отпечатком deploy с restart_claude НЕ отказывает ранней проверкой, а доходит до
+    // установщика (здесь — подменён и бросает); идущее поручение перекрыто словом.
+    const h = migration.deployGate(state, {}).listHash;
+    await assert.rejects(t.changeInner({ action: 'deploy', restart_claude: true, quote: 'Ставь сейчас, идущие поручения оборви', list_hash: h }), /установщик вызван/);
+    assert.equal(calls, 1, 'со словом и отпечатком дошли до установщика');
+  } finally { deployer.locked = old; if (envJob === undefined) delete process.env.MOST_JOB_ID; else process.env.MOST_JOB_ID = envJob; }
+});
+test('ред.8: слово установки принимается из чата любого участника и в запасном режиме; поручение — отказ', async () => {
+  const root = fresh('team-deploy-chat'), state = path.join(root, 'state'), t = new Team(root, path.join(state, 'team'));
+  json(path.join(state, 'codex-jobs/a.json'), { id: 'foreign-job', status: 'running', owner: locks.owner(), folder: 'чужая-папка', startedAt: ago(1) });
+  const deployer = require('../common/deploy'), oldLocked = deployer.locked, migration = require('../common/members-kimi'), access = require('../common/access');
+  let calls = 0; deployer.locked = async () => { calls++; throw Error('установщик вызван'); };
+  const h = migration.deployGate(state, {}).listHash;
+  const saved = { job: process.env.MOST_JOB_ID, cli: process.env.MOST_CLIENT, auth: process.env.MOST_AUTHORITY };
+  const restore = () => { for (const [k, v] of [['MOST_JOB_ID', saved.job], ['MOST_CLIENT', saved.cli], ['MOST_AUTHORITY', saved.auth]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } };
+  try {
+    delete process.env.MOST_JOB_ID; delete process.env.MOST_AUTHORITY;
+    // Слово из чата участника-не-Claude (codex, kimi) и из Claude — доходит до установщика; channel = имя клиента (deployGate).
+    for (const client of ['codex', 'kimi', 'claude']) {
+      process.env.MOST_CLIENT = client; calls = 0;
+      assert.equal(access.client(), client);
+      assert.equal(migration.deployGate(state, { quote: 'Ставь', listHash: h, channel: client }).channel, client, 'deployGate возвращает channel ' + client);
+      await assert.rejects(t.changeInner({ action: 'deploy', quote: 'Ставь сейчас', list_hash: h }), /установщик вызван/, 'слово из чата ' + client + ' принято');
+      assert.equal(calls, 1, client + ': дошли до установщика');
+    }
+    // Запасной режим (authority=user): слово из чата дирижёра-участника — проходит.
+    process.env.MOST_CLIENT = 'codex'; process.env.MOST_AUTHORITY = 'user'; calls = 0;
+    assert.equal(access.guest(), true, 'в запасном режиме чат — гость');
+    await assert.rejects(t.changeInner({ action: 'deploy', quote: 'Ставь в запасном', list_hash: h }), /установщик вызван/, 'слово в запасном режиме принято');
+    assert.equal(calls, 1, 'запасной режим: дошли до установщика');
+    delete process.env.MOST_AUTHORITY;
+    // Поручение — отказ (человека в поручении нет): MOST_JOB_ID; клиент claude-print. Установщик не вызван.
+    calls = 0;
+    process.env.MOST_CLIENT = 'claude'; process.env.MOST_JOB_ID = 'job-1';
+    await assert.rejects(t.changeInner({ action: 'deploy', quote: 'Ставь из поручения', list_hash: h }), /запрещено|поручени/, 'MOST_JOB_ID — отказ');
+    delete process.env.MOST_JOB_ID; process.env.MOST_CLIENT = 'claude-print';
+    await assert.rejects(t.changeInner({ action: 'deploy', quote: 'Ставь', list_hash: h }), /запрещено|поручени/, 'claude-print — отказ');
+    assert.equal(calls, 0, 'из поручения установщик не вызван');
+  } finally { deployer.locked = oldLocked; restore(); }
+});
+test('task8 п.1–2: признак поручения проверяется ПЕРВЫМ и в любом режиме (каждый признак отдельно); неопознанный клиент не получает чужое имя в channel', async () => {
+  const root = fresh('team-deploy-job'), state = path.join(root, 'state'), t = new Team(root, path.join(state, 'team'));
+  json(path.join(state, 'codex-jobs/a.json'), { id: 'foreign-job', status: 'running', owner: locks.owner(), folder: 'чужая-папка', startedAt: ago(1) });
+  const deployer = require('../common/deploy'), oldLocked = deployer.locked, migration = require('../common/members-kimi'), access = require('../common/access');
+  let calls = 0; deployer.locked = async () => { calls++; throw Error('установщик вызван'); };
+  const h = migration.deployGate(state, {}).listHash;
+  const saved = { job: process.env.MOST_JOB_ID, cli: process.env.MOST_CLIENT, auth: process.env.MOST_AUTHORITY };
+  const restore = () => { for (const [k, v] of [['MOST_JOB_ID', saved.job], ['MOST_CLIENT', saved.cli], ['MOST_AUTHORITY', saved.auth]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } };
+  const refuse = async msg => { calls = 0; await assert.rejects(t.changeInner({ action: 'deploy', quote: 'Ставь', list_hash: h }), /запрещено|поручени/, msg); assert.equal(calls, 0, msg + ': установщик не вызван'); };
+  try {
+    // Запасной режим активен (authority=user) — признак поручения всё равно отсекает установку ПЕРВЫМ, КАЖДЫЙ признак по отдельности.
+    process.env.MOST_AUTHORITY = 'user';
+    process.env.MOST_CLIENT = 'codex'; process.env.MOST_JOB_ID = 'job-1'; await refuse('запасной + MOST_JOB_ID');
+    delete process.env.MOST_JOB_ID; process.env.MOST_CLIENT = 'job'; await refuse('запасной + клиент job');
+    process.env.MOST_CLIENT = 'claude-print'; await refuse('запасной + клиент claude-print');
+    // Запасной режим + клиент codex без MOST_JOB_ID — проходит, channel = 'codex'.
+    process.env.MOST_CLIENT = 'codex'; calls = 0;
+    assert.equal(access.client(), 'codex');
+    await assert.rejects(t.changeInner({ action: 'deploy', quote: 'Ставь', list_hash: h }), /установщик вызван/, 'запасной + codex — проходит');
+    assert.equal(calls, 1, 'запасной + codex: дошли до установщика');
+    // Неопознанный клиент (пустой MOST_CLIENT) в запасном режиме → client() === 'unknown'; channel честный, не чужое имя.
+    delete process.env.MOST_CLIENT;
+    assert.equal(access.client(), 'unknown', 'пустой клиент в запасном режиме — unknown');
+    const g = migration.deployGate(state, { quote: 'Ставь', listHash: h, channel: access.client() });
+    assert.equal(g.channel, 'unknown', 'неопознанному клиенту не присвоено чужое имя');
+    assert(!['claude', 'codex', 'kimi', 'antigravity', 'deepseek'].includes(g.channel), 'channel не подделан под участника');
+    delete process.env.MOST_AUTHORITY;
+    // Основной режим — каждый признак поручения отдельно отказывает.
+    process.env.MOST_CLIENT = 'claude'; process.env.MOST_JOB_ID = 'job-1'; await refuse('основной + MOST_JOB_ID');
+    delete process.env.MOST_JOB_ID; process.env.MOST_CLIENT = 'job'; await refuse('основной + клиент job');
+    process.env.MOST_CLIENT = 'claude-print'; await refuse('основной + клиент claude-print');
+  } finally { deployer.locked = oldLocked; restore(); }
 });
 test('О2а: внешний deploy проверяет blob, единственное целое объявление, старый релиз и ошибку чтения', async () => {
   const source = fs.readFileSync(path.join(ROOT, 'common/deploy.js')).toString('utf8'), root = fresh('protocol');
@@ -279,6 +378,18 @@ test('О6а,ф,х: Р1 и ошибка Р1 отменяют свою паузу;
     json(file, { id: 'fixed', status: 'done' }); assert(hold.admit(state, serverInfo()).ok); await unlocked(state);
   }
   const state = fresh('id'); const h = await hold.begin(state, { runId: 'fallback' }); assert.equal(h.id, h.runId); assert(!hold.warnings(state).join('').includes('undefined')); await hold.abort(state, h);
+});
+test('team-v57 (ред.7): слово пользователя из операции установки перекрывает раннюю проверку restart (идущие поручения перезапуск не отменяют)', async () => {
+  const root = fresh('restart-word'), state = path.join(root, 'state'), file = path.join(state, 'codex-jobs/a.json');
+  json(file, { id: 'running', status: 'running', owner: locks.owner() });
+  let launches = 0;
+  // Без слова — ранняя проверка идущих поручений отменяет перезапуск, launch не вызывается.
+  await assert.rejects(restart.restart({ root, release: root, state }, { launch: async () => { launches++; } }), /идут поручения/);
+  assert.equal(launches, 0); assert(!fs.existsSync(hold.holdFile(state)));
+  // Со словом (пришедшим из записи операции установки) — ранняя проверка перезапуск НЕ отменяет: доходит до запуска
+  // сценария (здесь launch подменён и журнала не пишет, поэтому запуск не подтверждается — но проверка идущих уже пройдена).
+  await assert.rejects(restart.restart({ root, release: root, state, word: 'Ставь сейчас, идущие поручения оборви' }, { launch: async () => { launches++; }, waitMs: 50 }), /не подтверждён|не запущен/);
+  assert.equal(launches, 1, 'со словом launch вызван — ранняя проверка идущих поручений перезапуск не отменила');
 });
 test('О6а: занятый job_start ждут, исчерпание ожидания не создаёт паузы', async () => {
   const state = fresh('busy'), l = await locks.tryLock('job_start', 'all', {}, state); assert(l.ok);
@@ -457,7 +568,8 @@ test('О6т: close:false не создаёт ни паузы, ни отмето�
 function executorHarness(who) {
   process.env.AGY_PATH = path.join(__dirname, 'fake-agy.js');
   const filename = path.join(ROOT, 'servers', who, 'index.js'), m = new Module(filename, module); m.filename = filename; m.paths = Module._nodeModulePaths(path.dirname(filename));
-  const source = fs.readFileSync(filename).toString('utf8'), end = source.lastIndexOf('(async () => {'); assert(end > 0);
+  // Якорь по началу строки (team-v62 добавил вложенный `  (async () => {` в бутстрап — без `\n` срез резал его посередине).
+  const source = fs.readFileSync(filename).toString('utf8'), end = source.lastIndexOf('\n(async () => {'); assert(end > 0);
   const tail = who === 'codex' ? `
 execute = async (j, l) => { if (l) await l.release(); };
 module.exports = { send, queue, list, load, setServer: value => { restartServer = value; } };

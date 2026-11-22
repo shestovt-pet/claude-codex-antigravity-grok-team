@@ -29,6 +29,36 @@ function findInBin(root) {
     return null;
   }
 }
+function windowsAppsDir(env = process.env) {
+  const base = env['ProgramFiles'] || (env.SystemDrive ? path.join(env.SystemDrive, 'Program Files') : 'C:\\Program Files');
+  return path.join(base, 'WindowsApps');
+}
+// models-622: свежайший полный codex.exe, вложенный в установленный пакет приложения Codex
+// (%ProgramFiles%\WindowsApps\OpenAI.Codex_<версия>_...\app\resources\codex.exe). Приложение обновляется
+// отдельно от разложенного им в bin\<хеш> CLI: пока приложение после своего обновления не разложило новый CLI
+// в bin, свежий бинарь доступен только внутри пакета. Выбор — по времени установки пакета (самый свежий полный),
+// путь к конкретной версии не привязан. Каталог WindowsApps может быть закрыт ACL — тогда тихо пропускаем.
+function findInWindowsApps(env = process.env) {
+  try {
+    const root = windowsAppsDir(env);
+    return fs.readdirSync(root)
+      .filter((n) => /^OpenAI\.Codex_/i.test(n))
+      .map((n) => path.join(root, n, 'app', 'resources', 'codex.exe'))
+      .filter((p) => complete(p))
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0] || null;
+  } catch {
+    return null;
+  }
+}
+// models-622: самый свежий полный codex.exe среди разложенных в bin\<хеш> и вложенных в пакет приложения.
+// Путь не привязан к версии — на каждом разрешении выбирается самый свежий установленный (по времени файла).
+function freshestManaged(env = process.env) {
+  const candidates = [
+    env.LOCALAPPDATA ? findInBin(path.join(env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin')) : null,
+    findInWindowsApps(env),
+  ].filter(Boolean);
+  return candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0] || null;
+}
 function findCli(env = process.env) {
   // Явный CODEX_PATH принимается как есть (без проверки полной папки).
   if (env.CODEX_PATH) { const p = env.CODEX_PATH; return valid(p, env) ? p : null; }
@@ -38,6 +68,8 @@ function findCli(env = process.env) {
     // codex из PATH вне раскладки приложения — как есть.
     if (first && fs.existsSync(first)) return first;
   } catch {}
-  return env.LOCALAPPDATA ? findInBin(path.join(env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin')) : null;
+  // models-622: запасной путь — самый свежий полный CLI из bin\<хеш> приложения ИЛИ из обновлённого пакета
+  // приложения (когда приложение обновлено, но ещё не разложило CLI в bin). Версия не захардкожена.
+  return freshestManaged(env);
 }
-module.exports = { complete, valid, findCli, findInBin };
+module.exports = { complete, valid, findCli, findInBin, findInWindowsApps, freshestManaged };

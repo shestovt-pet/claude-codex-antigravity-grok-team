@@ -37,8 +37,10 @@ const tests = [], test = (name, fn) => tests.push([name, fn]);
 // неприменимы (приватную историю ради теста не хранят) и помечаются пропущенными (замысел team-v47, разд. 13.2).
 const hasBase = (() => { try { cp.execFileSync('git', ['show', BASE + ':common/format.js'], { cwd: base, stdio: 'ignore', windowsHide: true }); return true; } catch { return false; } })();
 const skipNoBase = () => { if (!hasBase) throw Object.assign(Error('неприменимо к публичной копии без истории: коммит ' + BASE + ' отсутствует'), { __skip: true }); };
-const realProcesses = cleanup.windowsProcesses;
-cleanup.windowsProcesses = () => [];
+const hold = require('../common/restart-hold'), realProcesses = hold.processTableAsync;
+const processRow = (pid, startedAt = null) => ({ pid, ppid: 0, startedAt });
+const emptySnapshot = async () => [processRow(process.pid)];
+hold.processTableAsync = emptySnapshot;
 // Модуль по содержимому базы d4398b2e (закреплена, не HEAD) — для проверок отката на старый код.
 function baseModule(name) {
   const Module = require('module'), file = path.join(base, 'common', name + '.js');
@@ -50,7 +52,8 @@ function baseModule(name) {
 function serverHarness(who) {
   const Module = require('module'), file = path.join(base, 'servers', who, 'index.js');
   const m = new Module(file, module); m.filename = file; m.paths = Module._nodeModulePaths(path.dirname(file));
-  const source = fs.readFileSync(file, 'utf8'), end = source.lastIndexOf('(async () => {');
+  // Якорь по началу строки (team-v62 добавил вложенный `  (async () => {` внутрь бутстрапа — без `\n` срез резал его посередине).
+  const source = fs.readFileSync(file, 'utf8'), end = source.lastIndexOf('\n(async () => {');
   assert(end > 0);
   m._compile(source.slice(0, end) + '\nexecute = async (j, l) => { if (l) await l.release(); };\nmodule.exports = { send, list, load };', file);
   return m.exports;
@@ -105,48 +108,85 @@ test('П1: повтор — «уже закрыто словом», запись
   assert.match(await team.word({ action: 'list' }), /закрытие словом/);
 });
 
-for (const status of ['running', 'queued', 'waiting_quota', 'delivery_unclear', 'migration_conflict', 'cancelling', 'cancel_requested', 'applying']) test('П1: BUSY по статусу ' + status + ' блокирует весь набор', async () => {
-  const a = card({ status: 'needs_decision' }), b = card({ status }), n = count();
-  assert.match(await close({ job_ids: [a.id, b.id] }), /ещё может работать — сначала отмена/);
-  assert.equal(count(), n); assert(!a.read().closedByWord); assert(!b.read().closedByWord);
+// team-v59: слово владельца закрывает running/queued/waiting_quota (closedByWord); данные-состояния переноса остаются отказом.
+for (const [status, forced, expected] of [
+  ['running', true], ['queued', true], ['waiting_quota', true],
+  ['migration_conflict', false, 'конфликт миграции требует разбора'],
+  ['applying', false, 'перенос ещё не завершён'],
+]) test('П1: статус ' + status + (forced ? ': слово владельца закрывает' : ': отказ (целостность переноса)'), async () => {
+  const a = card({ status: 'needs_decision', stopUnconfirmed: { pid: 2147483001 } }), b = card({ status, stopUnconfirmed: { pid: 2147483002 } }), n = count();
+  const before = [a.text(), b.text()];
+  const text = await close({ job_ids: [a.id, b.id] });
+  if (forced) {
+    assert.match(text, /закрыто/); assert.match(text, /мог остаться работать/);
+    assert.equal(count(), n + 1); assert(a.read().closedByWord && b.read().closedByWord);
+  } else {
+    assert.equal(text.split('\n')[1], b.id + ': ' + expected);
+    assert.deepStrictEqual([a.text(), b.text()], before);
+    assert.equal(count(), n); assert(!a.read().closedByWord); assert(!b.read().closedByWord);
+  }
 });
 
-for (const kind of ['alive', 'self', 'unknown', 'missing', 'apply', 'pid']) test('П1: BUSY по процессу/владельцу: ' + kind, async () => {
+// team-v59: слово владельца закрывает карточку при живом/неизвестном владельце и «возможно живом»/неустановленном PID.
+for (const kind of ['alive', 'self', 'unknown', 'missing', 'apply', 'pid']) test('П1: слово владельца закрывает по процессу/владельцу: ' + kind, async () => {
   const saved = locks.ownerState;
   const c = card(kind === 'missing' ? { owner: null } : kind === 'self' ? { owner: locks.owner() } : kind === 'apply' ? { apply: { owner: locks.owner() } } : kind === 'pid' ? { childPid: 23456 } : {});
   if (kind === 'alive' || kind === 'unknown') locks.ownerState = async () => kind;
-  if (kind === 'pid') cleanup.windowsProcesses = () => [{ pid: 23456 }];
+  if (kind === 'pid') hold.processTableAsync = async () => [processRow(process.pid), processRow(23456)];
   try {
+    f.json(c.file, { ...c.j, stopUnconfirmed: { pid: 2147483001 } });
     const n = count();
-    assert.match(await close({ job_ids: [c.id] }), /ещё может работать — сначала отмена/);
-    assert.equal(count(), n); assert(!c.read().closedByWord);
-  } finally { locks.ownerState = saved; cleanup.windowsProcesses = () => []; }
+    const text = await close({ job_ids: [c.id] });
+    assert.match(text, /закрыто словом владельца/); assert.match(text, /мог остаться работать/);
+    assert.equal(count(), n + 1); assert(c.read().closedByWord && c.read().closedByWord.basis === 'слово пользователя');
+  } finally { locks.ownerState = saved; hold.processTableAsync = emptySnapshot; }
 });
 
-test('П1: НЕЧЕГО — done или failed отклоняет весь набор, журнал слов без изменений', async () => {
-  const yes = card({ status: 'needs_decision' }), done = card({ status: 'done', write: true }), failed = card({ status: 'failed', write: true });
-  const before = [done, failed].map(c => c.text()), n = count();
-  const text = await close({ job_ids: [yes.id, done.id, failed.id] });
+test('П1: НЕЧЕГО — done, applied или failed без флага отклоняет весь набор, журнал слов без изменений', async () => {
+  const yes = card({ status: 'needs_decision' }), done = card({ status: 'done', write: true }), failed = card({ status: 'failed', write: true }), applied = card({ status: 'applied', write: true });
+  const before = [done, failed, applied].map(c => c.text()), n = count();
+  const text = await close({ job_ids: [yes.id, done.id, failed.id, applied.id] });
   assert.match(text, /нечего закрывать/);
   assert.equal(count(), n); assert(!yes.read().closedByWord);
-  assert.deepEqual([done.text(), failed.text()], before);
+  assert.deepEqual([done.text(), failed.text(), applied.text()], before);
 });
 
 test('П1: не найденный номер и доступ гостя/поручения/запасного режима — отказ', async () => {
   const c = card({ status: 'needs_decision' }), n = count();
   assert.match(await close({ job_ids: ['missing-v44'] }), /не найдено/);
   assert.equal(count(), n); assert(!c.read().closedByWord);
-  for (const mode of ['guest', 'job', 'fallback']) {
+  // Чат участника (codex) без доказанного ОТПЕЧАТКА чата (нет state\ready\team.json) и поручение — отказ по подлинности;
+  // слово владельца снимает только в подлинном чате (chat-origin доказанного происхождения отпечаток не заменяет).
+  for (const [mode, expected] of [
+    ['guest', 'Гостю это действие запрещено: поручение-сеанс этого не делает: слово, поручения и перенос — только из чата; не могу подтвердить, что это чат (запись основного сервера (state\\ready\\team.json) не прочитана), — скажи это в чате Codex.'],
+    ['job', /из поручения запрещено|Гостю это действие запрещено/],
+  ]) {
     if (mode === 'guest') process.env.MOST_CLIENT = 'codex';
     if (mode === 'job') process.env.MOST_JOB_ID = 'parent';
-    if (mode === 'fallback') await words.append({ kind: 'record', who_down: 'claude', quote: 'Claude отвалился', recorded_by: 'codex', owner: 'fallback-test' });
     try {
-      await assert.rejects(close({ job_ids: [c.id] }), /запрещено|запасно[йм]|основном|поручени/i);
-      assert.equal(count(), n + (mode === 'fallback' ? 1 : 0)); assert(!c.read().closedByWord);
+      await assert.rejects(close({ job_ids: [c.id] }), { message: expected });
+      assert.equal(count(), n); assert(!c.read().closedByWord);
     } finally {
       process.env.MOST_CLIENT = 'claude'; delete process.env.MOST_JOB_ID;
-      if (mode === 'fallback') await words.append({ kind: 'return', who_down: 'claude', quote: 'Claude вернулся', recorded_by: 'claude' });
     }
+  }
+});
+// team-v58 (task10, обновление устаревшего подслучая fallback): запасной режим чат не ограничивает (замысел §2). Проверяем оба
+// положения: доказанный чат закрывает карточку словом и в активном режиме; поручение в том же режиме — отказ.
+test('П1: запасной режим не ограничивает чат — доказанный чат закрывает словом, поручение — отказ', async () => {
+  const c = card({ status: 'needs_decision' }), n = count();
+  await words.append({ kind: 'record', who_down: 'claude', quote: 'Claude отвалился', recorded_by: 'codex', owner: 'fallback-test' });
+  try {
+    assert(words.mode().active, 'запасной режим активен');
+    // Доказанный чат (claude, MOST_TEST_CHAT_ORIGIN=proven): закрытие словом проходит и в активном режиме.
+    assert.match(await close({ job_ids: [c.id] }), /закрыто/);
+    assert(c.read().closedByWord, 'карточка закрыта доказанным чатом в запасном режиме');
+    // Поручение в том же активном режиме — отказ.
+    const c2 = card({ status: 'needs_decision' }); process.env.MOST_JOB_ID = 'parent';
+    try { await assert.rejects(close({ job_ids: [c2.id] }), /запрещено/); assert(!c2.read().closedByWord); }
+    finally { delete process.env.MOST_JOB_ID; }
+  } finally {
+    await words.append({ kind: 'return', who_down: 'claude', quote: 'Claude вернулся', recorded_by: 'claude' });
   }
 });
 
@@ -279,4 +319,34 @@ test('П3: напоминание только в team_status/team_work чере
   }
 });
 
-f.run(tests).finally(() => { cleanup.windowsProcesses = realProcesses; });
+for (const status of ['cancelling', 'cancel_requested', 'delivery_unclear', 'done', 'applied'])
+test('v55 close: ' + status + ' без потери результата и с подтверждением остановки', async () => {
+  const c = card({ status, stopUnconfirmed: { pid: 2147483001 }, result: 'ответ', finishedAt: '2026-01-02T00:00:00Z' });
+  const wl = require('../common/write-lock'), folder = path.join(f.project, c.id); fs.mkdirSync(folder);
+  f.json(c.file, { ...c.j, folder }); assert(wl.acquire(folder, { jobId: c.id }).ok);
+  fs.mkdirSync(path.join(state, 'codex-jobs', c.id)); // Плоская карточка рядом с рабочей папкой без card.json.
+  const completed = ['done', 'applied'].includes(status);
+  const expected = completed ? 'остановка подтверждена; результат сохранён' : 'закрыто';
+  assert.equal((await close({ job_ids: [c.id] })).split('\n')[0], c.id + ': ' + expected);
+  const j = c.read();
+  assert.equal(j.status, completed ? status : 'cancelled'); assert.equal(!!j.closedByWord, !completed);
+  assert(j.stopConfirmed); assert(!Object.hasOwn(j, 'stopUnconfirmed')); assert.equal(j.result, c.j.result); assert.equal(j.finishedAt, c.j.finishedAt);
+  assert.equal(j.stopConfirmed.prev_status, status);
+  const next = wl.acquire(folder, { jobId: c.id + '-next' }); assert(next.ok);
+  try { const before = c.text(), n = count(); await close({ job_ids: [c.id] }); assert.equal(c.text(), before); assert.equal(count(), n); assert(!wl.acquire(folder).ok); }
+  finally { next.release(); }
+});
+test('v55 close: чужой PID исключён по времени; неизвестный agyPid снимается словом владельца', async () => {
+  const a = card({ childPid: 23456, childStartedAt: '2026-01-01T00:00:10Z', startedAt: '2026-01-01T00:00:00Z' });
+  const b = card({ agyPid: 23457 }), n = count();
+  hold.processTableAsync = async () => [processRow(process.pid), processRow(23456, '2026-01-01T00:01:00Z'), processRow(23457)];
+  try {
+    // team-v59: a с чужим PID закрывается штатно; b с неустановленным agyPid — словом владельца (прежде блокировал пакет).
+    const text = await close({ job_ids: [a.id, b.id] });
+    assert.match(text, /закрыто/); assert.equal(count(), n + 1);
+    assert(a.read().stopConfirmed.evidence.processes.some(p => p.pid === 23456 && p.state === 'foreign'));
+    assert(b.read().closedByWord, 'неизвестный agyPid закрыт словом владельца');
+  } finally { hold.processTableAsync = emptySnapshot; }
+});
+
+f.run(tests).finally(() => { hold.processTableAsync = realProcesses; });

@@ -40,6 +40,26 @@ function classifyCodex(event) {
   };
 }
 
+// team-v61 (п.1): признак исчерпания подписочной квоты берётся ТОЛЬКО из диагностики провайдера (stderr/ошибка запуска),
+// а не из произвольного текста ответа исполнителя. Слово «quota» в тексте результата (задача про quota.js, waiting_quota и
+// т.п.) исчерпанием не является; голые «quota», «429», «rate limit», «too many requests» убраны (ограничение частоты — не
+// исчерпание аккаунта). Признаки — как в classifyAgy: «usage limit», «quota exceeded/exhausted/limit», RESOURCE_EXHAUSTED.
+// Применяется ТОЛЬКО к диагностике поручения, завершившегося с ошибкой; к тексту ответа (parsed.text) — никогда.
+function quotaExhausted(text) {
+  return /usage limit|quota[ _-]*(?:exceeded|exhausted|limit)|RESOURCE_EXHAUSTED/i.test(String(text || ''));
+}
+// Исходная строка провайдера без ссылок и локальных путей (их подставлять в ответ нельзя): убираем URL и пути Windows/POSIX,
+// схлопываем пробелы и обрезаем. Нужна, чтобы показать причину провайдера рядом с понятным сообщением моста.
+function providerLine(text, max = 400) {
+  return String(text || '')
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/\b[A-Za-z]:\\[^\s"']*/g, '')
+    .replace(/(?:^|\s)~?\/[^\s"']*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+}
+
 function retryPlan(job, failure) {
   const quota = failure.kind === 'quota',
     count = quota ? job.quotaAttempts || 0 : job.transientAttempts || 0;
@@ -113,7 +133,7 @@ function appServer(binary, timeout = 15000) {
       child.kill();
       err ? reject(err) : resolve(result);
     };
-    const timer = setTimeout(() => finish(new Error('Источник квоты не ответил за 15 секунд.')), timeout);
+    const timer = setTimeout(() => finish(new Error('Источник квоты не ответил за ' + Math.round(timeout / 1000) + ' с.')), timeout);
     const send = (o) => child.stdin.write(JSON.stringify(o) + '\n');
     child.stdin.on('error', () => {});
     child.stderr.resume();
@@ -229,6 +249,8 @@ module.exports = {
   resetTime,
   classifyAgy,
   classifyCodex,
+  quotaExhausted,
+  providerLine,
   retryPlan,
   windows,
   limitsSnapshot,

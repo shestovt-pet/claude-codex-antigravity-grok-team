@@ -22,7 +22,7 @@ const store = require('../common/members-store').create();
 function composition(phase = 'A', state = null) {
   const current = store.read();
   store.update(current.rev, n => {
-    for (const m of n.members) { m.state = 'active'; m.pause = null; }
+    for (const m of n.members.filter(m => m.adapter !== 'kimi-cli')) { m.state = 'active'; m.pause = null; }
     const d = n.members.find(m => m.id === 'deepseek'); d.roles.voter = phase === 'B'; d.roles.receives = phase === 'B';
     if (state) {
       const m = n.members.find(m => m.id === 'antigravity'); m.state = state;

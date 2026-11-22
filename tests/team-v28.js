@@ -12,7 +12,7 @@ const write = (f, s) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs
 const json = (f, v) => write(f, JSON.stringify(v, null, 2));
 const tests = [], test = (name, fn) => tests.push([name, fn]);
 const running = require('../common/access').guestTools;
-const servers = require('../common/members').servers;
+const servers = require('../common/members').installedServers;
 const configs = require('../common/client-configs');
 
 // Как в team-v25 О1: настоящая probeRelease из кода клона, без установки.
@@ -54,9 +54,9 @@ test('О1: ожидаемый список гостя берётся из рел
   assert.equal(marker.commit, id); assert.deepEqual(marker.servers, servers);
   // Проверены все гости из client-configs (CODEX и AGY), а не только codex.
   const guests = calls.filter(c => c[2] === 'full').map(c => c[1] + ':' + c[0]).sort();
-  // Независимый эталон: три гостевых клиента (Codex, Antigravity, DeepSeek) по три сервера связки.
-  assert.deepEqual(guests, ['antigravity:antigravity', 'antigravity:codex', 'antigravity:team', 'codex:antigravity', 'codex:codex', 'codex:team',
-    'deepseek:antigravity', 'deepseek:codex', 'deepseek:team'].sort());
+  // Независимый эталон: три гостевых клиента и четыре установленных сервера A, включая Kimi на паузе.
+  assert.deepEqual(guests, ['antigravity', 'codex', 'deepseek'].flatMap(client =>
+    ['team', 'codex', 'antigravity', 'kimi'].map(server => client + ':' + server)).sort());
 });
 
 test('О2: лишний или недостающий инструмент гостя — отказ, метки нет', async () => {
@@ -128,8 +128,10 @@ test('О5: чужая отметка готовности (grok) — справ�
   for (const s of servers) json(path.join(st, 'ready', s + '.json'), { release: rel });
   json(path.join(st, 'ready', 'grok.json'), { release: path.join(root, 'live', 'c'.repeat(40)) });
   const drift = require('../common/release-drift');
-  let rows = drift.lines(root, st);
+  // team-v60: перечень устаревших отметок — в full; краткая сводка показывает их число.
+  let rows = drift.lines(root, st, { full: true });
   assert(rows.includes('Устаревшая отметка готовности: grok.json'), rows.join('\n'));
+  assert(drift.lines(root, st).includes('устаревших отметок готовности: 1 — full=true'), drift.lines(root, st).join('\n'));
   assert(!rows.some(r => /Серверы запущены не из записанной установки/.test(r)), rows.join('\n'));
   json(path.join(st, 'ready', 'codex.json'), { release: path.join(root, 'live', 'd'.repeat(40)) });
   rows = drift.lines(root, st);

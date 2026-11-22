@@ -15,7 +15,7 @@ function target(call) {
     const tools = name === 'call_mcp_tool' ? [args.toolName, args.tool_name, args.tool].filter(x => x !== undefined) : [name];
     // Прежний вид вызова: сервер не указан, а имя инструмента начинается с team_/codex_.
     if (!servers.length && name === 'call_mcp_tool' && tools.length === 1) {
-      const pref = String(tools[0]).match(/^(team|codex|grok|deepseek|claude)_/);
+      const pref = String(tools[0]).match(/^(team|codex|grok|deepseek|claude|kimi)_/);
       if (pref) servers.push(pref[1]);
     }
     if (!servers.length || !tools.length || new Set(servers).size !== 1 || new Set(tools).size !== 1) return null;
@@ -30,7 +30,7 @@ function target(call) {
     name.match(/^([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_.-]+)$/);
   if (m) return { server: m[1], tool: m[2], args };
   // Прежние имена без сервера: team_status, codex_send и т.п.
-  const bare = name.match(/^(team|codex|grok|deepseek|claude)_([a-z0-9_]+)$/);
+  const bare = name.match(/^(team|codex|grok|deepseek|claude|kimi)_([a-z0-9_]+)$/);
   return bare ? { server: bare[1], tool: name, args } : null;
 }
 // team-v48e Г4e: вторая маска (пишущий codex/deepseek_send, team_work-изменение, deepseek_cancel, team_status usage) снята
@@ -52,7 +52,7 @@ function forbidden(calls) {
     if (allowed(c)) return false;
     const name = c?.name || c?.tool || c?.function?.name || '';
     if (typeof name !== 'string' || !name) return true;
-    return /mcp|list_resources|read_resource|\/|team_|codex_|antigravity_|grok_|deepseek_|claude_|write|replace|run_command|execute|delete|create|edit|terminal|shell|move|rename|subagent|manage_task/i.test(name);
+    return /mcp|list_resources|read_resource|\/|team_|codex_|antigravity_|grok_|deepseek_|claude_|kimi_|write|replace|run_command|execute|delete|create|edit|terminal|shell|move|rename|subagent|manage_task/i.test(name);
   });
 }
 function instruction() {

@@ -177,18 +177,24 @@ test('D5: уведомления об ожидании, продолжении, 
   n.transition('Codex',{status:'running'},{id:'write',status:'needs_decision',retryKind:'quota'});
   const out=fs.readFileSync(path.join(RUN,'notifications.jsonl'),'utf8');for(const text of ['Codex ждёт квоту','Codex продолжил поручение quota','Решение за Claude','с записью остановлено'])assert(out.includes(text));
 });
-test('E1: ограничения до исполнения',async()=>{
+test('E1: чат участника — полный доступ; ограничивают лишь дисциплина содержания и поручение (team-v58)',async()=>{
+  const access=require('../common/access');
   process.env.MOST_CLIENT='codex';
-  assert.throws(()=>require('../common/access').guard('team','team_status',{notify_test:true}),/Гостю/);
-  await assert.rejects(t.change({action:'start',name:'guest',request,design_file:design}),/Гостю/);
-  // team-v48e Г4b: блок изменений гостю снят безусловно (тумблер MOST_GUEST_STRICT удалён) — team_work create от гостя
-  // проходит гейт гостя и проверку редакции и доходит до той же дисциплины содержания, что и у любого клиента
-  // (цель/критерий/этапы/следующий шаг), без отказа «Гостю…». Папка работы при этом не создаётся.
-  await assert.rejects(
-    t.work({ owner: 'test-owner', action: 'create', name: 'guest', expected_revision: 0 }),
-    e => { assert.doesNotMatch(String(e.message), /Гостю/, 'нет отказа гостя'); assert.match(String(e.message), /Укажите цель, критерий завершения/); return true; },
-  );
-  assert(!fs.existsSync(path.join(root,'.work/guest'))); delete process.env.MOST_CLIENT;
+  try {
+    // team-v58: диагностика team_status и team_change открыты чату участника.
+    assert.doesNotThrow(()=>access.guard('team','team_status',{notify_test:true}),'диагностика открыта чату');
+    assert.doesNotThrow(()=>access.guard('team','team_change',{action:'start'}),'team_change start открыт чату');
+    // team_work create от чата проходит гейт доступа и упирается в ту же дисциплину содержания (цель/критерий/этапы/следующий
+    // шаг), что и у любого клиента, без отказа «Гостю…». Папка работы при этом не создаётся.
+    await assert.rejects(
+      t.work({ owner: 'test-owner', action: 'create', name: 'guest', expected_revision: 0 }),
+      e => { assert.doesNotMatch(String(e.message), /Гостю/, 'нет отказа гостя'); assert.match(String(e.message), /Укажите цель, критерий завершения/); return true; },
+    );
+    assert(!fs.existsSync(path.join(root,'.work/guest')));
+    // Поручение-сеанс (в нём человека нет): team_change закрыт.
+    process.env.MOST_JOB_ID='job-1';
+    assert.throws(()=>access.guard('team','team_change',{action:'start'}),/запрещено/,'поручение: team_change закрыт');
+  } finally { delete process.env.MOST_JOB_ID; delete process.env.MOST_CLIENT; }
 });
 test('E1: гостевые списки инструментов, очередь и основной исполнитель обоих мостов',async()=>{
   const {Client}=require('@modelcontextprotocol/sdk/client/index.js');
@@ -205,8 +211,9 @@ test('E1: гостевые списки инструментов, очередь
     }
     try {
       const guest=await connect(who,who==='codex'?'antigravity':'codex');
-      const listed=(await guest.listTools()).tools.map(t=>t.name);assert.deepEqual(listed.sort(),[who+'_send',who+'_status',who+'_result',...(who==='antigravity'?['antigravity_apply']:[])].sort());
-      const forbidden=await guest.callTool({name:who+'_cancel',arguments:{id:'none'}});assert(forbidden.isError);
+      // team-v58: чат участника получает на каждом сервере-участнике полный набор (status/send/result/cancel, +apply у antigravity).
+      const listed=(await guest.listTools()).tools.map(t=>t.name);assert.deepEqual(listed.sort(),[who+'_send',who+'_status',who+'_result',who+'_cancel',...(who==='antigravity'?['antigravity_apply']:[])].sort());
+      const forbidden=await guest.callTool({name:who+'_cancel',arguments:{id:'none'}});assert(forbidden.isError); // поручения none нет — отказ по отсутствию карточки, не по праву
       // team-v48e Г4c: прежний запрет записи гостю снят безусловно (тумблер MOST_GUEST_STRICT удалён) — positive-кейс «гость пишет»
       // проверяется в team-v22-full-access/team-v25; здесь не ставим write:true, чтобы не плодить задание в той же папке.
       const out=await guest.callTool({name:who+'_send',arguments:{folder,task:'[[FAKE:accept]] Проверка',role:'совет',stage:'Этап',work:'work',owner:'test-owner',...(who==='antigravity'?{mode:'text'}:{write:'false'})}});
@@ -214,7 +221,7 @@ test('E1: гостевые списки инструментов, очередь
       const id=text.match(/Номер поручения: (\S+)/)[1];
       write(path.join(folder,'_antigravity_result.txt'),'ЧУЖОЙ ЧЕРНОВИК');
       const file=who==='codex'?path.join(state,'codex-jobs',id+'.json'):path.join(state,'jobs',id,'card.json');
-      await new Promise(r=>setTimeout(r,150));assert.equal(read(file).status,'queued');assert(!fs.existsSync(path.join(state,'ready',who+'.json')));
+      await new Promise(r=>setTimeout(r,150));assert.equal(read(file).status,'queued');assert(fs.existsSync(path.join(state,'ready',who+'.json'))); // team-v62: team-v58 (task10 г) — готовность пишет КАЖДЫЙ сервер моста, даже запущенный не-Claude (гостевым) клиентом
       const queued=await guest.callTool({name:who+'_result',arguments:{id,wait_sec:'0',from_char:'0'}});assert.match(queued.content[0].text,/выполнит основной сервер/);assert(!queued.content[0].text.includes('undefined'));
       // team-v48e Г4c: прежняя переменная MOST_GUEST_STRICT удалена из кода — выставляем её в окружении основного исполнителя,
       // чтобы показать, что она не влияет ни на исполнение гостевого поручения, ни на перенос результата (apply).
@@ -230,10 +237,11 @@ test('E1: гостевые списки инструментов, очередь
       }
       assert.equal(read(path.join(state,'ready',who+'.json')).release,path.resolve(__dirname,'..'));
       const result=await guest.callTool({name:who+'_result',arguments:{id}});assert.match(result.content[0].text,/Принято 100 %/);
-      const team=await connect('team','codex');const teamTools=(await team.listTools()).tools;assert.deepEqual(teamTools.map(t=>t.name).sort(),['team_ask','team_ask_result','team_rules','team_status','team_word','team_work']);
+      // team-v58: чат участника получает полный набор дирижёра на team (все девять инструментов); диагностика открыта.
+      const team=await connect('team','codex');const teamTools=(await team.listTools()).tools;assert.deepEqual(teamTools.map(t=>t.name).sort(),['team_ask','team_ask_result','team_change','team_inbox','team_members','team_rules','team_scenario','team_status','team_work','team_word'].sort());
       assert(teamTools.find(t=>t.name==='team_work').inputSchema.properties.stages.items.properties.closes);
-      assert((await team.callTool({name:'team_status',arguments:{notify_test:true}})).isError);
-      assert((await team.callTool({name:'team_work',arguments:{owner: 'test-owner', action: 'create',name:'no'}})).isError);
+      assert(!(await team.callTool({name:'team_status',arguments:{notify_test:true}})).isError,'диагностика открыта чату участника');
+      assert((await team.callTool({name:'team_work',arguments:{owner: 'test-owner', action: 'create',name:'no'}})).isError); // дисциплина содержания — отказ (не по праву)
     } finally {for(const c of clients.reverse())await c.close();}
   }
 });
@@ -270,13 +278,13 @@ test('E3–E4: deploy обновляет три приложения; повто
   const previous = path.join(root, 'live', 'd'.repeat(40));
   for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js'])
     write(path.join(previous, 'common', name), fs.readFileSync(path.join(__dirname, '..', 'common', name)));
-  for (const name of require('../common/members').servers) write(path.join(previous, 'servers', name, 'index.js'), '// прежний сервер');
+  for (const name of require('../common/members').installedServers) write(path.join(previous, 'servers', name, 'index.js'), '// прежний сервер');
   json(claude, d.configFor({ foreign: 456 }, previous, root));
   const before=[codex,agy,permissions,claude].map(f=>fs.readFileSync(f,'utf8')), calls=[];
-  const deps={archive:async(root,commit,temp)=>{for(const n of ['team','codex','antigravity','claude'])write(path.join(temp,'servers',n,'index.js'),'// подделка');write(path.join(temp,'common','access.js'),fs.readFileSync(path.join(__dirname,'..','common','access.js')));
+  const deps={archive:async(root,commit,temp)=>{for(const n of ['team','codex','antigravity','claude','kimi'])write(path.join(temp,'servers',n,'index.js'),'// подделка');write(path.join(temp,'common','access.js'),fs.readFileSync(path.join(__dirname,'..','common','access.js')));
   for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(temp, 'common', name), fs.readFileSync(path.join(path.join(__dirname, '..'), 'common', name))); /* реестр кандидата А *//* team-v28 Р1 */},install:async()=>{},probe:async(file,env)=>{calls.push(env.MOST_CLIENT);return {tools:(env.MOST_CLIENT==='claude'?[]:require('../common/access').guestTools(path.basename(path.dirname(file)),env.MOST_CLIENT)).map(name=>({name}))};}};
   try {
-    await d.deploy({root,stateDir:path.join(RUN,'deploy-state')},deps);assert.equal(calls.length, 4 * (1 + require('../common/member-clients').all().length)); // team-v46: четыре сервера (добавлен claude)
+    await d.deploy({root,stateDir:path.join(RUN,'deploy-state')},deps);assert.equal(calls.length, require('../common/members').serversForInstall(require('../common/members-store').create(path.join(root, 'state')).read()).length * (1 + require('../common/member-clients').all().length));
     const after=[codex,agy,permissions,claude].map(f=>fs.readFileSync(f,'utf8'));assert(after[0].startsWith(before[0]));
     assert.equal(read(agy).foreign,123);assert.equal(read(claude).foreign,456);assert.equal(read(claude).mcpServers.team.env.MOST_STATE_DIR,read(agy).mcpServers.team.env.MOST_STATE_DIR);
     assert.equal(read(claude).mcpServers.team.env.MOST_STATE_DIR,path.join(root,'state'));
@@ -292,11 +300,12 @@ test('E3–E4: deploy обновляет три приложения; повто
 test('F1–F3: готовность, сценарий всех серверов и подтверждение запуска',async()=>{
   require('../common/access').ready('team'); assert.equal(read(path.join(process.env.MOST_STATE_DIR,'ready/team.json')).pid,process.pid);
   const restart=require('../common/restart'); const text=restart.script({runId:'test',log:'log',release:root,state:RUN});
-  for(const part of ["@('team', 'codex', 'antigravity')",'startedAt','AddSeconds(300)','CloseMainWindow','Start-Sleep -Seconds 8','if (-not (Get-Process']) assert(text.includes(part));
+  for(const part of ['@(' + require('../common/members').installedServers.map(n => "'" + n + "'").join(', ') + ')','startedAt','AddSeconds(300)','CloseMainWindow','Start-Sleep -Seconds 8','if (-not (Get-Process']) assert(text.includes(part));
   const out=await restart.restart({root,release:root,state:path.join(RUN,'restart-isolated')},{launch:async(file,{log,runId})=>write(log,'запущен '+runId+'\n')});assert.match(out,/Перезапуск Claude запланирован/);
   await assert.rejects(restart.restart({root,release:root,state:RUN},{waitMs:30,launch:async(file,{log})=>write(log,'запущен старый-запуск\n')}),/не подтверждён/);
   assert.match(restart.launchCommand('C:\\x.ps1'),/-ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\\x\.ps1"/);
-  process.env.MOST_CLIENT='codex';require('../common/access').ready('guest');assert(!fs.existsSync(path.join(process.env.MOST_STATE_DIR,'ready/guest.json')));delete process.env.MOST_CLIENT;
+  // team-v62: team-v58 (task10 г) — готовность пишет каждый сервер моста, даже у не-Claude (гостевого) клиента; запись НЕ пишет только проба установки (MOST_PROBE_ONLY).
+  process.env.MOST_CLIENT='codex';require('../common/access').ready('guest');assert(fs.existsSync(path.join(process.env.MOST_STATE_DIR,'ready/guest.json')));delete process.env.MOST_CLIENT;
   process.env.MOST_PROBE_ONLY='1';require('../common/access').ready('probe');assert(!fs.existsSync(path.join(process.env.MOST_STATE_DIR,'ready/probe.json')));delete process.env.MOST_PROBE_ONLY;
   assert.match(require('../common/format').format('Команда',{status:'done'}),/^Команда · сводка ·/);
 });

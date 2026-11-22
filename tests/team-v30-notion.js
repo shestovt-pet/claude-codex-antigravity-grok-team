@@ -8,7 +8,7 @@ const a = require('../common/agy-tools'), members = require('../common/members')
 const ALLOW = ['mcp(team/team_status)', 'mcp(team/team_rules)', 'mcp(team/team_work)', 'mcp(codex/codex_status)', 'mcp(codex/codex_result)', 'mcp(codex/codex_send)', 'mcp(notion/*)'];
 const release = path.join(f.root, 'live', 'a'.repeat(40)), base = path.join(f.root, 'live', 'b'.repeat(40));
 f.write(path.join(release, 'common/agy-mcp-permissions.js'), '// поддержка 3.8');
-for (const dir of [release, base]) for (const name of ['team', 'codex', 'antigravity']) f.write(path.join(dir, 'servers', name, 'index.js'), '');
+for (const dir of [release, base]) for (const name of members.installedServers) f.write(path.join(dir, 'servers', name, 'index.js'), '');
 let seq = 0;
 function fixture(config) {
   const file = path.join(f.RUN, 'settings-' + (++seq), 'settings.json');
@@ -105,7 +105,7 @@ cases.push(
     try {
       f.json(config, {});
       for (const target of [base, release, release]) {
-        f.json(path.join(target, 'probe-ok.json'), { commit: path.basename(target), root: f.root, servers: [...members.servers], at: new Date().toISOString() });
+        f.json(path.join(target, 'probe-ok.json'), { commit: path.basename(target), root: f.root, servers: [...members.installedServers], at: new Date().toISOString() });
         const result = await d.configure({ release: target, configs: [config], stateDir: path.join(f.RUN, 'configure-state') });
         assert.match(result, /Конфиги обновлены/);
         if (target === base) assert(!fs.existsSync(x.file));

@@ -34,8 +34,8 @@ let compat, locks, cleanup, deploy, ops, paths;
 const hashes = ['a', 'b', 'c', 'd'].map(c => c.repeat(40));
 function release(hash, root = link, modern = false) {
   const dir = at('live/' + hash);
-  for (const name of ['team', 'codex', 'antigravity', 'grok']) write(path.join(dir, 'servers', name, 'index.js'));
-  json(path.join(dir, 'probe-ok.json'), { commit: hash, root, servers: require('../common/members').servers, at: new Date().toISOString() });
+  for (const name of [...require('../common/members').installedServers, 'grok']) write(path.join(dir, 'servers', name, 'index.js'));
+  json(path.join(dir, 'probe-ok.json'), { commit: hash, root, servers: require('../common/members').installedServers, at: new Date().toISOString() });
   if (modern) write(path.join(dir, 'common/path-compat.js'), '// compatibility contract');
   return dir;
 }
@@ -81,7 +81,7 @@ test('О1, О3: старые deploy/start → новый configure, повтор
   for (let i = 0; i < 2; i++) {
     const result = await oldDeploy.deploy({ root: link, external: true, configs: [config], cleanup: false }, {
       repoLocked: true, archive: async (_root, _id, temp) => {
-        for (const n of ['team', 'codex', 'antigravity', 'grok']) write(path.join(temp, 'servers', n, 'index.js'));
+        for (const n of [...require('../common/members').installedServers, 'grok']) write(path.join(temp, 'servers', n, 'index.js'));
         write(path.join(temp, 'common/path-compat.js'), '// new code');
         write(path.join(temp, 'common/access.js'), fs.readFileSync(path.join(ROOT, 'common/access.js')));
   for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(temp, 'common', name), fs.readFileSync(path.join(ROOT, 'common', name))); /* реестр кандидата А */ // team-v28 Р1: есть в каждом релизе
@@ -131,7 +131,7 @@ test('О2: новый установщик впервые собирает и п
   const h = 'f'.repeat(40), git = require('../common/team-git');
   const builder = oldModule('deploy', { './team-git': { ...git, repository: () => {}, hash: () => h } }, true);
   const deps = { repoLocked: true, archive: async (_root, _id, temp) => {
-    for (const n of ['team', 'codex', 'antigravity', 'grok']) write(path.join(temp, 'servers', n, 'index.js'));
+    for (const n of [...require('../common/members').installedServers, 'grok']) write(path.join(temp, 'servers', n, 'index.js'));
     write(path.join(temp, 'common/access.js'), fs.readFileSync(path.join(ROOT, 'common/access.js')));
   for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(temp, 'common', name), fs.readFileSync(path.join(ROOT, 'common', name))); /* реестр кандидата А */ // team-v28 Р1: есть в каждом релизе
   }, install: async () => {}, probe: async () => ({}) };
@@ -140,7 +140,7 @@ test('О2: новый установщик впервые собирает и п
   assert.equal(marker.root, real); assert.equal(compat.releasePolicy(real, rel).oldCode, true);
   json(path.join(rel, 'probe-ok.json'), { ...marker, servers: [] });
   await builder.deploy({ root: link, releaseOnly: true }, deps);
-  assert.equal(read(path.join(rel, 'probe-ok.json')).servers.length, 3);
+  assert.deepEqual(read(path.join(rel, 'probe-ok.json')).servers, require('../common/members').installedServers);
   await ops.start({ root: link, release: rel, configs: [] }, { launch: async (_r, args) => {
     const f = args[args.indexOf('--result') + 1]; assert.equal(read(f).noCleanup, true);
     assert.equal(read(f).root, real); oldModule('deploy-ops').assertIdle(real, f);
@@ -186,11 +186,10 @@ test('О5: живые поручения в корне/подпапке, про�
       assert.equal(keep(r, clone).code, 'process_busy'); assert(!removal(r, tmp));
       assert.match(cleanup.tmpWhy(deps, clone, '.tmp-old'), /PID 87/);
     }
-    // Клон сохранён из-за правки; процесс появился только перед повторной проверкой подпапки.
-    let rows = [];
-    const deps = cleanDeps({ processes: () => rows, git: (_p, a) => a[0] === 'status' ? ' M notes.md' : a[0] === 'rev-parse' ? hashes[0] : '' });
-    const r = cleanup.cleanup({ root: real }, deps), candidate = removal(r, tmp); assert(candidate);
-    rows = [process]; assert.match(candidate.recheck(), /PID 87/);
+    // team-v58 (task5 п.2): временные папки tests\.tmp-* внутри СОХРАНЁННОГО клона поштучно не планируются — остаются с клоном.
+    const deps = cleanDeps({ processes: () => [], git: (_p, a) => a[0] === 'status' ? ' M notes.md' : a[0] === 'rev-parse' ? hashes[0] : '' });
+    const r = cleanup.cleanup({ root: real }, deps);
+    assert(!removal(r, tmp), 'tmp не удаляется поштучно'); assert(keep(r, clone), 'клон с правкой сохранён целиком (вместе с tmp)');
   }
   for (const processes of [() => { throw Error('нет доступа'); }, () => [{ pid: 1, cmd: 'ok' }, { pid: 2, cmd: null, exe: process.execPath }]]) {
     const r = cleanup.cleanup({ root: real }, cleanDeps({ processes }));
@@ -289,12 +288,13 @@ test('Ревью-2–5: реалистичные процессы, свобод�
       assert.equal(cleanup.cleanupText(r).split('не проверено процессов со скрытыми сведениями: 3').length, 2);
       const dirty = { ...deps, git: (_p, a) => a[0] === 'status' ? ' M notes.md' : a[0] === 'rev-parse' ? hashes[0] : '' };
       calls = 0; const r2 = cleanup.cleanup({ root: real }, dirty);
-      assert(keep(r2, clone)); assert(removal(r2, tmp)); assert(removal(r2, free)); assert.equal(calls, 1);
+      // team-v58 (task5 п.2): клон с правкой сохранён целиком; tmp внутри него поштучно НЕ удаляется; свободный релиз удаляется.
+      assert(keep(r2, clone)); assert(!removal(r2, tmp)); assert(removal(r2, free)); assert.equal(calls, 1);
       // Удаление только перехватывается: файлов теста не удаляем.
       calls = 0; const deleted = [];
       await patched(fs, 'rmSync', p => deleted.push(p), () => {
         const applied = cleanup.cleanup({ root: real, apply: true }, { ...dirty, logFile: at('test-cleanup-log.jsonl') });
-        assert.equal(calls, 2); assert(deleted.includes(tmp)); assert(deleted.includes(free));
+        assert.equal(calls, 2); assert(!deleted.includes(tmp)); assert(deleted.includes(free));
         assert.equal(applied.plan.uncheckedHiddenProcesses, 3);
         assert.match(ops.cleanupLine({ state: 'готово', removed: 0, failed: 0, uncheckedHiddenProcesses: 3 }), /не проверено процессов со скрытыми сведениями: 3/);
       });
@@ -391,9 +391,9 @@ test('О6: PowerShell получает физический релиз, JS уз�
     assert(fs.readFileSync(file, 'utf8').includes("$release = '" + at('live/' + hashes[3]) + "'"));
     write(info.log, 'итог ' + info.runId + ' True\n');
     json(info.result, { runId: info.runId, release: alias('live/' + hashes[3]), success: true, startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:02Z' });
-    for (const name of ['team', 'codex', 'antigravity', 'grok']) json(at('state/ready/' + name + '.json'), { release: alias('live/' + hashes[3]), startedAt: '2026-01-01T00:00:01Z', pid: process.pid });
+    for (const name of [...require('../common/members').installedServers, 'grok']) json(at('state/ready/' + name + '.json'), { release: alias('live/' + hashes[3]), startedAt: '2026-01-01T00:00:01Z', pid: process.pid });
   }, alive: () => true });
-  assert.equal(out.ready.length, 3);
+  assert.equal(out.ready.length, require('../common/members').installedServers.length);
 });
 test('О7–О9: равенство/сводка, реальные отличия, ошибки раскрытия', async () => {
   const drift = require('../common/release-drift');
@@ -546,8 +546,9 @@ test('О13: весь Team.cleanup сухой — ноль попыток зап�
   const old = new Date(0);
   for (const p of [at('live/.archive-race.tar'), at('temp/most-part2-race/a')]) write(p);
   fs.utimesSync(at('live/.archive-race.tar'), old, old); fs.utimesSync(at('temp/most-part2-race'), old, old);
-  const cases = [['readdirSync', at('live')], ['readdirSync', at('.work')], ['readdirSync', at('.work/merged/tests')], ['readdirSync', at('temp')],
-    ['lstatSync', at('live/.archive-race.tar')], ['lstatSync', at('.work/merged')], ['lstatSync', at('.work/merged/tests/.tmp-old')], ['lstatSync', at('temp/most-part2-race')],
+  // team-v58 (task5 п.2): tests\.tmp-* внутри клона больше не перечисляются поштучно — соответствующие случаи гонки сняты.
+  const cases = [['readdirSync', at('live')], ['readdirSync', at('.work')], ['readdirSync', at('temp')],
+    ['lstatSync', at('live/.archive-race.tar')], ['lstatSync', at('.work/merged')], ['lstatSync', at('temp/most-part2-race')],
     ['readFileSync', at('state/team/changes/merged.json')]];
   for (const [method, target] of cases) {
     const original = fs[method]; let hit = false;

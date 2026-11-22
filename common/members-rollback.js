@@ -10,6 +10,8 @@ function changes(state) {
 }
 function blockers(state, releases) {
   const entries = changes(state);
+  if (require('./members-kimi').recorded(state) && (!releases.length || releases.some(r => !require('./members-kimi').compatible(r))))
+    return ['Журнал содержит kimi-cli: возврат на старый код запрещён; только исправление вперёд или аварийная пауза Kimi тем же новым кодом.'];
   if (!entries.length) return [];
   if (releases.length && releases.every(r => fs.existsSync(path.join(r, 'common', 'members-store.js')))) return [];
   return entries.map(e => 'members.json: phase ' + e.phase + ', rev ' + e.rev);

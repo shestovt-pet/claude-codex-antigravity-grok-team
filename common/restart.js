@@ -101,10 +101,14 @@ function launchCommand(file) {
 function cleanEnv(base = process.env) {
   return Object.fromEntries(Object.entries(base).filter(([k]) => !/^MOST_/i.test(k)));
 }
-async function restart({ root, release, state, id, waitCompletion = false, close = true }, deps = {}) {
+async function restart({ root, release, state, id, waitCompletion = false, close = true, word, wordListHash, wordList }, deps = {}) {
   root = realOrGiven(root); release = realOrGiven(release); state ||= path.join(root, 'state');
   const runId = randomUUID(), folder = path.join(root, 'live/restart'), file = path.join(folder, runId + '.ps1'), log = path.join(folder, runId + '.log');
   const result = log + '.json', env = cleanEnv(), hold = require('./restart-hold');
+  // team-v57 (ред.7): слово пользователя, пришедшее из операции установки, перекрывает ВСЕ проверки на пути установки, включая
+  // эту защиту от обрыва поручений перед закрытием Claude. С непустым словом ранняя проверка live-jobs.running перезапуск НЕ
+  // отменяет (идущие поручения уже показаны пользователю и перекрыты его словом в overriddenByWord барьера установки).
+  const overridden = typeof word === 'string' && word.trim() !== '';
   let pause, launchConfirmed = false;
   const confirmLaunch = () => {
     try {
@@ -115,7 +119,28 @@ async function restart({ root, release, state, id, waitCompletion = false, close
   const planned = () => (close ? 'Перезапуск' : 'Запуск') + ' Claude запланирован (' + runId + '): итог — уведомлением Windows и в ' + log;
   if (close) {
     pause = await hold.begin(state, { runId, id: id || runId }, deps.hold || {});
-    try {
+    // team-v57 (task9 п.1, ревью Codex 2/Kimi 2): слово снимает проверку идущих поручений только для поручений из
+    // утверждённого списка. Когда вместе со словом пришёл утверждённый отпечаток (wordListHash), под уже взятой паузой
+    // (holdFile записан — новые поручения restart-hold.admit не пускает) список собирается заново и сверяется: при
+    // расхождении (появилось поручение, которого пользователь не видел) — отказ с новым списком, перезапуск не идёт.
+    if (overridden && typeof wordListHash === 'string' && wordListHash) {
+      const kimi = require('./members-kimi');
+      const b2 = kimi.installationBlockers(state, deps.bootAt ? { bootAt: deps.bootAt } : {});
+      const h2 = kimi.listHash(b2);
+      // §5.1 (team-v58): сверка нужна ТОЛЬКО при непустых находках свежего списка. Если к перезапуску все утверждённые
+      // поручения завершились (находок нет) — перезапуск НЕ отказывает, даже если отпечаток отличается от утверждённого.
+      const findings = b2.running.length + b2.blockers.length + b2.passedByCardWord.length + b2.passedByReboot.length;
+      // Сравнение не по полному равенству отпечатка, а по НОВЫМ записям (которых не было в утверждённом списке): пропавшие
+      // (завершившиеся) записи отказа не дают. wordList — утверждённый список из записи операции; без него (запас) —
+      // расхождение отпечатка при непустых находках считается новой записью, чтобы не ослабить защиту.
+      const newcomers = findings ? (wordList ? kimi.newRecords(b2, wordList) : (h2 !== wordListHash ? [...b2.running.map(r => r.who + ' ' + r.id), ...b2.blockers] : [])) : [];
+      if (newcomers.length) {
+        const cancelled = await hold.abort(state, pause, deps.hold || {});
+        // В отказе — новые записи, новый полный список и его отпечаток (refusalText-подобно): дайте слово заново по новому списку.
+        throw Object.assign(Error('Настройки переключены, Claude не перезапущен: список установки пополнился с момента показа — новые записи: ' + newcomers.join('; ') +
+          '.\nНовый полный список:\n' + kimi.listText(b2) + '\nОтпечаток списка (list_hash): ' + h2 + '.\nДайте слово заново по новому списку.'), { restartNotStarted: cancelled, restartStarted: !cancelled });
+      }
+    } else if (!overridden) try {
       const live = await (deps.running || require('./live-jobs').running)({ stateDir: state });
       if (live.length) throw Error('идут поручения ' + require('./live-jobs').describe(live));
     } catch (e) {

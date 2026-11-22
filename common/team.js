@@ -9,6 +9,8 @@ const { format, duration } = require('./format');
 const participants = require('./members').ids;
 const sha = value => require('crypto').createHash('sha256').update(value).digest('hex');
 const requestText = c => c.request ? 'Запрос пользователя ' + c.requestMark + ':\n' + c.request + (c.fast ? '\nМалая правка, карточка sha256 ' + c.cardHash + ':\n' + c.note + '\nМалая ли правка — обязательный вопрос ревью.\n' : '\nЗамысел: ' + c.designFile + ', sha256 ' + c.designHash + '\n') : 'запрос не сохранён (изменение начато до ворот запроса)\n';
+// team-v62: к отказу ворот малой правки добавляем, что слово владельца (quote) снимает его.
+const fastWordHint = msg => msg.replace(/(team_change start без fast)\.?$/, '$1 либо передайте слово владельца параметром quote.');
 function refreshDesign(c) {
   if (!c.request || c.fast) return;
   const current = sha(fs.readFileSync(c.designFile));
@@ -211,8 +213,10 @@ class Team {
         );
       if (a.action === 'close' && a.quote !== undefined) {
         const access = require('./access');
-        if (process.env.MOST_JOB_ID || access.client() !== 'claude' || access.guest() || require('./user-word').mode().active)
-          throw Error('Закрытие словом разрешено только чату Claude в основном режиме; из гостя и поручения запрещено.');
+        // team-v59: закрытие работы словом владельца — из ДОКАЗАННОГО чата любого участника связки и в запасном режиме
+        // (прежде только чат Claude в основном режиме). Из поручения и недоказанного сеанса — отказ (границу держит chatSession).
+        if (!access.chatSession())
+          throw Error('Закрытие работы словом принимает доказанный чат участника; из поручения и недоказанного сеанса запрещено.');
         if (typeof a.quote !== 'string' || !a.quote.trim()) throw Error('нужно слово пользователя дословно');
         if (Object.keys(a).some(k => !['action', 'name', 'owner', 'expected_revision', 'quote'].includes(k) && a[k] !== undefined))
           throw Error('закрытие словом не меняет план');
@@ -437,19 +441,44 @@ class Team {
   }
   async changeInner(a) {
     require('./access').guard('team', 'team_change', a);
-    if (['design', 'verdict'].includes(a.action)) {
-      const target = ['claude', 'user'].includes(a.who) && a.replaces ? a.replaces : a.who;
-      if (!['grok', 'user'].includes(target)) require('./members').assertAvailable(target);
+    // team-v59: слово владельца (who=user) закрывает место при любом состоянии участника — доступность/пригодность
+    // заменяемого не проверяется (участник мог не отвечать, быть на паузе или удалён). Для прочих — прежняя проверка.
+    if (['design', 'verdict'].includes(a.action) && a.who !== 'user') {
+      const target = a.who === 'claude' && a.replaces ? a.replaces : a.who;
+      if (target !== 'grok') require('./members').assertAvailable(target);
+      if (require('./members').adapterOf(target) === 'kimi-cli') require('./kimi-review').eligibility(target);
     }
     if (a.name && ['commit', 'merge', 'deploy'].includes(a.action)) {
       const change = read(this.changeFile(a.name));
       if (change.work) require('./work-owner').check(read(this.workFile(change.work)), a.owner);
     }
     if (a.action === 'deploy') {
-      if (a.restart_claude) {
-        const live = await require('./live-jobs').running({ stateDir: path.dirname(this.state) });
-        if (live.length) throw Error('Установка с перезапуском Claude не начата: перезапуск оборвёт идущие поручения — ' + require('./live-jobs').describe(live) + '. Дождитесь их окончания и повторите. Без перезапуска (restart_claude=false) настройки переключатся, а новые серверы заработают после следующего перезапуска Claude.');
-      }
+      // team-v57 (ред.7): слово пользователя перекрывает ВСЕ проверки на пути установки. Прежняя РАННЯЯ проверка идущих
+      // поручений при restart_claude (live-jobs.running, не глядя на слово) снята: идущие поручения уже входят в список
+      // deployGate (INSTALL_BLOCKING), и его единый отпечаток связывает слово с тем, что видел пользователь. Без слова —
+      // отказ с полным списком и отпечатком (тем же, что у основного барьера); со словом и верным отпечатком — не отказ,
+      // идущие поручения перечислены в overriddenByWord и в итоговом сообщении, а restart их не отменяет (слово из операции).
+      // team-v57 (ред.8): владелец моста управляет консилиумом из любого участника — слово пользователя для установки
+      // принимается из его чата в ЛЮБОМ участнике связки (claude, codex, antigravity, deepseek, kimi) и в запасном
+      // режиме. channel — имя клиента-участника, из чьего чата пришло слово. Отказ — ТОЛЬКО для поручения (в поручении
+      // пользователя нет, там пишет помощник): задан MOST_JOB_ID либо клиент-исполнитель job / claude-print.
+      // team-v57 (ред.8, task8 п.1): признак поручения проверяется ПЕРВЫМ и НЕ зависит от режима (в том числе запасного).
+      // Задан MOST_JOB_ID, либо клиент-исполнитель job / claude-print → в поручении пользователя нет (там пишет помощник):
+      // слово для установки не принимается и team_change deploy недоступен. Это дублирует access.allowed/jobSession как
+      // защита в глубину, до сбора списка и до любой проверки режима/отпечатка. channel — имя клиента-участника чата.
+      const access = require('./access');
+      const channel = access.client();
+      if (!!process.env.MOST_JOB_ID || channel === 'job' || channel === 'claude-print')
+        throw Error('Установка (team_change deploy) из поручения недоступна: в поручении пользователя нет, его слово оттуда не принимается.');
+      // team-v57 (ред.8): целевой коммит должен уже находиться в принятой main — проверяем ДО сбора списка установки, чтобы
+      // неверный коммит отклонялся сразу (как в базе), а список установки и слово собирались только для годного коммита.
+      // Авторитетная повторная проверка — под замком репозитория ниже.
+      git(this.root, ['merge-base', '--is-ancestor', hash(this.root, a.commit || 'main', (r, args) => git(r, args, { recoverIndex: false })), 'main']);
+      const gate = require('./members-kimi').deployGate(path.dirname(this.state), { quote: a.quote, listHash: a.list_hash, channel });
+      let installWord, installChannel, installListHash;
+      if (gate.refusal) return gate.refusal;
+      // team-v57 (task9 п.1): утверждённый отпечаток идёт вместе со словом в запись операции и сверяется барьером установки.
+      if (gate.word) { installWord = gate.word; installChannel = gate.channel; installListHash = gate.listHash; }
       const pending = require('./deploy-ops').list(this.root).find(op => !require('./deploy-ops').terminal.includes(op.status));
       if (pending) throw Error('Идёт установка ' + pending.id);
       let deployedCommit = null;
@@ -472,12 +501,16 @@ class Team {
         for (const work of new Set(linked)) require('./work-owner').touch(work, a.owner, this.root);
         // Коммит должен уже находиться в принятой main.
         git(this.root, ['merge-base', '--is-ancestor', commit, 'main']);
-        return deployer.deploy({ root: this.root, commit, external: true, restartClaude: a.restart_claude, cleanup: a.cleanup !== false }, { repoLocked: true });
+        return deployer.deploy({ root: this.root, commit, external: true, restartClaude: a.restart_claude, cleanup: a.cleanup !== false, word: installWord, wordChannel: installChannel, wordListHash: installListHash }, { repoLocked: true });
       });
       // team-v19 К12: гости старых релизов в открытых Codex и Antigravity — одной строкой отчёта.
       let stale = '';
       try { stale = require('./client-configs').staleGuests({ root: this.root, release: deployedCommit }, this.staleDeps || {}); } catch {}
-      const out = deployed + (stale ? '\n' + stale : '');
+      // team-v58-any-chat (часть Д, task7): итог установки про чат Kimi — «подключён: <путь>» (путь нашёлся сам) либо
+      // «не подключён: …» предупреждением (не задан путь настроек или нет домашней папки kimi-code). Установка не падает.
+      let kimiNote = '';
+      try { kimiNote = [...require('./client-configs').connected(), ...require('./client-configs').warnings()].join('\n'); } catch {}
+      const out = deployed + (stale ? '\n' + stale : '') + (kimiNote ? '\n' + kimiNote : '');
       // team-v10 Р5: без перезапуска уборку выполняет этот же вызов, уже отпустив замок установки;
       // с перезапуском — новый сервер после готовности.
       if (!a.restart_claude && /: завершено\./.test(out)) return out + '\n' + await this.afterDeploy();
@@ -505,6 +538,7 @@ class Team {
         base +
         '\nКандидат: ' +
         p.candidate +
+        '\nДля выбора модели ревью Codex передайте codex_send change=' + a.name + ' и роль «проверка».' +
         '\n' +
         git(p.folder, ['diff', '--no-ext-diff', '--no-textconv', p.c.base + '...HEAD']) +
         '\nНезакоммиченные изменения:\n' +
@@ -586,6 +620,21 @@ class Team {
       if (['design', 'verdict'].includes(a.action) && a.who === 'grok') throw Error(require('./members').grokDisabled);
       if (a.action === 'design') {
         if (!c.request) throw Error('В старом изменении запрос и замысел не сохранены.');
+        if (a.who === 'user') {
+          // team-v59: слово владельца закрывает голос за замысел (replaces=<участник>|claude|all) на текущий designHash.
+          const replaces = a.replaces || 'all';
+          if (!['all', 'claude', ...require('./members').knownSeatIds].includes(replaces) || !a.quote?.trim())
+            throw Error('Решение пользователя по замыслу требует цитаты (quote) и replaces=<участник>|claude|all.');
+          const rec = await require('./owner-word').override('team_change.design', a.quote, { replaces, phase: 'design', change: a.name, designHash: c.designHash });
+          (c.decisions ||= []).push({ kind: 'owner_word', phase: 'design', replaces, designHash: c.designHash, quote: a.quote, word_id: rec.id, at: new Date().toISOString() });
+          c.designVotes ||= [];
+          c.designVotes.push({ who: 'user', replaces, decision: 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ', quote: a.quote, designHash: c.designHash, word_id: rec.id });
+          save(this.changeFile(a.name), c);
+          const names = require('./members').names;
+          const list = replaces === 'all' ? 'все обязательные голоса за замысел' : 'место ' + (names[replaces] || replaces);
+          return require('./owner-word').riskLine('замысел принят без голоса участника.') + '\n' +
+            'Закрыто словом владельца: ' + list + ' для замысла ' + c.designHash.slice(0, 8) + ' (слово ' + rec.id + '). Голос участника не требуется.';
+        }
         if (!['ПРИНЯТО', 'НЕ ПРИНЯТО'].includes(a.decision)) throw Error('Неизвестный вердикт замысла.');
         if (a.who === 'claude') {
           if (a.decision !== 'ПРИНЯТО' || !require('./members').seatIds.includes(a.replaces) || !a.note?.trim() ||
@@ -605,10 +654,25 @@ class Team {
       if (a.action === 'commit') {
         // team-v18 К3: места Codex и Antigravity — одной функцией с verdict, merge и precheck.
         const seats = require('./team-seats');
-        if (!c.fast && c.request && seats.SEATS.some(who => !seats.seat(c, who, 'design').closed)) throw Error('Сначала ворота замысла: нужно ПРИНЯТО от Codex и Antigravity по замыслу ' + c.designHash +
+        // team-v61 (п.8): слово владельца в commit (параметр quote). Слово владельца главнее правил моста: commit проходит без
+        // ворот замысла и без голосов, риск (нет ревью/голосов) называется в ответе, дословная цитата хранится в карточке
+        // (owner_word в c.decisions + вердикт who=user). Сам git-commit делается как обычно.
+        const commitQuote = typeof a.quote === 'string' && a.quote.trim() ? a.quote.trim() : null;
+        // team-v62: слово владельца (quote сейчас или уже записанное по изменению) главнее правил моста, в т.ч. границы малой правки.
+        const ownerWordKnown = !!commitQuote || (c.decisions || []).some(d => d.kind === 'owner_word');
+        if (!commitQuote && !c.fast && c.request && seats.SEATS.some(who => !seats.seat(c, who, 'design').closed)) throw Error('Сначала ворота замысла: нужно ПРИНЯТО от Codex и Antigravity по замыслу ' + c.designHash +
           '\n' + require('./precheck').designVoteWarnings(c).map((w) => '- ' + w).join('\n'));
         if (!a.message?.trim()) throw Error('Нужно сообщение коммита.');
-        const fastTree = c.fast ? require('./precheck').checkFast(folder, c.base, undefined, true).tree : null;
+        // team-v62: ворота малой правки (защищённые пути, размер дифа, «не малая правка») снимаются словом владельца; без слова — прежний отказ с подсказкой про quote.
+        let fastTree = null, fastRisk = null;
+        if (c.fast) {
+          try { fastTree = require('./precheck').checkFast(folder, c.base, undefined, true).tree; }
+          catch (e) {
+            if (!ownerWordKnown) throw Error(fastWordHint(e.message));
+            fastRisk = e.message.replace(/^не малая правка — нужен замысел: /, '').replace(/; team_change start без fast\.?$/, '');
+            fastTree = require('./fingerprint').fingerprint(folder, undefined, true);
+          }
+        }
         const self = this.precheck(p);
         // Отпечаток прогона Grok (team-v9 Р1): кандидат должен совпасть с проверенным содержимым.
         if (a.fingerprint) {
@@ -623,8 +687,18 @@ class Team {
         else c.candidateDesignHash = c.designHash;
         c.verdicts = [];
         c.status = 'ожидает ревью';
+        let commitWordLine = '';
+        if (commitQuote) {
+          // Слово закрывает места verdict для этой пары (replaces=all) — merge пройдёт без голосов и без замысла.
+          const rec = await require('./owner-word').override('team_change.commit', commitQuote, { replaces: 'all', phase: 'verdict', change: a.name, base: c.base, candidate: c.candidate });
+          (c.decisions ||= []).push({ kind: 'owner_word', phase: 'verdict', replaces: 'all', base: c.base, candidate: c.candidate, quote: commitQuote, word_id: rec.id, at: new Date().toISOString() });
+          c.verdicts.push({ who: 'user', base: c.base, candidate: c.candidate, decision: 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ', replaces: 'all', quote: commitQuote, word_id: rec.id, at: new Date().toISOString() });
+          commitWordLine = require('./owner-word').riskLine('commit словом владельца — без ревью замысла и без голосов участников; код не проходил независимую проверку.') +
+            '\nЗакрыто словом владельца (слово ' + rec.id + '): все обязательные места verdict для пары ' + c.base.slice(0, 8) + '→' + c.candidate.slice(0, 8) + '. merge пройдёт без голосов.\n';
+        }
         save(this.changeFile(a.name), c);
-        return 'Кандидат: ' + c.candidate + '\nБаза: ' + c.base + '\nПрежние вердикты аннулированы.\n' + self;
+        const fastRiskLine = fastRisk ? 'Принято словом владельца: без замысла, без ревью; правка затрагивает ' + fastRisk + '.\n' : '';
+        return 'Кандидат: ' + c.candidate + '\nБаза: ' + c.base + '\nПрежние вердикты аннулированы.\n' + fastRiskLine + commitWordLine + self;
       }
       if (a.action === 'verdict') {
         this.checkPair(a, p);
@@ -632,8 +706,18 @@ class Team {
         if (!['ПРИНЯТО', 'НЕ ПРИНЯТО', 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ'].includes(a.decision))
           throw Error('Неизвестный вердикт.');
         if (a.who === 'user') {
-          if (a.decision !== 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ' || ![...require('./members').seatIds, 'claude'].includes(a.replaces) || !a.quote?.trim())
-            throw Error('Решение пользователя требует точной цитаты и одного заменяемого участника.');
+          // team-v59: слово владельца ЗАКРЫВАЕТ место (replaces=<участник>|claude|all), а не только пишется в историю.
+          const replaces = a.replaces || 'all';
+          if (a.decision !== 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ' || !['all', 'claude', ...require('./members').knownSeatIds].includes(replaces) || !a.quote?.trim())
+            throw Error('Решение пользователя требует точной цитаты (quote) и replaces=<участник>|claude|all.');
+          const rec = await require('./owner-word').override('team_change.verdict', a.quote, { replaces, phase: 'verdict', change: a.name, base: c.base, candidate: p.candidate });
+          (c.decisions ||= []).push({ kind: 'owner_word', phase: 'verdict', replaces, base: c.base, candidate: p.candidate, quote: a.quote, word_id: rec.id, at: new Date().toISOString() });
+          c.verdicts.push({ who: 'user', base: c.base, candidate: p.candidate, decision: a.decision, replaces, quote: a.quote, note: a.note, word_id: rec.id, at: new Date().toISOString() });
+          save(this.changeFile(a.name), c);
+          const names = require('./members').names;
+          const list = replaces === 'all' ? 'все обязательные места (Codex, Antigravity, Claude)' : 'место ' + (names[replaces] || replaces);
+          return require('./owner-word').riskLine('слияние без голоса участника — код мог не пройти независимую проверку.') + '\n' +
+            'Закрыто словом владельца: ' + list + ' для пары ' + c.base.slice(0, 8) + '→' + p.candidate.slice(0, 8) + ' (слово ' + rec.id + '). Голос участника не требуется.';
         } else {
           if (!participants.includes(a.who) || a.decision === 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ')
             throw Error('Неверный участник или вид решения.');
@@ -644,7 +728,7 @@ class Team {
             systemic(c, a.who, a.job_id, j.reviewText);
           }
         }
-        const target = a.who === 'user' ? a.replaces : a.who;
+        const target = a.who;
         // team-v18 К3: история записей места хранится целиком; новая запись прежнюю не удаляет.
         c.verdicts.push({
           who: a.who,
@@ -658,7 +742,6 @@ class Team {
           at: new Date().toISOString(),
         });
         save(this.changeFile(a.name), c);
-        if (a.who === 'user') return 'Решение пользователя записано в историю для ' + target + ': место им не закрывается — нужно ПРИНЯТО участника.';
         return 'Вердикт записан для ' + target + ': ' + a.decision;
       }
       if (a.action === 'reconsider') {
@@ -687,14 +770,40 @@ class Team {
       }
       if (a.action === 'merge') {
         const seats = require('./team-seats');
-        if (c.fast) {
-          require('./precheck').checkFast(folder, c.base, p.candidate);
+        // team-v61 (п.7,8): слово владельца в merge (параметр quote). Слово владельца главнее правил моста: слияние проходит
+        // без голосов и без замысла, и «меньше двух внешних семей» его не держит. Если слово для этой пары ещё не записано —
+        // записываем как owner_word (replaces=all, phase verdict); дословная цитата хранится в карточке; риск называется ниже.
+        const mergeQuote = typeof a.quote === 'string' && a.quote.trim() ? a.quote.trim() : null;
+        if (mergeQuote && !(c.decisions || []).some(d => d.kind === 'owner_word' && d.phase === 'verdict' && d.replaces === 'all' && d.base === c.base && d.candidate === p.candidate)) {
+          const rec = await require('./owner-word').override('team_change.merge', mergeQuote, { replaces: 'all', phase: 'verdict', change: a.name, base: c.base, candidate: p.candidate });
+          (c.decisions ||= []).push({ kind: 'owner_word', phase: 'verdict', replaces: 'all', base: c.base, candidate: p.candidate, quote: mergeQuote, word_id: rec.id, at: new Date().toISOString() });
+          (c.verdicts ||= []).push({ who: 'user', base: c.base, candidate: p.candidate, decision: 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ', replaces: 'all', quote: mergeQuote, word_id: rec.id, at: new Date().toISOString() });
+          save(this.changeFile(a.name), c);
+        }
+        // team-v59: места, закрытые словом владельца (owner_word в c.decisions). ownerClosed — закрыто ли место who на фазе;
+        // sysOverridden — перекрыто ли словом системное замечание участника. ownerNotices — предупреждения в ответ.
+        const ownerWords = (c.decisions || []).filter(d => d.kind === 'owner_word');
+        // team-v61 (п.7,8): слово владельца закрыло ВСЕ места verdict этой пары (replaces=all) → замысел и число семей не держат.
+        const ownerAllVerdict = ownerWords.some(d => d.phase === 'verdict' && d.replaces === 'all' && d.base === c.base && d.candidate === p.candidate);
+        const ownerClosed = (who, phase, cand = p.candidate) => ownerWords.some(d => d.phase === phase && (d.replaces === who || d.replaces === 'all') &&
+          (phase === 'design' ? d.designHash === c.designHash : d.base === c.base && d.candidate === cand));
+        // team-v59 (DeepSeek №3): системное замечание участника относится к КАНДИДАТУ (фаза verdict); перекрыть его может только
+        // слово владельца той же фазы по этой паре base/candidate. Слово, закрывшее лишь ЗАМЫСЕЛ (phase=design), системную находку
+        // по кандидату не снимает — иначе урок молча не требовался. Фазу так же проверяет соседний ownerClosed.
+        const sysOverridden = v => ownerWords.some(d => d.phase === 'verdict' && (d.replaces === v.who || d.replaces === 'all') && d.base === c.base && d.candidate === p.candidate);
+        const ownerNotices = [];
+        if (c.fast && !ownerAllVerdict) {
+          try { require('./precheck').checkFast(folder, c.base, p.candidate); }
+          catch (e) { throw Error(fastWordHint(e.message)); }
           for (const v of c.verdicts.filter(v => require('./members').seatIds.includes(v.who) && v.base === c.base && v.candidate === p.candidate)) {
             const j = stores.review(v.who, v.job_id, c.base, p.candidate, v.decision, c.requestMark);
-            if (/\[блокирующее\][^\r\n]*не малая/i.test(j.reviewText)) throw Error('не малая правка — нужен замысел; team_change start без fast.');
+            if (/\[блокирующее\][^\r\n]*не малая/i.test(j.reviewText)) throw Error(fastWordHint('не малая правка — нужен замысел; team_change start без fast.'));
           }
+        } else if (c.fast && ownerAllVerdict) {
+          // team-v62: слово владельца сняло границу малой правки — защищённые пути/«не малая» не держат; риск называем предупреждением.
+          ownerNotices.push('граница малой правки снята словом владельца.');
         }
-        if (!c.fast && c.request && (c.candidateDesignHash !== c.designHash || seats.SEATS.some(who => !seats.seat(c, who, 'design').closed)))
+        if (!ownerAllVerdict && !c.fast && c.request && (c.candidateDesignHash !== c.designHash || seats.SEATS.some(who => !seats.seat(c, who, 'design').closed)))
           throw Error('Замысел изменён или не принят: нужны новый commit и новые вердикты.' +
             seats.SEATS.map(who => seats.seatError(c, who, 'design')).filter(Boolean).map(e => '\n' + e).join(''));
         let lessonText = '';
@@ -709,7 +818,10 @@ class Team {
             const n = v.note?.match(/системное — открыто в уроке (\d+)/)?.[1];
             if (n) { try { open ||= new RegExp('^## ' + n + '\\.', 'm').test(git(folder, ['show', p.candidate + ':lessons.md'])); } catch {} }
           }
-          const unresolved = c.systemic.filter(v => v.who !== 'grok');
+          // team-v59: системное замечание участника, место которого закрыто словом владельца, урока в lessons.md не требует —
+          // предупреждение в ответ (замысел §1: требование строки урока словом перекрывается).
+          if (c.systemic.some(sysOverridden)) ownerNotices.push('урок по системным замечаниям не записан — перекрыто словом владельца.');
+          const unresolved = c.systemic.filter(v => v.who !== 'grok' && !sysOverridden(v));
           const missing = unresolved.filter(v => v.who === 'grok'
             ? !require('./grok-gate').paragraph(lessonText, v.job_id.slice(0, 8), ['closed'])
             : !added.includes(v.job_id.slice(0, 8)));
@@ -724,12 +836,14 @@ class Team {
         // team-v45: Claude может остановить слияние; по каждому обязательному месту требуется ПРИНЯТО;
         // «РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ» место не закрывает.
         const decision = c.verdicts.filter(v => v.who === 'claude' && v.base === c.base && v.candidate === p.candidate).at(-1);
-        if (decision?.decision === 'НЕ ПРИНЯТО') throw Error('Claude: НЕ ПРИНЯТО на эту пару — слияние остановлено дирижёром');
+        // team-v59: слово владельца перекрывает и вердикт самого Claude (replaces=claude или all).
+        if (decision?.decision === 'НЕ ПРИНЯТО' && !ownerClosed('claude', 'verdict')) throw Error('Claude: НЕ ПРИНЯТО на эту пару — слияние остановлено дирижёром');
         const families = new Set(seats.SEATS.map(w => require('./members').familyOf(w)));
-        if (families.size < 2)
+        if (!ownerAllVerdict && families.size < 2)
           throw Error('Изменение ждёт: меньше двух уникальных активных внешних голосующих семей (' + (seats.SEATS.join(', ') || 'нет') + ').');
         for (const [phase, candidate] of [['verdict', p.candidate], ['design', c.candidate]]) {
-          if (phase === 'design' && (!c.request || c.fast)) continue;
+          // team-v61 (п.8): слово владельца (replaces=all, verdict) перекрывает и ворота замысла — фазу design не проверяем.
+          if (phase === 'design' && (!c.request || c.fast || ownerAllVerdict)) continue;
           for (const who of seats.SEATS) {
             const error = seats.seatError(c, who, phase, candidate);
             if (error) throw Error(error);
@@ -738,11 +852,13 @@ class Team {
               seats.verifySlot(c, phase, who, st.record.job_id, 'ПРИНЯТО', { state: this.state, candidate });
               const late = seats.storeRefusal(c, who, phase, candidate);
               if (late) throw Error('Позднее «НЕ ПРИНЯТО» ' + who + ' (' + late.id + ') по этой редакции: слияние остановлено до разбора.');
-            } else if (phase === 'verdict') stores.review(who, st.record.job_id, c.base, p.candidate, 'ПРИНЯТО', c.requestMark);
+            } else if (phase === 'verdict' && st.by !== 'owner_word') stores.review(who, st.record.job_id, c.base, p.candidate, 'ПРИНЯТО', c.requestMark);
           }
           // team-v31: пауза не снимает отказ — незакрытый отказ приостановленного участника держит слияние.
           const members = require('./members');
           for (const m of members.all().filter(m => members.paused(m.id) && m.external && m.roles?.voter)) {
+            // team-v59: место, закрытое словом владельца, держать слияние не может — ни записанным, ни хранилищным отказом.
+            if (ownerClosed(m.id, phase, candidate)) continue;
             const st = seats.seat(c, m.id, phase, candidate);
             // Незаписанный отказ из хранилища держит слияние и при закрытом месте (ревью Antigravity mvijc3e1);
             // записанные отказы уже учтены в seat(), закрытые пересмотром — в c.decisions.
@@ -765,8 +881,18 @@ class Team {
         git(this.root, ['merge', '--ff-only', 'FETCH_HEAD']);
         c.status = 'слито';
         c.mergedAt = new Date().toISOString();
+        // team-v59: в истории изменения — что места закрыты словом владельца, а не голосом.
+        if (ownerWords.length) c.mergedByWord = { words: ownerWords.map(d => d.word_id), replaced: [...new Set(ownerWords.map(d => d.replaces))], at: c.mergedAt };
         save(this.changeFile(a.name), c);
-        return 'Слито в main: ' + p.candidate;
+        if (!ownerWords.length) return 'Слито в main: ' + p.candidate;
+        // Слито словом владельца: перечень заменённых голосов, было ли ревью, предупреждения.
+        const names = require('./members').names;
+        const replaced = [...new Set(ownerWords.map(d => d.replaces))].map(r => r === 'all' ? 'все обязательные' : names[r] || r);
+        const seatVerdicts = (c.verdicts || []).filter(v => seats.SEATS.includes(v.who) && v.base === c.base && v.candidate === p.candidate);
+        const reviewNote = !seatVerdicts.length ? '; ревью не было' : seatVerdicts.some(v => v.decision === 'НЕ ПРИНЯТО') ? '; ревью было с отказами' : '';
+        return [...ownerNotices.map(n => 'Предупреждение: ' + n),
+          'слито словом владельца: голоса ' + replaced.join(', ') + ' заменены' + reviewNote,
+          'Слито в main: ' + p.candidate].join('\n');
       }
       throw Error('Неизвестное действие.');
     });
@@ -778,6 +904,7 @@ class Team {
     if (a.action === 'list') return words.listText();
     if (a.action === 'stop_confirm') return require('./stop-confirm').run(a);
     if (a.action === 'close') return require('./job-close').run(a);
+    if (a.action === 'release_orphan') return require('./release-orphan').run(a);
     // team-v19: слово о Claude, возврат, остановка дирижёра и перепривязка — запасной режим (К1, К2).
     if (a.action !== 'record' || a.who_down === 'claude') return fallback.word(a, this.fallbackDeps || {});
     const guestWord = await fallback.helperWord(a);
@@ -956,7 +1083,12 @@ class Team {
     return require('./after-deploy').afterLatest({ root: this.root, waitMs });
   }
   async status(claudeQuota, claudeUsage, notifyTest, full = false, scope = {}) {
-    require('./access').guard('team', 'team_status', { claude_quota: claudeQuota, claude_usage: claudeUsage, notify_test: notifyTest });
+    const acc = require('./access');
+    acc.guard('team', 'team_status', { claude_quota: claudeQuota, claude_usage: claudeUsage, notify_test: notifyTest });
+    // team-v58 Г: сеанс под именем зарегистрированного участника, но без доказанного происхождения — причина недостачи прав
+    // чата показывается строкой (а не только при отказе в действии). Поручение тут не считаем: у него своя природа и баннер.
+    const originNote = (!acc.jobSession() && acc.registeredMember(acc.client()) && !acc.chatOriginOk())
+      ? 'Права чата не выданы (это сеанс с правами поручения): ' + acc.chatOriginReason() : '';
     const snapshot = require('./job-snapshot').create();
     // Обычная сводка только читает. Уборку запускают установка и старт сервера.
     if (claudeUsage) {
@@ -993,27 +1125,34 @@ class Team {
         }),
       );
     }
+    // team-v60: переоценку этапов (refreshWork → stage-gate: перечитывание и пере-хэширование файлов по всем работам)
+    // краткая сводка не делает — это 9–11 с на каждый вызов. Строки прогресса в кратком строятся из сохранённого состояния
+    // работ (readWork), а полную проверку ворот оставляем только для full (ниже, до строки квот) и для team_work.
     let statusWorks = [], statusWorksError;
-    await section('Проверка этапов', async () => {
+    const readStatusWorks = () => { if (statusWorksError) throw statusWorksError; return statusWorks; };
+    // Переоценку этапов делает только full (на прежнем месте — до строки квот); краткая её пропускает.
+    if (full) await section('Проверка этапов', async () => {
       try { statusWorks = await Promise.all(this.works().map(w => w.error ? w : this.refreshWork(this.workFile(w.name), { readOnly: true, snapshot }))); }
       catch (e) { statusWorksError = e; throw e; }
     });
-    const readStatusWorks = () => { if (statusWorksError) throw statusWorksError; return statusWorks; };
-    const quota = await require('./quota-line').quotaLine({ state: this.state, binary: process.env.CODEX_PATH || findCodex(), advice: !full, agyModel: scope.agy_model });
+    // team-v59 (часть 3 п.1): в кратком режиме внешние источники квоты ограничены бюджетом; не успели — прошлое значение с
+    // временем, свежее дорасчитывается в фоне (full — без бюджета, допускается дольше).
+    const quota = await require('./quota-line').quotaLine({ state: this.state, binary: process.env.CODEX_PATH || findCodex(), advice: !full, agyModel: scope.agy_model, budgetMs: full ? undefined : Number(process.env.MOST_QUOTA_BUDGET_MS || 2000) });
     const current = require('./request-context').context.getStore();
     const reminder = current?.publicSnapshot?.warning ?? require('./work-owner').reminder(this.root, undefined, scope);
     const rulesWarning = require('./server-instructions').read().warning;
-    const warning = [rulesWarning, reminder].filter(Boolean).join('\n');
+    const warning = [originNote, rulesWarning, reminder].filter(Boolean).join('\n');
     if (!full) {
       const notification = notifyTest ? 'Пробное уведомление: ' + await require('./notify').notify('Связка: пробное уведомление', 'Уведомления команды работают.') : '';
       // Прямые вызовы тоже учитывают стандартную оболочку; MCP передаёт точный бюджет.
       const budget = scope.summaryBudget ?? (3000 - format('Команда', { status: 'done' }, '', 'Проверьте результат и выберите следующий шаг.').length - 1);
       const prefix = !current?.publicSnapshot && reminder ? reminder + '\n' : '';
-      const required = [rulesWarning, notification].filter(Boolean);
-      return prefix + await require('./summary').compact({ root: this.root, state: this.state, works: readStatusWorks }, quota, snapshot, { budget: budget - prefix.length, required });
+      const required = [originNote, rulesWarning, notification].filter(Boolean);
+      // Сырые работы (readWork, без переоценки ворот) — строки прогресса из сохранённого состояния.
+      return prefix + await require('./summary').compact({ root: this.root, state: this.state, works: () => this.works() }, quota, snapshot, { budget: budget - prefix.length, required });
     }
     rows.push(quota, ...require('./restart-hold').warnings(path.dirname(this.state)));
-    await section('Расхождение версий', () => rows.push(...require('./release-drift').lines(this.root, stateDir)));
+    await section('Расхождение версий', () => rows.push(...require('./release-drift').lines(this.root, stateDir, { full: true })));
     if (warning) rows.unshift(warning);
     await section('Нагрузка', () => rows.push(require('./summary').loadLine(this.state, Object.fromEntries(require('./members').helpers.map(who => [who, stores.list(who, true, snapshot).jobs])))));
     for (const who of require('./members').scanIds) {
@@ -1154,7 +1293,10 @@ class Team {
   }
 }
 
-function findCodex() {
+// team-v60: where.exe / разбор каталога codex — дорого на каждый краткий team_status. Путь кэшируется в памяти процесса
+// на несколько минут (TTL MOST_FIND_CODEX_TTL_MS); установка нового codex подхватится по истечении срока.
+let _codexCache;
+function findCodexUncached() {
   try {
     return require('child_process')
       .execFileSync(
@@ -1178,4 +1320,15 @@ function findCodex() {
     return null;
   }
 }
-module.exports = { Team, percent, workText, workBrief, acceptedMessage, findCodex };
+function findCodex(probe = findCodexUncached) {
+  const ttl = Number(process.env.MOST_FIND_CODEX_TTL_MS || 300000);
+  if (_codexCache && Date.now() - _codexCache.at < ttl) return _codexCache.value;
+  const value = probe();
+  // team-v63 (п.в.2): кэшируем только НАЙДЕННЫЙ путь. Пустой/битый результат (null) раньше запоминался на 5 минут, и Codex
+  // «не найден» ещё 5 минут после появления — теперь при ненайденном зонд повторяется каждым вызовом, пока путь не появится.
+  if (value) _codexCache = { value, at: Date.now() };
+  else _codexCache = null;
+  return value;
+}
+function _resetCodexCache() { _codexCache = null; }
+module.exports = { Team, percent, workText, workBrief, acceptedMessage, findCodex, _resetCodexCache };

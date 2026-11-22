@@ -31,7 +31,7 @@ function connections(text) {
 }
 function render(text, release, root, node, client = 'deepseek', configFile) {
   const b = block(text), outside = text.slice(0, b.from) + text.slice(b.to);
-  if (/\bid:\s*['"]?mcp-most-|\bserverName:\s*['"]?(?:team|codex|antigravity|deepseek|claude)\b/.test(outside)) throw Error('Подключения most в DSH вне служебного блока; требуется явное устранение дубликатов.');
+  if (/\bid:\s*['"]?mcp-most-|\bserverName:\s*['"]?(?:team|codex|antigravity|deepseek|claude|kimi)\b/.test(outside)) throw Error('Подключения most в DSH вне служебного блока; требуется явное устранение дубликатов.');
   const entries = [...require('./members').installedServers].map(n => ({ id: 'mcp-most-' + n, name: '@deepseek-ai/dsh-mcp-client', config: {
     serverName: n, transport: 'stdio', command: node, args: [path.join(release, 'servers', n, 'index.js')],
     env: { MOST_CLIENT: client, MOST_REPO_ROOT: root, MOST_STATE_DIR: path.join(root, 'state') }, failOnStartupError: true,

@@ -1,14 +1,14 @@
 'use strict';
 // Участник, адаптер и сервер — разные сущности. Адаптер claude-print — отдельный разовый сеанс Claude Code
 // (исполнитель, не чат-дирижёр): он обслуживается сервером claude и получает поручения в папку claude-jobs.
-const adapters = Object.freeze({ 'codex-cli': { server: 'codex', jobs: 'codex-jobs' }, 'agy-cli': { server: 'antigravity', jobs: 'jobs' }, 'dsh-headless': { server: 'deepseek', jobs: 'deepseek-jobs' }, 'claude-print': { server: 'claude', jobs: 'claude-jobs' } });
+const adapters = Object.freeze({ 'kimi-cli': { server: 'kimi', jobs: 'kimi-jobs' }, 'codex-cli': { server: 'codex', jobs: 'codex-jobs' }, 'agy-cli': { server: 'antigravity', jobs: 'jobs' }, 'dsh-headless': { server: 'deepseek', jobs: 'deepseek-jobs' }, 'claude-print': { server: 'claude', jobs: 'claude-jobs' } });
 const store = () => require('./members-store').create();
 const snapshot = () => store().read({ initialize: false });
 const all = () => snapshot().members;
 // Фаза установки: A — прежние права и ворота, B — DeepSeek действует (team-v31).
 const phase = () => snapshot().phase || 'A';
-// Пауза manual выводит участника из кворума, доступа и приёма поручений только в фазе B.
-const pausedLive = m => phase() === 'B' && m.state === 'paused' && m.pause?.kind === 'manual';
+// Пауза manual действует для Kimi в A/B/C; для прежних участников — в фазе B.
+const pausedLive = m => !!m && (m.adapter === 'kimi-cli' || phase() === 'B') && m.state === 'paused' && m.pause?.kind === 'manual';
 const paused = id => !!pausedLive(all().find(m => m.id === id));
 // team-v48 Г5 (§13.B.5): получатель недоступен, если на ручной паузе реестра (B) ИЛИ по слову пользователя о недоступности.
 // Очереди всех исполнителей держат карточку queued/waiting_quota, пока предикат истинен (не под переменной — класс (в)).
@@ -26,7 +26,7 @@ const recipientPaused = (server, fallbackWord) => {
 // Одна формулировка паузы для сводки и списка участников (team-v44 П2).
 function pauseNote(m) {
   if (!m?.pause) return '';
-  if (phase() !== 'B') return 'в А не влияет на исполнение';
+  if (m.adapter !== 'kimi-cli' && phase() !== 'B') return 'в А не влияет на исполнение';
   return pausedLive(m) ? 'исключён из кворума и приёма' : 'не действует в B';
 }
 // Пауза в А только отображается; в B — участник исключается из действующего состава.

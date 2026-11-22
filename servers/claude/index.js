@@ -116,6 +116,19 @@ async function normalized(id) {
 function reply(j, body, next = 'Проверьте результат.', error = false) {
   return { content: [{ type: 'text', text: format('Claude', j, body, next) }], ...(error ? { isError: true } : {}) };
 }
+// team-v56 И8 (ревью Gemini-А 3): повтор request_id без карточки на диске не рапортует молча 'queued'. Различаем
+// recovery_required (с recoveryId), идущую постановку (владелец жив) и исчезнувшую постановку (владелец мёртв — явная ошибка).
+async function duplicateReply(r, requestId) {
+  const rec = r.record || {};
+  if (rec.phase === 'recovery_required')
+    return reply({ id: r.jobId, status: 'failed', requestId }, 'Повтор request_id ' + requestId + ': прежняя постановка требует восстановления (recovery_required' + (rec.recoveryId ? ' ' + rec.recoveryId : '') + '); карточка не создана.', 'Разберите незавершённую постановку.', true);
+  if (rec.committed)
+    return reply({ id: r.jobId, status: 'delivery_unclear', requestId }, 'Повтор request_id ' + requestId + ': поручение ' + r.jobId + ' постановлено, но карточка недоступна; доставка ответа неясна.', 'Запросите результат позже.', true);
+  let owner = 'unknown'; try { owner = await locks.ownerState(rec.owner); } catch {}
+  if (owner === 'alive' || owner === 'self')
+    return reply({ id: r.jobId, status: 'queued', requestId }, 'Повтор request_id ' + requestId + ': постановка ещё идёт (владелец активен); повторите запрос позже.');
+  return reply({ id: r.jobId, status: 'failed', requestId }, 'Повтор request_id ' + requestId + ': прежняя постановка оборвалась до публикации (владелец ' + owner + '); карточки нет. Повторите с новым request_id.', 'Повторите запрос.', true);
+}
 function view(j, offset = 0) {
   let body = j.error || '';
   if (j.status === 'queued') body = access.queued;
@@ -196,7 +209,7 @@ async function execute(job, folderLock) {
     try {
       const e = JSON.parse(s);
       if (Array.isArray(e.permission_denials)) job.permissionDenials = e.permission_denials;
-      if (e.type === 'result' && typeof e.result === 'string') { finalText = e.result; completed = true; }
+      if (e.type === 'result' && typeof e.result === 'string') { finalText = e.result; completed = true; const t = require('../../common/usage').genericTokens(e.usage); if (t) job.tokens = { ...(job.tokens || {}), ...t }; }
       if (e.type === 'tool_call') provenance.observe(job, 'claude', { toolNames: [e.tool] });
     } catch {}
   }
@@ -230,6 +243,16 @@ async function execute(job, folderLock) {
         c.permissionDenials = job.permissionDenials || [];
         c.finishedAt = new Date().toISOString();
         c.exitCode = code;
+        // team-v63 (п.6): объём ответа, секунды, токены (если CLI сообщил usage).
+        try { require('../../common/usage').finalize(c, { resultText: finalText == null ? undefined : finalText }); } catch {}
+        if (job.tokens) c.tokens = job.tokens;
+        // team-v59 (Codex №1): поручение снято словом владельца на ходу — поздний результат карточку НЕ воскрешает: статус
+        // остаётся снятым, done/needs_decision не выставляется, голосом не считается, замок записи не возвращается.
+        if (require('../../common/live-jobs').closedByOwnerWord(c)) {
+          if (finalText !== null) { c.lateResultFile = path.join(path.dirname(file(job.id)), job.id + '.late.result.txt'); fs.writeFileSync(c.lateResultFile, finalText); }
+          c.lateResult = { at: c.finishedAt, exitCode: code, completed: !!completed }; c.voteEligible = false;
+          return;
+        }
         const deadlines = require('../../common/chain-deadline');
         if (c.status === 'running' && (deadlines.parentTerminal(c) || deadlines.deadlinePassed(c))) {
           c.status = 'cancelling'; c.stopReason = deadlines.parentTerminal(c) ? 'parent' : 'timeout';
@@ -360,6 +383,7 @@ async function execute(job, folderLock) {
     poll = setInterval(guarded(function pollJob() {
       const j = load(job.id);
       if (require('../../common/chain-deadline').parentTerminal(j)) stop(job.id, 'parent').catch(logFailure);
+      else if (require('../../common/live-jobs').closedByOwnerWord(j)) killByWord(job.id); // снято словом владельца — штатный kill дерева
       else if (j.status === 'cancelling') stop(job.id, j.stopReason).catch(logFailure);
       else if (require('../../common/chain-deadline').deadlinePassed(j)) stop(job.id, 'timeout').catch(logFailure);
     }), 200);
@@ -368,7 +392,7 @@ async function execute(job, folderLock) {
         ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; каждое действие вне папки поручения перечисли в отчёте.'
         : job.write ? 'Изменения разрешены только в рамках поручения. Перечисли файлы и проверки.'
         : 'Только чтение. Не изменяй файлы.',
-      'Не обходи ограничения. Отвечай по-русски.', job.task, job.textFile ? 'Материал в файле: ' + job.textFile : ''].join('\n'));
+      'Не обходи ограничения. Отвечай по-русски.', job.task, job.textFile ? 'Материал в файле: ' + job.textFile : '', ...require('../../common/attachments').promptTail(job)].join('\n'));
   } catch (e) {
     await finish(null, e.message);
   }
@@ -398,6 +422,16 @@ async function stop(id, reason = 'cancel') {
   }
   setTimeout(guarded(() => { if (active.has(id)) mutate(id, (c) => { c.status = 'stop_unconfirmed'; c.stopUnconfirmed = { pid: e.child.pid }; }).catch(logFailure); }), 3000).unref();
 }
+// team-v59 (Codex №1): карточка уже снята словом владельца (статус терминален) — процесс останавливаем, статус не трогаем.
+function killByWord(id) {
+  const e = active.get(id);
+  if (!e || e.stopping) return;
+  e.stopping = true;
+  try {
+    if (process.platform === 'win32') execFileSync('taskkill.exe', ['/PID', String(e.child.pid), '/T', '/F'], { windowsHide: true, timeout: 10000, stdio: 'pipe' });
+    else process.kill(-e.child.pid, 'SIGKILL');
+  } catch { try { e.child.kill('SIGKILL'); } catch {} }
+}
 // team-v46 п.2: хранилище родителя для claude-print — store 'claude'.
 function parentJob() { return require('../../common/job-identity').currentJob(); }
 async function send(a) {
@@ -413,32 +447,62 @@ async function send(a) {
   if (!currentBinary() && !access.guest()) throw Error('Исполнитель Claude не найден. Укажите CLAUDE_PATH.');
   if (require('../../common/user-word').mode().active) throw Error('Claude-исполнитель недоступен в запасном режиме (Claude отвалился).');
   if (closing) throw Error('Сервер останавливается.');
-  if (!path.isAbsolute(a.folder) || !fs.existsSync(a.folder) || !fs.statSync(a.folder).isDirectory())
+  // team-v63 (п.5/п.19): действующая отметка «лимит исчерпан» — не запускаем CLI (в т.ч. на продолжении); force — всегда.
+  if (a.force !== true && !access.guest()) {
+    const qm = require('../../common/quota-mark').blocked(list());
+    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('Claude', qm.at), 'Дождитесь сброса или передайте force: true.');
+  }
+  // team-v63 (п.1/п.16): вложения читаются сейчас; гостю без полного доступа — только из его папки поручения.
+  const _att = require('../../common/attachments');
+  const attachData = _att.read(a.files, { authorize: _att.guestAuthorizer({ guest: access.guest() && !access.chatSession(), folder: a.folder, fullAccess: a.full_access === true }) });
+  // team-v62: роль «совет»/«текст» без записи (и «проверка» с text) — папка необязательна (служебная пустая), как у
+  // codex/deepseek/kimi/antigravity (scratch-folder). Простой вопрос Claude-исполнителю без папки не должен отказывать
+  // («поручение идёт без папки; никаких искусственных ограничений»). Запись (write=true) по-прежнему требует явную папку.
+  require('../../common/scratch-folder').ensure(a);
+  if (!path.isAbsolute(a.folder || '') || !fs.existsSync(a.folder) || !fs.statSync(a.folder).isDirectory())
     throw Error('Нужна абсолютная существующая папка.');
   // team-v46 п.5а: общее правило папок при постановке.
   if (a.write) {
     const fref = writeFolder.refusal(a.folder, { client: access.client(), guest: access.guest(), fullAccess: a.full_access === true, owner: a.owner });
     if (fref) throw Error(fref);
   }
-  if (a.work && !a.stage) throw Error('Для работы укажите этап.');
+  if (a.work && !a.stage && a.role !== 'совет') throw Error('Для работы укажите этап.'); // team-v59 ч3: совет — этап не обязателен (незарегистрированная работа примется ярлыком)
   const folder = fs.realpathSync(a.folder),
     id = randomUUID();
-  let folderLock = null;
+  let folderLock = null, admId = null, requestId = null, published = false;
   try {
-    if (a.write) {
-      folderLock = await writeLock.acquire(folder, { jobId: id });
-      if (!folderLock.ok) throw Error(folderLock.needsDecision ? 'Нужно решение: остановка прежнего исполнителя не подтверждена; замок записи сохранён.' : 'В этой папке (или вложенной) уже идёт поручение с записью.');
+    // team-v56 Б0 (этап 2): устойчивая admission ВСЕГДА до захвата замка/публикации. request_id необязателен — при
+    // отсутствии сервер выдаёт новый и показывает его в ответе; повтор того же ID возвращает тот же номер, иные параметры
+    // того же ключа — REQUEST_ID_CONFLICT без карточки, замка и следов на диске.
+    {
+      const adm = require('../../common/job-admission');
+      const txt = a.text === undefined ? undefined : require('crypto').createHash('sha256').update(a.text).digest('hex');
+      const values = [['folder', require('../../common/scratch-folder').folderValue(a, folder)], ['task', a.task], ['text', txt], ['role', a.role], ['write', a.write === true],
+        ['full_access', a.full_access === true], ['level', a.level], ['files', attachData?.hash], ['work', a.work], ['stage', a.stage], ['stageId', a.stageId], ['stageTitle', a.stageTitle], ['gateOrder', a.gateOrder],
+        ['scopeTask', a.scopeTask], ['replaces', a.replaces], ['replacementEvidence', a.replacementEvidence], ['owner', a.owner],
+        ['parentJob', require('../../common/job-chain').fields(a).parentJob], ['opora', a.opora]];
+      const r = await adm.begin({ adapter: 'claude-print', access, requestId: a.request_id, values, newJobId: id });
+      requestId = r.requestId;
+      if (r.duplicate) { require('../../common/scratch-folder').discard(a); try { return view(load(r.jobId)); } catch {} return await duplicateReply(r, requestId); }
+      admId = r.admissionId;
     }
+    // team-v56 Б0 п.1: все проверки без побочных эффектов, допуск, stage/chain/срок — ДО захвата write-lock.
     if (!access.guest() && restartServer) restartHold.assertAdmitted(stateDir, restartServer, { early: true });
     await require('../../common/stage-gate').prepareJob(a, 'claude');
     const chainFields = require('../../common/job-chain').fields(a);
     const dl = require('../../common/chain-deadline').applyDeadline(chainFields, access.client(), 'claude');
     if (dl.error) throw Error(dl.error);
+    // Захват замка — последний шаг перед публикацией: дальше только построение карточки, запись входа и save/commit.
+    if (a.write) {
+      folderLock = await writeLock.acquire(folder, { jobId: id });
+      if (!folderLock.ok) throw Error(folderLock.needsDecision ? 'Нужно решение: остановка прежнего исполнителя не подтверждена; замок записи сохранён.' : 'В этой папке (или вложенной) уже идёт поручение с записью.');
+    }
     const job = {
       id, folder, write: a.write, fullAccess: a.full_access === true,
       task: a.task,
       stage: a.stage, stageTitle: a.stageTitle, stageId: a.stageId, gateOrder: a.gateOrder, scopeTask: a.scopeTask, role: a.role, replaces: a.replaces, replacementEvidence: a.replacementEvidence,
       work: a.work,
+      workLabel: a.workLabel, workUnbound: a.workUnbound, // team-v62: имя работы-ярлыка (нелатинская/незарегистрированная) сохраняется для сводки и *_result
       from: require('../../common/job-identity').memberId(access.client()) || access.client(),
       ...chainFields,
       status: access.guest() ? 'queued' : 'running',
@@ -450,16 +514,31 @@ async function send(a) {
       ...(dl.deadline ? { deadline: dl.deadline } : {}),
     };
     if (a.text !== undefined) { job.textFile = path.join(dir, id + '.input.txt'); fs.writeFileSync(job.textFile, a.text); }
+    // team-v63 (п.1/п.6): вложения отдельным файлом; объём входа в знаках. Уровень — информативно (у Claude нет таблицы моделей).
+    if (a.level) job.level = a.level;
+    const attachChars = require('../../common/attachments').attach(job, attachData, path.join(dir, id + '.attach.txt')).chars;
+    job.chars_in = require('../../common/usage').charsIn(a, attachChars);
+    job.requestId = requestId;
     job.provenance = provenance.forJob(job, 'claude');
+    // team-v56 Б0 п.2/п.4: публикация карточки и commit admission — одной короткой секцией; published отмечает публикацию.
     if (access.guest()) save(job);
     else await restartHold.locked(stateDir, () => { admitExecution(); save(job); });
+    published = true;
+    // team-v56 И7 (ревью Codex 5): постановка отозвана (release_orphan) → commit вернёт null; карточку не запускаем.
+    if (admId && !require('../../common/job-admission').commit(stateDir, admId, { instance: folderLock?.owner?.instance })) {
+      try { await mutate(job.id, c => { c.status = 'cancelled'; c.error = 'Постановка отозвана (release_orphan) до запуска.'; }); } catch {}
+      throw Error('Постановка отозвана (release_orphan); запуск отменён.');
+    }
     if (access.guest()) return reply(job, access.queued);
     const lock = folderLock;
     folderLock = null;
     await execute(job, lock);
     return view(load(job.id));
   } finally {
-    if (folderLock?.ok) await folderLock.release();
+    // team-v56 Б0 п.3: до публикации — узкий откат admission и точного замка по его instance (при неудаче снятия —
+    // recovery_required с диагностическим ID). После публикации — no-op; опубликованный замок снимает обычный release.
+    if (admId) try { require('../../common/job-admission').releaseUnpublished(stateDir, admId, { lock: folderLock?.ok ? { instance: folderLock.owner.instance, folder, jobId: id } : undefined, published }); } catch {}
+    if (folderLock?.ok && published) await folderLock.release();
   }
 }
 async function queue() {
@@ -531,9 +610,13 @@ async function queue() {
 }
 const server = new McpServer({ name: 'claude', version: VERSION }, require('../../common/server-instructions').options('claude'));
 function register(name, title, description, inputSchema, fn) {
-  if (!access.allowed('claude', name)) return;
+  if (!access.offered('claude', name)) return;
   server.registerTool(name, { title, description, inputSchema: require('../../common/schema').compatible(inputSchema) }, async (a) => {
     try {
+      // team-v62 (взгляд участников): обработчику нужно перенесённое состояние — дождёмся конца первичной миграции (с
+      // пределом). initialize/tools/list сюда не попадают. По превышении — понятный текст с предложением повторить.
+      const hold = await require('../../common/state-migration').awaitPrimary();
+      if (hold) throw Error(hold);
       access.guard('claude', name, a);
       if (name === 'claude_send') {
         const refusal = fullAccessRefusal(a);
@@ -548,16 +631,20 @@ function register(name, title, description, inputSchema, fn) {
   });
 }
 register('claude_send', 'Поручить Claude-исполнителю', 'Начать отдельное разовое поручение Claude Code (отдельный сеанс, не чат). Запись — как у Codex; Bash — только с полным доступом.', {
-  folder: z.string().describe('Абсолютная папка проекта.'),
+  folder: z.string().optional().describe('Абсолютная папка проекта; для роли «совет»/«текст» без записи необязательна — мост берёт служебную папку.'),
   ...require('../../common/stage-schema').send,
   task: z.string().min(1).describe('Поручение.'),
   text: z.string().optional().describe('Материал для работы.'),
+  files: z.array(z.union([z.string(), z.object({ path: z.string(), lines: z.string().optional() })])).optional().describe('Вложения: абсолютные пути (строка или { path, lines }); мост читает и вкладывает их в поручение, файлы открывать не нужно.'),
+  level: z.enum(['fast', 'normal', 'strong']).optional().describe('Уровень модели: fast | normal | strong (у Claude-исполнителя информативно; роль и права не меняет).'),
+  force: z.boolean().optional().describe('Пробовать даже при действующей отметке «лимит исчерпан».'),
   write: z.boolean().default(false).describe('Разрешить изменения по поручению (Edit в папке поручения).'),
   full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя (Bash); при write=true, роли текст или совет и абсолютной существующей папке.'),
   continue_id: z.string().optional().describe('Номер предыдущего поручения.'),
   stage: z.string().optional().describe('Этап.'),
   owner: z.string().optional().describe('Метка сеанса владельца работы.'),
   work: z.string().optional().describe('Работа.'),
+  request_id: z.string().optional().describe('Идентификатор запроса для идемпотентного повтора (team-v56 Б0); повтор того же request_id возвращает тот же номер.'),
 }, send);
 register('claude_result', 'Результат Claude-исполнителя', 'Получить состояние и ответ, при необходимости частями.', {
   id: z.string().describe('Номер поручения.'),
@@ -603,7 +690,6 @@ async function shutdown() {
   process.exit(0);
 }
 (async () => {
-  await require('../../common/state-migration').start(require('../../common/paths'));
   restartServer = access.guest() ? null : restartHold.serverAsync(stateDir, 'claude');
   process.stdin.on('close', guarded(shutdown));
   const owner = await locks.startOwner({ version: VERSION, file: __filename });
@@ -612,10 +698,17 @@ async function shutdown() {
   process.on('SIGINT', guarded(shutdown));
   process.on('SIGTERM', guarded(shutdown));
   server.server.onclose = guarded(shutdown);
+  try { require('../../common/state-migration').arm(); } catch {} // team-v63 (п.18): взвести барьер миграции до connect
   await server.connect(require('../../common/public-transport').publicTransport(new StdioServerTransport()));
   access.ready('claude');
-  if (!access.guest() && process.env.MOST_PROBE_ONLY !== '1') {
-    await queue().catch(logFailure);
-    setInterval(guarded(queue), Math.min(30000, Number(process.env.MOST_QUEUE_TICK_MS || 1000))).unref();
-  }
+  try { require('../../common/chat-origin').primeAsync(); } catch {} // team-v59 (task2): происхождение чата — в фоне после connect
+  // team-v62 (task4): миграция хранилища и первая сверка очереди — в ФОНЕ после ответа на initialize/tools/list
+  // (общий замок миграции больше не держит server.connect). Очередь стартует только после миграции (барьер сохранён).
+  (async () => {
+    await require('../../common/state-migration').start(require('../../common/paths'));
+    if (!access.guest() && process.env.MOST_PROBE_ONLY !== '1') {
+      await queue().catch(logFailure);
+      setInterval(guarded(queue), Math.min(30000, Number(process.env.MOST_QUEUE_TICK_MS || 1000))).unref();
+    }
+  })().catch(logFailure);
 })().catch((e) => { logFailure(e); process.exit(1); });

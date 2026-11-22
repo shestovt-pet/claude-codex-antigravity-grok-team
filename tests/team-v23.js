@@ -13,7 +13,7 @@ test('О1: подключения, разрешения, сравнение и �
     const base = { mcpServers: { grok: oldGrok } };
     const next = kind === 'claude' ? deploy.configFor(base, release, root) : cc.jsonConfig(base, kind, release, root, state, 'node');
     assert(!next.mcpServers.grok);
-    assert.deepEqual(Object.keys(next.mcpServers).sort(), [...members.servers].sort());
+    assert.deepEqual(Object.keys(next.mcpServers).sort(), [...members.installedServers].sort());
     const foreign = { mcpServers: { grok: { command: 'foreign', args: [] } } };
     const preserved = kind === 'claude' ? deploy.configFor(foreign, release, root) : cc.jsonConfig(foreign, kind, release, root, state, 'node');
     assert.deepEqual(preserved.mcpServers.grok, foreign.mcpServers.grok);
@@ -309,8 +309,26 @@ test('О11: model/effort в новом запуске, продолжении, �
       assert.equal(rows[i].args[rows[i].args.indexOf('-m') + 1], model); assert(rows[i].args.includes('model_reasoning_effort="' + effort + '"'));
       assert.equal(rows[i].args[rows[i].args.indexOf('-s') + 1], 'read-only');
     }
-    assert(rows[1].args.includes('resume')); assert(rows[5].args.includes('resume')); assert(!rows[3].args.includes('-m') && !rows[3].args.includes('-c'));
+    assert(rows[1].args.includes('resume')); assert(rows[5].args.includes('resume'));
+    // Простой короткий вопрос без выбора модели и уровня получает gpt-6.2-sol low.
+    assert.equal(rows[3].args[rows[3].args.indexOf('-m') + 1], 'gpt-6.2-sol'); assert(rows[3].args.includes('model_reasoning_effort="low"'));
+    assert.equal(readJob(d.id).model, 'gpt-6.2-sol'); assert.equal(readJob(d.id).effort, 'low');
     assert.equal(readJob(a.id).provenance.provider_reported_text_model, 'unknown');
+    const changeReview = { name: 'review-model', base: 'a'.repeat(40), candidate: 'b'.repeat(40) };
+    const changeFile = path.join(state, 'changes', changeReview.name + '.json');
+    json(changeFile, { ...changeReview, status: 'кандидат' });
+    const reviewArgs = { change: changeReview.name, role: 'проверка', task: 'Дай оценку этому изменению' };
+    const review = await send(reviewArgs);
+    assert.match(review.text, /gpt-6\.2-astra high.*review_high/);
+    await wait(review.id, 'done');
+    assert.deepEqual(readJob(review.id).changeReview, changeReview);
+    const reviewArgsLog = fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse).at(-1).args;
+    assert.equal(reviewArgsLog[reviewArgsLog.indexOf('-m') + 1], 'gpt-6.2-astra');
+    assert(reviewArgsLog.includes('model_reasoning_effort="high"'));
+    assert((await call({ ...reviewArgs, change: 'missing' })).isError);
+    assert((await call({ ...reviewArgs, role: 'совет' })).isError);
+    json(changeFile, { ...changeReview, status: 'закрыто без слияния' });
+    assert((await call(reviewArgs)).isError);
   } finally { await client.close(); await transport.close(); }
 });
 test('О14: рецепт, сохранение NODE_PATH, модели и самонапоминание', () => {

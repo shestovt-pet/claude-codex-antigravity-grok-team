@@ -15,10 +15,17 @@ const skipOld = () => { if (!hasBase) throw Object.assign(Error('публичн�
 const root = path.join(RUN, 'корень & (тест) с пробелом'), other = path.join(RUN, 'other');
 fs.mkdirSync(root); fs.mkdirSync(other);
 // Состав нового релиза после forward-миграции team-v46 (claude — устанавливаемый сервер).
-const servers = ['team', 'claude', 'codex', 'antigravity', 'deepseek'];
+const servers = ['team', 'claude', 'codex', 'antigravity', 'deepseek', 'kimi'];
 // Старый релиз (коммит base) собран кодом до claude-сервера: его проверяет старый deploy, у которого claude не адаптер.
 const oldServers = ['team', 'codex', 'antigravity', 'deepseek'];
 let current, old;
+function historicalState(root) {
+  // Отдельная история создаётся самим старым кодом; текущий журнал никогда не обрезается.
+  const store = require(path.join(old, 'common/members-store.js')).create(path.join(root, 'state'));
+  store.update(store.read().rev, n => { Object.assign(n.members.find(m => m.id === 'deepseek').roles, { receives: true, sends: true, writer: true, voter: true }); },
+    { action: 'activate', who: 'claude', reason: 'Историческая фикстура до Kimi', quote: 'Проверка' }, { phase: 'B' });
+  assert(!store.history().some(e => e.after.members.some(m => m.adapter === 'kimi-cli')));
+}
 const ok = result => assert.equal(result.status, 0, result.stderr + result.stdout);
 const snapshot = files => files.map(file => [fs.readFileSync(file).toString('hex'), fs.statSync(file).mtimeMs]);
 test('Подготовка: локальные пакеты и архив базы, фаза B из собственного корня', () => {
@@ -140,22 +147,41 @@ test('Команда cmd: точная передача данных, запре
   assert.throws(()=>ops.commandLine(dir,['x'.repeat(8191)],root),/слишком длинная/);
   assert.throws(()=>ops.commandLine(dir,[],path.parse(root).root),/разделителем/);
 });
-test('Матрица: старый start → новый CLI, новый start → старый CLI, новый → новый', async () => {
+test('Матрица: старый start → новый CLI, новый → новый; старый CLI после Kimi отвергнут', async () => {
   skipOld();
-  for (const [from,to,setRoot] of [[old,current,false],[current,old,true],[current,current,true]]) {
-    const config=path.join(root,'matrix-'+path.basename(from).slice(0,2)+'-'+path.basename(to).slice(0,2)+'.json');f.json(config,{});
+  for (const [from,originalTo,setRoot] of [[old,current,false],[current,old,true],[current,current,true]]) {
+    const preKimi=from===old, refused=originalTo===old, r=preKimi?path.join(RUN,'matrix-pre-kimi'):root;
+    if(preKimi)historicalState(r);
+    const to=preKimi?f.release(r,'f'.repeat(40),{servers,installed:false}):originalTo;
+    if(preKimi)fs.cpSync(path.join(f.source,'servers'),path.join(to,'servers'),{recursive:true});
+    const historyBefore=preKimi?fs.readFileSync(path.join(r,'state/members-log.jsonl'),'utf8'):null;
+    const config=path.join(r,'matrix-'+path.basename(from).slice(0,2)+'-'+path.basename(to).slice(0,2)+'.json');f.json(config,{});
     const code=`const assert=require('assert'),cp=require('child_process'),fs=require('fs'),path=require('path');
       const ops=require(${JSON.stringify(path.join(from,'common/deploy-ops.js'))});
-      ops.start({root:${JSON.stringify(root)},release:${JSON.stringify(to)},configs:[${JSON.stringify(config)}],cleanup:false},{launch:async(release,args,r)=>{
+      ops.start({root:${JSON.stringify(r)},release:${JSON.stringify(to)},configs:[${JSON.stringify(config)}],cleanup:false},{launch:async(release,args,r)=>{
         let env={...process.env};delete env.MOST_REPO_ROOT;delete env.MOST_STATE_DIR;
         ${setRoot ? `const line=require(${JSON.stringify(path.join(f.source,'common/deploy-ops.js'))}).commandLine(release,args,r);const index=line.indexOf(' /d ');const run=cp.spawnSync(line.slice(1,index-1),['/d',line.slice(index+4)],{env,encoding:'utf8',windowsVerbatimArguments:true});` : `assert(!args.includes('--root'));const run=cp.spawnSync(process.execPath,[path.join(release,'tools/deploy.js'),...args],{env,encoding:'utf8'});`}
-        assert.equal(run.status,0,run.stderr+run.stdout);return process.pid;
-      }}).then(t=>{assert.match(t,/завершено/);console.log(t)}).catch(e=>{console.error(e);process.exitCode=1});`;
-    ok(cp.spawnSync(process.execPath,['-e',code],{cwd:other,env:f.env(root),encoding:'utf8',timeout:120000}));
-    const servers=read(config).mcpServers;assert(servers.deepseek);assert.equal(servers.team.env.MOST_REPO_ROOT,root);
+        ${refused ? `assert.notEqual(run.status,0);throw Error(run.stderr+run.stdout);` : `assert.equal(run.status,0,run.stderr+run.stdout);return process.pid;`}
+      }}).then(t=>{${refused ? `assert.fail('Старый CLI не должен принять журнал Kimi')` : `assert.match(t,/завершено/);console.log(t)`}}).catch(e=>{${refused ? `assert.match(e.message,/kimi-cli|Реестр участников/);console.log('Старый CLI отвергнут')` : `console.error(e);process.exitCode=1`}});`;
+    ok(cp.spawnSync(process.execPath,['-e',code],{cwd:other,env:f.env(r),encoding:'utf8',timeout:600000}));
+    if(preKimi) {
+      const state=path.join(r,'state'),store=require('../common/members-store').create(state),reg=store.read();
+      assert(fs.readFileSync(store.log,'utf8').startsWith(historyBefore),'исторический журнал сохранён');
+      const events=store.history().filter(e=>e.action==='team-v56-kimi');assert.equal(events.length,1);
+      assert(!events[0].before.members.some(m=>m.adapter==='kimi-cli'));
+      const kimi=reg.members.find(m=>m.adapter==='kimi-cli');assert.equal(kimi.state,'paused');assert.equal(kimi.pause.kind,'manual');
+      assert.equal(events[0].after.members.find(m=>m.adapter==='kimi-cli').pause.kind,'manual');
+      const op=read(path.join(state,'kimi-migration.json'));assert.equal(op.status,'complete');
+      assert.deepEqual(op.steps.map(s=>[s.name,s.status]),[['stop','done'],['migrate','done']]);
+      assert(!fs.existsSync(path.join(state,'restart-hold.json')));
+      assert.equal(read(path.join(state,'restart-claims',op.id+'.json')).decision,'отмена');
+    }
+    if(refused)assert.deepEqual(read(config),{});
+    else {const servers=read(config).mcpServers;assert(servers.deepseek);assert.equal(servers.team.env.MOST_REPO_ROOT,r);}
   }
   const ops=require('../common/deploy-ops').list(root,{reconcile:false});
   for(const op of ops.filter(o=>!['install','race','rejected'].includes(o.id))) {
+    if(op.release===old){assert.equal(op.status,'отказ');assert.match(op.reason,/kimi-cli|Реестр участников/);continue;}
     assert.equal(op.status,'завершено');assert(Number.isInteger(op.pid));assert(fs.existsSync(path.join(root,'state/deploy-ops',op.id+'.json.pid')));
   }
   // Реестр корня фазы B: роли DeepSeek из f.phaseB сохранились — внешний шаг читал именно root/state/members.json.
@@ -225,6 +251,11 @@ test('Runner: таблица исходов и закрытый список о�
   const env=runner.environment(parent,RUN);assert.equal(env.PATH,'keep');assert(!Object.values(env).includes('dirty'));assert.equal(env.MOST_NOTIFY,'off');
   for(const name of ['../x','..','a/b','C:\\x'])assert.throws(()=>runner.logPath(__dirname,name));
   assert.equal(runner.logPath(__dirname,'own.txt'),path.join(__dirname,'own.txt'));
+  assert.equal(runner.logPath(__dirname,'own.txt',RUN),path.join(RUN,'own.txt'));
+  assert.throws(()=>runner.logPath(__dirname,'../x',RUN));
+  assert.throws(()=>runner.logPath(__dirname,'own.txt','relative'),/абсолютная/);
+  assert.throws(()=>runner.logPath(__dirname,'own.txt',__filename),/папка/);
+  assert.throws(()=>runner.logPath(__dirname,'own.txt',path.join(RUN,'missing')));
 });
 test('Runner: spawn error не мешает следующим, смешанный итог и нулевые прогоны', async () => {
   const {EventEmitter}=require('events');let calls=0;
@@ -280,11 +311,16 @@ test('Сводки: тот же релиз позже, строгие поля/�
   assert(!status.superseded({valid:false}));
   assert(!status.superseded({valid:true,status:'отказ',sameRoot:true,sameRelease:true,direct:true,commit:m.commit,names:[],at:2,updatedAt:1}));
   const {Team}=require('../common/team'), team=new Team(r), before=snapshot([file,marker]);
+  const historical=path.join(RUN,'historical-summary');historicalState(historical);
+  const historicalRelease=path.join(historical,'live','d'.repeat(40));fs.mkdirSync(historicalRelease,{recursive:true});
+  const historicalFile=f.operation(historical,historicalRelease,'stale');
+  f.json(historicalFile,{...op,root:historical,release:historicalRelease});
+  f.json(path.join(historical,'live/deployed.json'),{...m,release:historicalRelease});
   const baseline=`const assert=require('assert');
     require(${JSON.stringify(path.join(old,'common/quota-line.js'))}).quotaLine=async()=> 'Фиксированная квота';
-    const {Team}=require(${JSON.stringify(path.join(old,'common/team.js'))});const t=new Team(${JSON.stringify(r)});
+    const {Team}=require(${JSON.stringify(path.join(old,'common/team.js'))});const t=new Team(${JSON.stringify(historical)});
     (async()=>{for(const full of [false,true])assert((await t.status(undefined,undefined,undefined,full)).includes('Установка stale: отказ'));})().catch(e=>{console.error(e);process.exitCode=1});`;
-  ok(cp.spawnSync(process.execPath,['-e',baseline],{cwd:other,env:{...f.env(r),CODEX_PATH:path.join(r,'missing-codex.exe'),MOST_TEST_BOOT_AT:'2000-01-01T00:00:00Z'},encoding:'utf8'}));
+  ok(cp.spawnSync(process.execPath,['-e',baseline],{cwd:other,env:{...f.env(historical),CODEX_PATH:path.join(historical,'missing-codex.exe'),MOST_TEST_BOOT_AT:'2000-01-01T00:00:00Z'},encoding:'utf8'}));
   for(const full of [false,true]) {const text=await team.status(undefined,undefined,undefined,full);assert(!text.includes('Установка stale:'),text);assert(text.includes('Последнее развёртывание:'),text);}
   assert.deepEqual(snapshot([file,marker]),before);
   f.json(marker,{...m,at:op.updatedAt});

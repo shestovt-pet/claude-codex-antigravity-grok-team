@@ -1,9 +1,10 @@
 'use strict';
 // Профили DeepSeek Harness для поручений моста: создаются установкой из adapter_params реестра.
-// MCP моста: в most-read, most-write и most-full — гостевые серверы для подпоручений (team-v36), в most-review нет; авторизация аккаунта включена (ключ API не нужен); модель задаётся профилем
-// (у headless нет флага модели): most-read — flash, most-review — pro (единственный для голоса),
-// most-write — pro, most-full — pro. most-review в песочнице read-only и без оболочки.
+// most-review — профиль проверки и голоса, только чтение, без MCP и оболочки. Модель задаёт профиль dsh:
+// по умолчанию flash, для конкретного процесса мост может передать другой выбор через окружение.
 const fs = require('fs'), path = require('path'), os = require('os');
+const { TABLE } = require('./model-choice');
+const MODEL_ENV = 'MOST_DSH_JOB_MODEL';
 
 function profilesDir() {
   return process.env.DSH_HOME || path.join(process.env.USERPROFILE || os.homedir(), '.dsh');
@@ -20,7 +21,11 @@ function profileName(job) {
 }
 function profileModel(name, params) {
   const models = params?.models || {};
-  return name === 'most-read' ? (models.read || 'deepseek-v4-flash') : (models.review || 'deepseek-v4-pro');
+  const reading = name === 'most-read';
+  const configured = reading ? models.read : models.review;
+  // Старые штатные значения уже записаны в реестре. Обновляем их при чтении, сохраняя пользовательские настройки.
+  const previousDefault = reading ? 'deepseek-v4-flash' : 'deepseek-v4-pro';
+  return configured && configured !== previousDefault ? configured : TABLE.deepseek.read.model;
 }
 function cordisYml() { return '# dsh profile root — an empty entry list.\n[]\n'; }
 function packageJson(name) {
@@ -31,7 +36,8 @@ const auth = (model) => [
   '- id: credentials', '  disabled: false',
   '- id: deepseek-account', '  disabled: false',
   '- id: authorization', '  disabled: false',
-  '- id: agent-default-model', '  config:', '    provider: deepseek-account', '    model: ' + model,
+  '- id: agent-default-model', '  config:', '    provider: deepseek-account',
+  '    model: !!js process.env.' + MODEL_ENV + ' || ' + JSON.stringify(model),
 ];
 function patch(name, model, bridge) {
   const mode = name === 'most-read' || name === 'most-review' ? 'read-only' : name === 'most-write' ? 'workspace-write' : 'danger-full-access';
@@ -159,4 +165,4 @@ function journalEvidence(sessionId, dir = profilesDir()) {
   } catch { return null; }
 }
 const journalModel = (id, dir) => journalEvidence(id, dir)?.model || null;
-module.exports = { profilesDir, generate, profileName, profileModel, modelFor, sessionModel, sessionEvidence, journalModel, journalEvidence, zstdFrames, DEEPSEEK_ROUTES };
+module.exports = { profilesDir, generate, profileName, profileModel, modelFor, sessionModel, sessionEvidence, journalModel, journalEvidence, zstdFrames, DEEPSEEK_ROUTES, MODEL_ENV };

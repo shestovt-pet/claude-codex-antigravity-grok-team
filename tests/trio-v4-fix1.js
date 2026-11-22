@@ -84,7 +84,7 @@ test('Старый релиз: три сервера и старое храни�
   const commit = git.hash(root), release = path.join(root, 'live', commit), oldState = path.join(root, 'live/.deploy-state');
   const oldNames = ['team', 'codex', 'antigravity'];
   // team-v46: после миграции реестра серверов четыре (добавлен claude); старый релиз проверял только три.
-  const names = ['team', 'claude', 'codex', 'antigravity'];
+  const names = ['team', 'claude', 'codex', 'antigravity', 'kimi'];
   // Релиз содержит настоящий код кандидата; старый deploy проверял только три сервера.
   for (const dir of ['servers', 'common']) fs.cpSync(path.join(__dirname, '..', dir), path.join(release, dir), { recursive: true });
   fs.copyFileSync(path.join(__dirname, '../package.json'), path.join(release, 'package.json'));
@@ -114,8 +114,11 @@ test('Старый релиз: три сервера и старое храни�
       restarted = true; write(log, 'запущен ' + runId);
     } },
   });
-  assert.equal(probes.length, names.length * (1 + require('../common/member-clients').all().length)); // team-v46: четыре сервера перепроверяются заново
-  assert.deepEqual(read(path.join(release, 'probe-ok.json')).servers, names);
+  // Новый адаптер: проба до миграции и готовность того же кода до снятия hold.
+  const finalNames = require('../common/members').serversForInstall(require('../common/members-store').create(path.join(root, 'state')).read());
+  const round = ns => [...ns.map(n => [n, 'claude']), ...require('../common/member-clients').all().flatMap(c => ns.map(n => [n, c.id]))];
+  assert.deepEqual(probes, [...round(names), ...round(finalNames)]);
+  assert.deepEqual(read(path.join(release, 'probe-ok.json')).servers, finalNames);
   for (const n of names) assert.equal(read(config).mcpServers[n].env.MOST_STATE_DIR, path.join(root, 'state'));
   assert(!fs.readFileSync(process.env.MOST_CODEX_CONFIG, 'utf8').includes('[mcp_servers.grok]'));
   assert(!read(process.env.MOST_AGY_MCP_CONFIG).mcpServers.grok);

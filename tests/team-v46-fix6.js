@@ -92,8 +92,8 @@ module.exports = ({ test, f, client, text }) => {
       save(who, card);
       const lock = wl.acquire(folder, { jobId: id }); assert(lock.ok); lock.release();
       assert.equal(wl.acquire(folder).ok, false);
-      const cleanup = require('../common/cleanup'), scan = cleanup.windowsProcesses;
-      cleanup.windowsProcesses = () => [];
+      const hold = require('../common/restart-hold'), scan = hold.processTableAsync;
+      hold.processTableAsync = async () => [{ pid: process.pid, ppid: process.ppid, startedAt: null }];
       try {
         const run = require('../common/' + action).run;
         const result = await run({ job_ids: [id], quote: 'Исполнитель остановлен, закрыть.' });
@@ -105,7 +105,7 @@ module.exports = ({ test, f, client, text }) => {
         const retry = wl.acquire(folder, { jobId: id }); assert(retry.ok);
         await run({ job_ids: [id], quote: 'Исполнитель остановлен, закрыть.' });
         const after = wl.acquire(folder, { jobId: id + '-after' }); assert(after.ok); after.release();
-      } finally { cleanup.windowsProcesses = scan; }
+      } finally { hold.processTableAsync = scan; }
     }));
   test('fix6 #4: сбой отметки после переключения сохраняет новый конфиг и receives=true', async () => {
     const root = path.join(f.RUN, 'fix6-deploy'), state = path.join(root, 'state');

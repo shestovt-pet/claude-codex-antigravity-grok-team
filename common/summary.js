@@ -32,6 +32,10 @@ function grokText(c) {
     return v.decision || ({ running: 'ждём ответ', queued: 'ждём ответ', delivery_unclear: 'ждём ответ', failed: 'отказ', lost: 'потеряно', cancelled: 'отменено локально', stop_unconfirmed: 'остановка не подтверждена', cancel_requested: 'запрошена отмена' }[v.status]) || v.status;
   }).join(' / ');
 }
+// team-v62: нелатинская/незарегистрированная работа роли «совет» принимается ярлыком без привязки к воротам. Её имя
+// (workLabel) хранится в карточке; сводка и *_result показывают «работа: <имя> (без привязки)». Привязка зарегистрированных
+// работ к приёмке идёт отдельно (job.work / job.stage) и этим ярлыком не затрагивается.
+function workLabelLine(job) { return job && job.workUnbound && job.workLabel ? 'работа: ' + job.workLabel + ' (без привязки)' : null; }
 function workTitle(name) {
   if (!/^[a-z0-9-]{1,40}$/.test(name || '')) return name || 'не указана';
   try { return title(read(path.join(require('./paths').repoRoot, 'works', name + '.json'))); }
@@ -101,32 +105,51 @@ async function compact(team, quota, snapshot = require('./job-snapshot').create(
     for (const m of registry.members.filter(m => m.state !== 'removed' && m.pause))
       add('Пауза участника ' + m.title + ' (' + m.id + '): ' + m.pause.kind + ' — ' + members.pauseNote(m));
   } catch (e) { add(e.message); }
+  // team-v63 (п.4): одна строка о сценариях без тяжёлых чтений (только state.json каждого сценария).
+  try { const n = require('./scenario').runningCount(require('./paths').stateDir); if (n) add('Сценарии: ' + n + ' идёт', 2); } catch {}
   for (const line of options.required || []) add(line);
   for (const line of options.restartWarnings || require('./restart-hold').warnings(path.dirname(team.state))) add(line);
   await section(() => require('./release-drift').lines(team.root, require('./paths').stateDir).forEach(line => add(line)));
   for (const who of require('./members').scanIds) await section(async () => {
     const result = stores.list(who, true, snapshot); jobs[who] = result.jobs;
     result.errors.forEach(e => add('Ошибка чтения: ' + e));
-    const waiting = result.jobs.filter(j => !j.archived && j.status === 'waiting_quota');
+    // team-v61 (п.3): «ближайшее продолжение» честно только там, где очередь действительно возобновляет поручение
+    // (Codex/Antigravity). Kimi не автопродолжает — его исчерпание показывает отдельная строка «Kimi: лимит исчерпан» ниже,
+    // поэтому из этой агрегации Kimi исключён (иначе обещалось бы автопродолжение, которого не будет).
+    const waiting = who === 'kimi' ? [] : result.jobs.filter(j => !j.archived && j.status === 'waiting_quota');
     if (waiting.length) {
       const times = waiting.map(j => Date.parse(j.nextAttemptAt)).filter(Number.isFinite);
       const next = times.length ? new Date(Math.min(...times)).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) : 'время неизвестно';
       add(require('./members').names[who] + ': Ждут квоту: ' + waiting.length + ' поручений, ближайшее продолжение ' + next + ' · подробности: full=true');
     }
+    // team-v60: исчерпание подписочной квоты Kimi (5-часовое окно) — одна строка «Kimi: лимит исчерпан с ЧЧ:ММ», пока после
+    // зафиксированного исчерпания не было успешного (done) поручения Kimi.
+    if (who === 'kimi') {
+      const quotaAt = Math.max(0, ...result.jobs.filter(j => !j.archived && j.lastQuotaAt).map(j => Date.parse(j.lastQuotaAt)).filter(Number.isFinite));
+      // team-v61 (Kimi №3): строку «лимит исчерпан» снимает ЛЮБОЕ более позднее успешное (done) поручение Kimi, включая
+      // архивное — для okAt архивность не исключаем (иначе после архивирования успеха старое lastQuotaAt держало бы строку).
+      const okAt = Math.max(0, ...result.jobs.filter(j => j.status === 'done').map(j => Date.parse(j.finishedAt || j.finalizedAt)).filter(Number.isFinite));
+      if (quotaAt && quotaAt > okAt) add(require('./members').names[who] + ': лимит исчерпан с ' + new Date(quotaAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }));
+    }
     let decisions = 0, stops = 0;
     const active = ['running', 'queued', 'cancelling', 'cancel_requested', 'delivery_unclear', 'migration_conflict', 'applying'];
+    // team-v63 (Д): сценарные поручения в краткой сводке по одному НЕ перечисляем — их считает строка «Сценарии: N идёт».
+    // team-v63 (п.23): НО из счётчиков решений/остановок сценарные не выпадают — нужно решение/неподтверждённая остановка
+    // сценарного поручения видна в сводке через эти счётчики (прежде фильтр !j.scenario выбрасывал их целиком).
     for (const j of result.jobs.filter(j => !j.archived && (j.stopUnconfirmed || [...active, 'needs_decision', 'stop_unconfirmed'].includes(j.status)))) {
       const confirmed = require('./live-jobs').confirmed(j, who);
       const status = require('./live-jobs').effectiveStatus(j, ['running', 'cancelling', 'stop_unconfirmed'].includes(j.status) ? await snapshot.ownerState(j.owner) : 'unknown');
       if (confirmed && status !== 'needs_decision' && !active.includes(status) && status !== 'waiting_quota') continue;
       const stopped = !confirmed && (j.stopUnconfirmed || j.status === 'stop_unconfirmed');
+      // Сценарное поручение индивидуальной строкой не показываем, но в счётчики решений/остановок включаем.
+      if (j.scenario) { if (status === 'needs_decision') decisions++; if (stopped) stops++; continue; }
       const old = Date.parse(j.startedAt) < Date.now() - 86400000;
       if (old && !active.includes(status)) {
         if (stopped) stops++;
         if (status === 'needs_decision') decisions++;
         continue;
       }
-      add(who + ' ' + j.id.slice(0, 8) + ': ' + require('./states')[status] + (stopped ? ' · ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА' : '') + (j.nextAttemptAt ? ' до ' + j.nextAttemptAt : ''));
+      add(who + ' ' + j.id.slice(0, 8) + ': ' + require('./states')[status] + (stopped ? ' · ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА' : '') + (j.nextAttemptAt ? ' до ' + j.nextAttemptAt : '') + (workLabelLine(j) ? ' · ' + workLabelLine(j) : ''));
     }
     if (decisions) add(who + ': нужно решение по ' + decisions + ' поручениям старше суток — full=true');
     if (stops) add(who + ': остановка не подтверждена у ' + stops + ' поручений старше суток — full=true');
@@ -147,7 +170,9 @@ async function compact(team, quota, snapshot = require('./job-snapshot').create(
       for (const s of w.stages) {
         if (s.state === 'выдан без принятия') block.push(title(w) + ': ' + s.title + ' — выдан без принятия; ' + (s.gate?.reasons || []).join('; '));
         if (s.gate?.files?.length) block.push(title(w) + ': ' + s.title + ' — место помощника с чистой памятью заполнено файлом Claude; сервер его не проверял');
-        if (s.gate?.warning) add(title(w) + ': ' + s.title + ' — ' + s.gate.warning);
+        // team-v61 (Codex №4): СОХРАНЁННОЕ предупреждение этапа («этап не удалось проверить (ENOENT …)») показываем и в
+        // краткой сводке — берём его из сохранённого состояния БЕЗ переоценки ворот (refreshWork/чтения материала/хешей нет).
+        if (s.gate?.warning) block.push(title(w) + ': ' + s.title + ' — ' + s.gate.warning);
       }
       add(block.join('\n'), 6, { work: true, updated: Date.parse(w.updated_at || w.created_at) || 0 });
     }
@@ -197,4 +222,4 @@ async function compact(team, quota, snapshot = require('./job-snapshot').create(
   });
   return fit(rows, options.budget);
 }
-module.exports = { fit, changeTitle, localTime, compact, title, label, workTitle, loadLine, settings, grokText, mergedLine };
+module.exports = { fit, changeTitle, localTime, compact, title, label, workTitle, workLabelLine, loadLine, settings, grokText, mergedLine };

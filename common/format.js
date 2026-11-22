@@ -37,8 +37,9 @@ function format(assistant, job = {}, body = '', next = 'Проверьте ре�
       duration(elapsed),
     job.stage
       ? 'Этап: ' + (job.stageTitle || job.stage) + ' (работа ' + require('./summary').workTitle(job.workName || (typeof job.work === 'string' ? job.work : '—')) + ')'
-      : '',
+      : require('./summary').workLabelLine(job) || '',
     job.id ? 'Номер поручения: ' + job.id : '',
+    job.requestId ? 'ID запроса (для повтора): ' + job.requestId : '',
     job.from ? 'Отправитель: ' + job.from + (job.fromChat ? ' (чат)' : '') : '',
     assistant === 'Codex' && job.id ? 'запрошено: модель ' + (job.model || 'unknown') + ', уровень ' + (job.effort || 'unknown') + '; подтверждено: модель unknown, уровень unknown' : '',
     assistant === 'Codex' && job.fullAccessApplied === true

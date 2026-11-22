@@ -168,12 +168,14 @@ function countReads() {
     if (files.has(String(file))) counts.set(String(file), (counts.get(String(file)) || 0) + 1);
     return original.call(this, file, ...args);
   };
-  return { counts, files, restore() { fs.readFileSync = original; }, check(multiplier = 1) {
-    assert.equal(counts.size, files.size);
-    for (const [file, count] of counts) assert.equal(count, multiplier, file + ': ' + count + ' чтений');
+  // team-v62: team-v59 «сводка за секунды» — status/list/get строят сводку из сохранённого снимка (scan-index), НЕ перечитывая
+  // карточки. Карточка читается только если её запись в индексе устарела (mtime изменился). Поэтому проверяем не «по одному
+  // чтению на карточку», а ЧИСЛО РАЗНЫХ перечитанных карточек: 0 при свежем индексе, ровно обновлённые — при изменении.
+  return { counts, files, restore() { fs.readFileSync = original; }, check(expectedFiles = 0) {
+    assert.equal(counts.size, expectedFiles, 'перечитано карточек: ' + counts.size + ' (ожидалось ' + expectedFiles + ') — сводка строится из снимка');
   } };
 }
-test('О6: N карточек и M этапов — одно чтение на весь status/list/get, включая source и review', async () => {
+test('О6: N карточек и M этапов — сводка из снимка без перечитывания карточек (status/list/get, включая source и review)', async () => {
   const f = fixture({ author: { family: 'google', model: 'gemini' } });
   job(f, 'antigravity', 0, { role: 'текст' }); job(f, 'codex', 1, { task: 'historic' }); job(f); reviews(f);
   const team = persisted(f);
@@ -200,14 +202,14 @@ test('О2/О6: два перекрывающихся запроса имеют �
     try {
       const first = team.status(); await ready;
       update('codex', id, { status: 'done' });
-      // Запись фикстуры читает JSON сама; не относится к серверному запросу.
-      measured.counts.set(card('codex', id), measured.counts.get(card('codex', id)) - 1);
       let secondEntered; const readySecond = new Promise(resolve => { secondEntered = resolve; });
       quota.quotaLine = () => { secondEntered(); return Promise.resolve('Квоты: тест'); };
       const second = team.status(); await readySecond;
       const secondText = await second; entered[0]('Квоты: тест'); const firstText = await first;
       assert(firstText.includes(id.slice(0, 8))); assert(!secondText.includes(id.slice(0, 8)));
-      measured.check(2);
+      // team-v62: снимки независимы (первый видит running, второй — done). Перечитывается ТОЛЬКО обновлённая карточка
+      // (её запись в индексе устарела после update); остальные берутся из снимка. Было «2 чтения на каждую из всех».
+      measured.check(1);
     } finally { measured.restore(); }
   });
 });

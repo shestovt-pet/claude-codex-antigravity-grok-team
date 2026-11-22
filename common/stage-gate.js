@@ -337,6 +337,7 @@ async function evaluateCurrent(w, s, old, jobs, snapshot) {
   if (new Set(ids).size !== ids.length) throw Error('Одно поручение дважды в reviews.');
   for (const id of ids) if (jobs.some(j => j.id === id) && !linked.some(j => j.id === id)) throw Error(id + ': поручение другой работы или этапа.');
   const rows = currentRows(w, s, jobs, v, ids, snapshot).filter(j => j.replaces?.who !== 'grok');
+  for (const j of rows) if (require('./members').adapterOf(j.who) === 'kimi-cli' && require('./members').get(j.who)) require('./kimi-review').eligibility(j.who);
   for (const j of rows) if (ps.some(p => p.part) && !named(j.who === 'fresh' ? j.reviewText : task(j), ps).length)
     messages.push(j.id + ': части не названы — засчитано на все');
   for (const j of rows.filter(j => j.who !== 'fresh')) {
@@ -445,9 +446,25 @@ async function evaluateCurrent(w, s, old, jobs, snapshot) {
 // Вызывается мостами под общим замком работы до отправки.
 async function prepareJob(a, who, root = repoRoot) {
   require('./access').guard(who, who + '_send', a);
+  // team-v59 (часть 3 п.3а,3б): простой вопрос (роль «совет») — имя работы любое (кириллица, пробелы), регистрация не
+  // обязательна. Имя не латинский идентификатор ИЛИ работа не зарегистрирована → принимаем БЕЗ привязки к воротам работы:
+  // исходное имя сохраняем ярлыком (workLabel), владение/этап не требуются. Делается ДО withWork (он берёт замок работы по
+  // латинскому имени). Ворота приёмки зарегистрированных работ не затрагиваются; для «текст»/«проверка» привязка обязательна.
+  if (a.work && a.role === 'совет') {
+    const latin = /^[a-z0-9-]{1,40}$/.test(a.work);
+    if (!latin || !fs.existsSync(path.join(root, 'works', a.work + '.json'))) {
+      a.workLabel = a.work; a.workUnbound = true; delete a.work; delete a.stage;
+    }
+  }
   return require('./work-owner').withWork(a, () => prepareLocked(a, who, root), root);
 }
 async function prepareLocked(a, who, root) {
+  if (require('./members').adapterOf(who) === 'kimi-cli') {
+    const refusal = require('./kimi-launch').refusal(a); if (refusal) throw Error(refusal);
+    // team-v56 А1: шлюз приёма поручения проверяет допуск ИСПОЛНЕНИЯ (voter не требуется), не голоса — писатель и совет
+    // при voter=false принимаются и исполняются без голоса; запись требует роль писателя; пауза/CLI проверяются как прежде.
+    require('./kimi-review').executionEligibility({ write: a.write === true, fullAccess: a.full_access === true || a.fullAccess === true, fallbackWord: a.fallbackWord }, who, { requireProbe: false });
+  }
   if (!a.work) return a;
   if (!['текст', 'проверка', 'совет'].includes(a.role)) throw Error('Поручение с work требует role: текст, проверка или совет.');
   if (a.replaces && a.role !== 'проверка') throw Error('replaces допустим только для role «проверка».');
@@ -459,6 +476,7 @@ async function prepareLocked(a, who, root) {
   delete a.gateOrder; delete a.replacementEvidence;
   s.id ||= crypto.randomUUID(); s.rules_version ||= 13; s.gate ||= { files: [], reasons: [] };
   a.stageId = s.id; a.stage = s.id; a.stageTitle = s.title;
+  a.stageLevel = s.level;
   if (a.role === 'проверка' && (s.rules_version >= 14 || s.level)) {
     const v = version(w, s);
     if (who === 'codex' && (a.continue_id || a.previous || a.write)) throw Error('Ревью Codex должно быть новым сеансом только для чтения.');

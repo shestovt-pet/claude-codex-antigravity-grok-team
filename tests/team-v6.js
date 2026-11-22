@@ -18,14 +18,14 @@ function checklist() {
   files.forEach((f, i) => {
     const s = fs.readFileSync(f, 'utf8');
     // Правила доставляются с корнем установки (team-v11 Р1): здесь корень — папка прогона.
-    for (const text of ['Claude — дирижёр', 'Codex — критик логики и код', 'Antigravity — автор литературного текста', 'Claude — веб-поиск, источники и термины', ...require('../common/members').active().map(m => m.title + ': ' + m.specialization), 'Помощники из team_status участвуют в обсуждении замысла и итоговом ревью', 'Рутину делают сервер и скрипты', 'Обязательные проверяющие — голосующие помощники из team_status', 'решение принимает Claude', ...['C:\\most\\AGENTS.md', 'C:\\most\\rules\\common.md', 'C:\\most\\lessons.md'].map(t => require('../common/paths').withRoot(t, process.env.MOST_REPO_ROOT)), '[блокирующее]/[улучшение]', '[разовое]/[системное]', 'последняя строка — «ПРИНЯТО» или «НЕ ПРИНЯТО: N блокирующих»', 'только с доказательством', i ? 'не разрешение самостоятельно отправлять задания или менять настройки' : 'Чат Codex может сам ставить поручения через мост']) assert(s.includes(text), text);
+    for (const text of ['Claude — дирижёр', 'Codex — критик логики и код', 'Antigravity — автор литературного текста', 'Claude — веб-поиск, источники и термины', ...require('../common/members').active().map(m => m.title + ': ' + m.specialization), 'Помощники из team_status участвуют в обсуждении замысла и итоговом ревью', 'Рутину делают сервер и скрипты', 'Обязательные проверяющие — голосующие помощники из team_status', 'решение принимает Claude', ...['C:\\most\\AGENTS.md', 'C:\\most\\rules\\common.md', 'C:\\most\\lessons.md'].map(t => require('../common/paths').withRoot(t, process.env.MOST_REPO_ROOT)), '[блокирующее]/[улучшение]', '[разовое]/[системное]', 'последняя строка — «ПРИНЯТО» или «НЕ ПРИНЯТО: N блокирующих»', 'только с доказательством', i ? 'Чат Antigravity — полный набор дирижёра' : 'Чат Codex — полный набор дирижёра']) assert(s.includes(text), text);
     for (const text of i ? ['на диск не пишет', 'команд, меняющих файлы, не запускает', 'Результат переносит сервер по решению Claude'] : ['отдельного пользователя Windows без сети', '`.git` только для чтения', 'Удаления запрещены', 'перечисляй в отчёте']) assert(s.includes(text), text);
   });
 }
 function release() {
   const dir = path.join(RUN, 'live', 'a'.repeat(40));
-  for (const n of ['team', 'codex', 'antigravity']) write(path.join(dir, 'servers', n, 'index.js'), '');
-  json(path.join(dir, 'probe-ok.json'), { root: RUN, commit: 'a'.repeat(40), at: new Date().toISOString(), servers: ['team', 'codex', 'antigravity'] });
+  for (const n of [...require('../common/members').installedServers]) write(path.join(dir, 'servers', n, 'index.js'), '');
+  json(path.join(dir, 'probe-ok.json'), { root: RUN, commit: 'a'.repeat(40), at: new Date().toISOString(), servers: [...require('../common/members').installedServers] });
   return dir;
 }
 test('Р1: точные прежние структуры, обязательный смысл, внешние байты и повтор', async () => {
@@ -151,7 +151,11 @@ test('Р3: close проверяет владельца, сохраняет ис�
   assert.equal(read(file).verdicts.length, 1); assert.equal(require('../common/summary').changeTitle({ name: 'trio-v2' }), 'trio-v2');
   const merged = team.changeFile('merged-change'); json(merged, { name: 'merged-change', owner: 'session', status: 'слито' });
   await assert.rejects(team.change({ action: 'close', name: 'merged-change', owner: 'session', note: 'проверка' }), /Слитое/);
-  process.env.MOST_CLIENT = 'codex'; try { await assert.rejects(team.change({ action: 'close', name: 'old-change', owner: 'session', note: 'устарело' }), /Гостю/); } finally { process.env.MOST_CLIENT = 'claude'; }
+  // team-v58: чат любого участника (codex) с доказанным происхождением закрывает изменение как дирижёр; закрыто оно только для
+  // ПОРУЧЕНИЯ-сеанса (MOST_JOB_ID) — ему team_change недоступен (allowed→guard «Гостю это действие запрещено»).
+  process.env.MOST_CLIENT = 'codex'; process.env.MOST_JOB_ID = 'job-v6-close';
+  try { await assert.rejects(team.change({ action: 'close', name: 'old-change', owner: 'session', note: 'устарело' }), /Гостю|запрещено|поручени/); }
+  finally { process.env.MOST_CLIENT = 'claude'; delete process.env.MOST_JOB_ID; }
   const summary = await require('../common/summary').compact({ root: RUN, state: team.state, works: () => [] }, 'Квоты');
   assert.match(summary, /закрыто: 1/); assert(!summary.includes('old-change'));
 });
@@ -176,10 +180,10 @@ test('Р5: execute → restart → итог сценария; отказ гот�
         require('./fixtures/team-v29/restart-complete')(info);
         write(info.log, 'итог ' + info.runId + ' ' + (success ? 'True' : 'False') + '\n');
         json(info.result, { runId: info.runId, release: 'candidate-release', startedAt: '2026-09-27T10:00:00Z', finishedAt: '2026-09-27T10:01:00Z', success, reason: 'Пробный итог' });
-        for (const name of ['team', 'codex', 'antigravity']) json(path.join(root, 'state/ready', name + '.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'candidate-release' });
+        for (const name of [...require('../common/members').installedServers]) json(path.join(root, 'state/ready', name + '.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'candidate-release' });
       } }),
     });
-    if (success) { await execute(); assert.equal(read(file).status, 'завершено'); assert.equal(read(file).restartEvidence.ready.length, 3); }
+    if (success) { await execute(); assert.equal(read(file).status, 'завершено'); assert.equal(read(file).restartEvidence.ready.length, require('../common/members').installedServers.length); }
     else { await assert.rejects(execute(), /готовность нового Claude не подтверждена/); assert.equal(read(file).status, 'перезапуск не подтверждён'); assert.equal(read(file).restartEvidence, undefined); }
   }
 });
@@ -188,10 +192,10 @@ test('Р5: завершено только после журнала и свеж
   let now = 0; await assert.rejects(restart.waitForCompletion(info, { now: () => now, sleep: async ms => { now += ms; }, completionMs: 500 }), /Истекло время/);
   json(info.result, { runId: 'run', release: 'release', success: false, reason: 'отказ' }); await assert.rejects(restart.waitForCompletion(info), /отказ/);
   const startedAt = '2026-09-27T10:00:00Z'; json(info.result, { runId: 'run', release: 'release', success: true, startedAt, finishedAt: '2026-09-27T10:01:00Z' });
-  for (const name of ['team', 'codex', 'antigravity']) json(path.join(state, 'ready', name + '.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'release' });
+  for (const name of [...require('../common/members').installedServers]) json(path.join(state, 'ready', name + '.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'release' });
   await assert.rejects(restart.waitForCompletion(info), /ENOENT/);
   write(info.log, 'итог run True\n');
-  assert.equal((await restart.waitForCompletion(info)).ready.length, 3);
+  assert.equal((await restart.waitForCompletion(info)).ready.length, require('../common/members').installedServers.length);
   await assert.rejects(restart.waitForCompletion(info, { alive: () => false }), /Готовность/);
   json(path.join(state, 'ready/codex.json'), { pid: process.pid, startedAt: '2026-09-27T10:00:30Z', release: 'old' }); await assert.rejects(restart.waitForCompletion(info), /Готовность/);
   json(path.join(state, 'ready/codex.json'), { pid: process.pid, startedAt, release: 'release' }); await assert.rejects(restart.waitForCompletion(info), /Готовность/);

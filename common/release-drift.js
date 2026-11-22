@@ -9,7 +9,7 @@ function git(root, args) {
   if (r.error || r.status !== 0) throw Error('Не удалось проверить git: ' + args[0]);
   return r.stdout.trim();
 }
-function lines(root, state) {
+function lines(root, state, { full = false } = {}) {
   root = realOrGiven(root);
   const rows = [], deployedPath = path.join(root, 'live', 'deployed.json');
   let deployed;
@@ -33,7 +33,8 @@ function lines(root, state) {
     // team-v28 Р3: отметки готовности только текущих участников; чужие (Grok выключен) — справкой, без «⚠».
     const servers = require('./members').installedServers, files = fs.readdirSync(ready).filter(n => n.endsWith('.json'));
     const stale = files.filter(n => !servers.includes(n.slice(0, -5)));
-    if (stale.length) rows.push('Устаревшая отметка готовности: ' + stale.join(', '));
+    // team-v60: перечень устаревших отметок — только в full; краткая сводка показывает одно число (их уборку не ждёт).
+    if (stale.length) rows.push(full ? 'Устаревшая отметка готовности: ' + stale.join(', ') : 'устаревших отметок готовности: ' + stale.length + ' — full=true');
     const releases = files.filter(n => !stale.includes(n)).map(n => {
       const rec = JSON.parse(fs.readFileSync(path.join(ready, n), 'utf8'));
       return rec.release && path.resolve(rec.release);

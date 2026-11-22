@@ -169,7 +169,9 @@ if (process.argv.includes('--team-server')) {
   function bridgeHarness(who) {
     const file = path.join(__dirname, '../servers', who, 'index.js'), source = fs.readFileSync(file, 'utf8');
     const m = new Module(file, module); m.filename = file; m.paths = Module._nodeModulePaths(path.dirname(file));
-    const end = source.lastIndexOf('(async () => {'); assert(end > 0);
+    // Якорь по началу строки: бутстрап сервера — `(async () => {` без отступа. Без `\n` lastIndexOf ловил вложенный
+    // `  (async () => {` внутри бутстрапа (team-v62) и резал исходник посреди него (Unexpected end of input).
+    const end = source.lastIndexOf('\n(async () => {'); assert(end > 0);
     const nativeRequire = m.require.bind(m);
     // DeepSeek запускает тот же fake-codex через обёртку протокола, без настоящего dsh.
     if (who === 'deepseek') m.require = id => id === 'child_process' ? { ...cp, spawn: (_bin, _args, opts) => {
@@ -255,8 +257,13 @@ child.on('close', code => { process.exitCode = code; });
       for (const removed of [false, true]) {
         if (removed) updateMembers(n => { n.members.find(m => m.id === 'deepseek').state = 'removed'; }); else pause(true);
         for (const [tool, args] of operations()) {
+          const ownerWord = tool === 'team_change' && args.who === 'user';
           const before = fs.readFileSync(team.changeFile(c.name), 'utf8'), words = require('../common/user-word').lines().length;
-          r = await call(tool, args); assert(r.isError, text(r)); assert.match(text(r), removed ? /Неверный участник/ : /на паузе/);
+          r = await call(tool, args);
+          // team-v59: слово владельца закрывает место даже для участника на паузе (deepseek ещё в knownSeatIds);
+          // удалённого (не место связки) заменить нельзя — отказ по replaces.
+          if (ownerWord && !removed) { assert(!r.isError, text(r)); assert.match(text(r), /Закрыто словом владельца/); continue; }
+          assert(r.isError, text(r)); assert.match(text(r), removed ? /Неверный участник|replaces/ : /на паузе/);
           assert.equal(fs.readFileSync(team.changeFile(c.name), 'utf8'), before); assert.equal(require('../common/user-word').lines().length, words);
         }
         if (!removed) {
@@ -337,15 +344,10 @@ child.on('close', code => { process.exitCode = code; });
     for (const quote of ['', '  ']) await assert.rejects(team.work({ ...args, quote }), /нужно слово/);
     for (const extra of [{ stages: [] }, { goal: 'другая' }, { plan_change: 'другая' }, { status_sent: true }]) await assert.rejects(team.work({ ...args, quote: 'Закрыть', ...extra }), /не меняет план/);
     await assert.rejects(team.work(args), /Закрыть можно/);
-    const access = require('../common/access'), words = require('../common/user-word'), originalMode = words.mode;
-    for (const env of [{ MOST_CLIENT: 'codex' }, { MOST_JOB_ID: 'job-v45' }]) {
-      const prev = { MOST_CLIENT: process.env.MOST_CLIENT, MOST_JOB_ID: process.env.MOST_JOB_ID }; Object.assign(process.env, env);
-      try { await assert.rejects(team.work({ ...args, quote: 'Закрыть' })); } finally { for (const [k, v] of Object.entries(prev)) if (v === undefined) delete process.env[k]; else process.env[k] = v; }
-    }
-    // Изолируем проверку именно режима закрытия от раннего общего access.guard.
-    const guard = access.guard; access.guard = () => {}; words.mode = () => ({ active: true });
-    try { await assert.rejects(team.work({ ...args, quote: 'Закрыть' }), /основном режиме/); }
-    finally { access.guard = guard; words.mode = originalMode; }
+    // team-v59: закрытие словом — из доказанного чата любого участника и в запасном режиме; только поручение/недоказанный сеанс — отказ.
+    const prevJob = process.env.MOST_JOB_ID; process.env.MOST_JOB_ID = 'job-v45';
+    try { await assert.rejects(team.work({ ...args, quote: 'Закрыть' }), /из поручения|недоказанного/); }
+    finally { if (prevJob === undefined) delete process.env.MOST_JOB_ID; else process.env.MOST_JOB_ID = prevJob; }
     assert.equal(fs.readFileSync(team.workFile(w.name), 'utf8'), before);
   });
   test('П3/П4 тексты и ограничение размера памятки', () => {

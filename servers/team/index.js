@@ -16,9 +16,13 @@ const SEATS = fromRegistry(() => require('../../common/members').knownSeatIds);
 const WORD_WHO = fromRegistry(() => [...require('../../common/members').knownSeatIds, ...require('../../common/members').knownFallbackIds, 'grok', 'claude']);
 const AUTHORS = fromRegistry(() => [...require('../../common/members').knownVoterFamilies, 'xai']);
 function register(name, title, description, inputSchema, fn) {
-  if (!require('../../common/access').allowed('team', name)) return;
+  if (!require('../../common/access').offered('team', name)) return;
   server.registerTool(name, { title, description, inputSchema: require('../../common/schema').compatible(inputSchema) }, async (a) => {
     try {
+      // team-v62 (взгляд участников): обработчику нужно перенесённое состояние — дождёмся конца первичной миграции (с
+      // пределом). initialize/tools/list сюда не попадают. По превышении — понятный текст с предложением повторить.
+      const hold = await require('../../common/state-migration').awaitPrimary();
+      if (hold) throw Error(hold);
       require('../../common/access').guard('team', name, a);
       // Один снимок и одна функция оболочки для измерения и отправки.
       const transport = require('../../common/public-transport');
@@ -79,7 +83,7 @@ register(
   { part: z.enum(['brief', 'common', 'claude', 'antigravity', 'grok', 'roles', 'fallback', 'all']).default('brief').describe('Часть правил.') },
   (a) => team.rules(a.part),
 );
-register('team_members', 'Участники связки', 'Список и управление реестром. В фазе А пауза только отображается; add/remove требуют цитату пользователя.', {
+register('team_members', 'Участники связки', 'Список и управление реестром. Пауза Kimi действует в A/B/C; у остальных в A только отображается. add/remove требуют цитату пользователя.', {
   action: z.enum(['list', 'add', 'remove', 'pause', 'resume']),
   expected_rev: z.number().int().nonnegative().optional(),
   id: z.string().optional(), member: z.record(z.unknown()).optional(),
@@ -145,7 +149,7 @@ register(
 register(
   'team_inbox',
   'Входящие дирижёру',
-  'Список, ответ или отказ по запросам дирижёру. Только клиент claude.',
+  'Список, ответ или отказ по запросам дирижёру. Доказанный чат любого участника связки.',
   {
     action: z.enum(['list', 'answer', 'reject']),
     id: z.string().optional().describe('Номер запроса (answer/reject).'),
@@ -153,7 +157,9 @@ register(
   },
   async (a) => {
     const acc = require('../../common/access');
-    if (acc.guest() || acc.client() !== 'claude') throw Error('Входящие дирижёра доступны только дирижёру (клиент claude).');
+    // team-v59: владелец управляет консилиумом из любого участника — входящие дирижёра доступны из ДОКАЗАННОГО чата любого
+    // участника связки (прежде только клиент claude). Поручение и недоказанный сеанс — отказ (границу держит chatSession).
+    if (!acc.chatSession()) throw Error('Входящие дирижёра доступны из доказанного чата участника связки.');
     const inbox = require('../../common/inbox');
     if (a.action === 'list') {
       const p = inbox.pending();
@@ -242,8 +248,9 @@ register(
       .optional(),
     job_id: z.string().optional(),
     decision: z.enum(['ПРИНЯТО', 'НЕ ПРИНЯТО', 'РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ']).optional(),
-    replaces: list(IDS && [...IDS], v => require('../../common/members').ids.includes(v), 'Участник из team_status').optional().describe('Чьё место: замена Claude после двух отказов, решение пользователя (только история) или Grok на месте выпавшего (по grok_slot).'),
-    quote: z.string().optional().describe('Цитата слова пользователя; для reconsider — причина отклонения отказа дирижёром.'),
+    replaces: list(IDS && [...IDS, 'all'], v => v === 'all' || require('../../common/members').ids.includes(v), 'Участник из team_status или all').optional().describe('Чьё место: замена Claude после двух отказов; решение владельца словом (replaces=<участник>|claude|all закрывает место(а)); Grok на месте выпавшего (по grok_slot).'),
+    quote: z.string().optional().describe('Цитата слова пользователя; для reconsider — причина отклонения отказа дирижёром; для deploy — слово пользователя, перекрывающее проверку перед установкой (вместе с list_hash); для commit/merge — слово владельца: проходят без ворот замысла и без голосов (риск называется, цитата хранится в карточке).'),
+    list_hash: z.string().optional().describe('deploy: отпечаток показанного списка установки из первого отказа (sha256). Передаётся вместе с quote; при изменении состояния сервер отвечает новым списком и слово нужно дать заново.'),
     commit: z.string().optional().describe('Принятый коммит или main.'),
   },
   (a) => team.change(a),
@@ -251,26 +258,71 @@ register(
 register(
   'team_word',
   'Слово пользователя',
-  'Записать дословно слово пользователя «X отвалился» или показать записи. stop_confirm подтверждает остановку по job_ids и quote только из чата Claude в основном режиме. close закрывает карточки «нужно решение» словом пользователя (только чат Claude в основном режиме; изменения в папке поручения не откатываются). Слово о помощнике — чат Claude; слово о Claude — чат Codex или Antigravity (запасной режим, rules/fallback.md); правок и удалений нет.',
+  'Записать дословно слово пользователя «X отвалился» или показать записи. stop_confirm подтверждает остановку по job_ids и quote только из чата Claude в основном режиме. close закрывает карточки «нужно решение» словом пользователя (только чат Claude в основном режиме; изменения в папке поручения не откатываются). release_orphan снимает замок записи без карточки по точным lock_instance/job_ids/folder (только чат Claude в основном режиме, при отсутствии карточки и мёртвом владельце). Слово о помощнике — чат Claude; слово о Claude — чат Codex или Antigravity (запасной режим, rules/fallback.md); правок и удалений нет.',
   {
-    action: z.enum(['record', 'list', 'return', 'handover', 'rebind', 'stop_confirm', 'close']),
+    action: z.enum(['record', 'list', 'return', 'handover', 'rebind', 'stop_confirm', 'close', 'release_orphan']),
     who_down: list(WORD_WHO, v => [...require('../../common/members').ids, 'grok'].includes(v), 'Выпавший из team_status').optional().describe('Кого пользователь назвал выпавшим.'),
     quote: z.string().optional().describe('Реплика пользователя дословно.'),
-    job_ids: z.array(z.string().min(8)).min(1).optional().describe('stop_confirm и close: полные номера поручений или однозначные префиксы от 8 знаков.'),
+    job_ids: z.array(z.string().min(8)).min(1).optional().describe('stop_confirm, close и release_orphan: полные номера поручений или однозначные префиксы от 8 знаков (release_orphan — ровно один).'),
     owner: z.string().optional().describe('Метка сеанса дирижёра запасного режима (fallback-codex-<4 буквы>).'),
+    lock_instance: z.string().optional().describe('release_orphan: точный instance осиротевшего замка записи из team_status/диагностики.'),
+    folder: z.string().optional().describe('release_orphan: абсолютная папка осиротевшего замка записи.'),
+    admission: z.string().optional().describe('release_orphan: идентификатор admission, если известен (необязательно).'),
   },
   (a) => team.word(a),
 );
-if (require.main === module)
-  require('../../common/state-migration').start(require('../../common/paths'))
-    .then(() => { if (!require('../../common/access').guest() && process.env.MOST_PROBE_ONLY !== '1') {
-      try { require('../../common/members').store().read(); } catch (e) { console.error(e.message); }
-    } })
-    .then(() => require('../../common/restart-hold').cleanup(require('../../common/paths').stateDir))
-    .then(() => server.connect(require('../../common/public-transport').publicTransport(new StdioServerTransport()))).then(() => require('../../common/access').ready('team'))
+register(
+  'team_scenario',
+  'Сценарий (мост сам ведёт цикл)',
+  'Запустить/вести многоходовый сценарий: мост сам шлёт поручения и по ответу «крючка» (внешней команды владельца) решает, что дальше — без участия чата. start | status | stop | list | resume. Крючок запускается с правами пользователя (риск называется в ответе start).',
+  {
+    action: z.enum(['start', 'status', 'stop', 'list', 'resume']),
+    scenario_file: z.string().optional().describe('start: абсолютный путь JSON-файла сценария (рядом — крючок; cwd = папка сценария).'),
+    hook: z.object({ interp: z.string(), script: z.string() }).optional().describe('start: крючок { interp, script } абсолютными путями, если не задан в файле сценария.'),
+    parallel: z.number().int().positive().optional().describe('start: предел одновременных поручений (по умолчанию без предела).'),
+    id: z.string().optional().describe('status/stop/resume: номер сценария.'),
+  },
+  (a) => require('../../common/scenario-manager').command(a),
+);
+if (require.main === module) {
+  // team-v63 (п.18): взводим барьер первичной миграции СИНХРОННО до server.connect — чтобы вызов инструмента, пришедший
+  // между connect() и .then(start()), не проскочил мимо барьера (started ещё не выставлен в start()).
+  try { require('../../common/state-migration').arm(); } catch {}
+  // team-v62 (task4): server.connect ПЕРВЫМ — ответ на initialize/tools/list не ждёт миграцию, чтение реестра и уборку
+  // меток перезапуска. Прежде эти три шага шли ДО connect, и общий замок миграции держал подключение: поздние серверы
+  // моста не попадали в первый проход привязки приложения и их инструменты появлялись минутами позже.
+  server.connect(require('../../common/public-transport').publicTransport(new StdioServerTransport()))
+    .then(() => require('../../common/access').ready('team'))
+    // team-v59 (task2): происхождение чата вычисляем в ФОНЕ после connect (не блокируя initialize/tools/list); первый guard
+    // при незавершённом фоне посчитает синхронно. Фон не держит обработку инструментов.
+    .then(() => { try { require('../../common/chat-origin').primeAsync(); } catch {} })
+    // team-v62 (task4): миграция хранилища, чтение реестра участников и уборка меток перезапуска — в ФОНЕ после connect.
+    .then(() => {
+      require('../../common/state-migration').start(require('../../common/paths'))
+        .then(() => { if (!require('../../common/access').guest() && process.env.MOST_PROBE_ONLY !== '1') {
+          try { require('../../common/members').store().read(); } catch (e) { console.error(e.message); }
+        } })
+        .then(() => require('../../common/restart-hold').cleanup(require('../../common/paths').stateDir))
+        .catch((e) => console.error(e));
+    })
     // team-v10 Р5: новый сервер после установки с перезапуском сам выполняет уборку.
-    .then(() => { setTimeout(() => team.afterDeploy(600000).catch(() => {}), 5000).unref(); }).catch((e) => {
+    .then(() => { setTimeout(() => team.afterDeploy(600000).catch(() => {}), 5000).unref(); })
+    // team-v59 (часть 3, дополнение 2): авто-уборка конечных карточек старше недели — в фоне, после ответа на initialize,
+    // не задерживая инструменты, не чаще раза в сутки. Проба установки записей не трогает.
+    // team-v62 (взгляд участников): уборки читают перенесённое состояние (карточки, отметки процессов) — запускаем их
+    // только ПОСЛЕ завершения первичной миграции (waitPrimary; при неприменимой миграции — сразу).
+    .then(() => { if (process.env.MOST_PROBE_ONLY !== '1') setTimeout(() => { require('../../common/state-migration').waitPrimary().then(() => {
+      try { require('../../common/cards-autocleanup').maybeRun({ stateDir: require('../../common/paths').stateDir, repoRoot: require('../../common/paths').repoRoot }); } catch {}
+      // team-v61 (п.12): уборка устаревших отметок процессов (restart-servers/<pid>.json|.watch, ready/<server>.<pid>.json)
+      // мёртвых процессов старше суток — в фоне, не на пути ответа сводки, не чаще раза в сутки.
+      // team-v61 (часть 3): maybeRun асинхронна (снимок процессов через execFile, не блокируя событийный цикл) — .catch,
+      // чтобы отклонённое обещание фоновой уборки не всплывало необработанным.
+      try { require('../../common/restart-mark-cleanup').maybeRun({ stateDir: require('../../common/paths').stateDir }).catch(() => {}); } catch {}
+      // team-v63 (п.4): незавершённые сценарии поднимаются сами с последнего шага (оборванные поручения шага переотправляются).
+      try { if (!require('../../common/access').guest()) require('../../common/scenario-manager').resumeAll(require('../../common/paths').stateDir); } catch {}
+    }); }, 7000).unref(); }).catch((e) => {
     console.error(e);
     process.exitCode = 1;
   });
+}
 module.exports = { server };

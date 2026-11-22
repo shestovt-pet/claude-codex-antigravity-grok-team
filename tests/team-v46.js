@@ -302,6 +302,36 @@ test('Codex findCli: неполная папка bin отвергается; COD
   assert.equal(cb.findCli({ CODEX_PATH: path.join(fresh, 'codex.exe') }), path.join(fresh, 'codex.exe'));
 });
 
+test('models-622 Codex: при обновлённом пакете приложения, не разложенном в bin, берётся свежий CLI из WindowsApps; самый свежий — при раскладке в bin', () => {
+  const cb = require('../common/codex-binary');
+  const base = fs.mkdtempSync(path.join(f.RUN, 'codex-src-'));
+  const local = path.join(base, 'Local'), pf = path.join(base, 'ProgramFiles');
+  const bin = path.join(local, 'OpenAI', 'Codex', 'bin');
+  const binOld = path.join(bin, 'aaaa000000000000');
+  const pkg = path.join(pf, 'WindowsApps', 'OpenAI.Codex_26.1117.4957.0_x64__2p2nqsd0c76g0', 'app', 'resources');
+  for (const d of [binOld, pkg]) fs.mkdirSync(d, { recursive: true });
+  // Полная папка в bin (старая, выложена приложением) и полный CLI внутри обновлённого пакета приложения.
+  for (const d of [binOld, pkg]) { fs.writeFileSync(path.join(d, 'codex.exe'), 'x'); fs.writeFileSync(path.join(d, 'codex-code-mode-host.exe'), 'x'); }
+  const env = { LOCALAPPDATA: local, ProgramFiles: pf };
+  // Пакет приложения свежее разложенного в bin — выбирается CLI из пакета (путь к версии не захардкожен).
+  fs.utimesSync(path.join(binOld, 'codex.exe'), new Date(), new Date(Date.now() - 4000));
+  fs.utimesSync(path.join(pkg, 'codex.exe'), new Date(), new Date(Date.now() + 4000));
+  assert.equal(cb.findInWindowsApps(env), path.join(pkg, 'codex.exe'));
+  assert.equal(cb.findCli(env), path.join(pkg, 'codex.exe'));
+  // Приложение разложило свежий CLI в bin\<хеш> — он новее пакета и выбирается он (исполнение остаётся в bin).
+  const binNew = path.join(bin, 'bbbb111111111111');
+  fs.mkdirSync(binNew);
+  fs.writeFileSync(path.join(binNew, 'codex.exe'), 'x'); fs.writeFileSync(path.join(binNew, 'codex-code-mode-host.exe'), 'x');
+  fs.utimesSync(path.join(binNew, 'codex.exe'), new Date(), new Date(Date.now() + 8000));
+  assert.equal(cb.findCli(env), path.join(binNew, 'codex.exe'));
+  // Неполный пакет приложения (без host) игнорируется — свежесть не спасает неполную раскладку.
+  const bad = path.join(pf, 'WindowsApps', 'OpenAI.Codex_99.0.0.0_x64__2p2nqsd0c76g0', 'app', 'resources');
+  fs.mkdirSync(bad, { recursive: true });
+  fs.writeFileSync(path.join(bad, 'codex.exe'), 'x');
+  fs.utimesSync(path.join(bad, 'codex.exe'), new Date(), new Date(Date.now() + 16000));
+  assert.equal(cb.findInWindowsApps(env), path.join(pkg, 'codex.exe'));
+});
+
 async function client(who, clientName, p, fn) {
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
   const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
@@ -542,7 +572,8 @@ test('antigravity: очередь не перечитывает завершён
   const rq = src.slice(src.indexOf('async function resumeQueue()'), src.indexOf('// ---------- запуск ----------'));
   assert.equal((rq.match(/listJobs\(\)/g) || []).length, 0, 'resumeQueue не вызывает listJobs()');
   assert.equal((rq.match(/queueJobs\(\)/g) || []).length, 3);
-  assert.match(src, /setTimeout\(\(\) => \{ try \{ pruneOld\(\); \} catch \(e\) \{ log\(errText\(e\)\); \} \}, 120000\)\.unref\(\);/);
+  // team-v62 обернул уборку в waitPrimary().then (уборка — после первичной миграции): обновлённая форма строки.
+  assert.match(src, /setTimeout\(\(\) => \{ require\('\.\.\/\.\.\/common\/state-migration'\)\.waitPrimary\(\)\.then\(\(\) => \{ try \{ pruneOld\(\); \} catch \(e\) \{ log\(errText\(e\)\); \} \}\); \}, 120000\)\.unref\(\);/);
 });
 require('./team-v46-fix5')({ test, f, client, text });
 require('./team-v46-fix6')({ test, f, client, text });

@@ -25,6 +25,12 @@ function touch(workName, owner, root = repoRoot) {
 // Проверка и действие держат один замок с claim: передача между ними невозможна.
 async function withWork(args, action, root = repoRoot) {
   if (!args.work) return action();
+  // team-v62: незарегистрированная работа или имя не-латинский идентификатор (напр. кириллица) — это ЯРЛЫК (workLabel) у
+  // роли «совет», а не привязка к воротам работы; замок работы по такому имени не берём (name() его не принимает). Решение
+  // отдаём stage-gate.prepareJob, который заменит такую work на workLabel без владения и этапа. Без этого внешняя обёртка
+  // withWork в обработчике *_send падала на name() раньше релейбла, и поручение с русской/незарегистрированной работой
+  // отвергалось — вопреки «поручение идёт без работы, имя любое» (team-v59 ч3). Регистрированную латинскую работу — как прежде.
+  if (!/^[a-z0-9-]{1,40}$/.test(args.work) || !fs.existsSync(inside(root, 'works', args.work + '.json'))) return action();
   const held = workLock.getStore();
   if (held?.active && samePath(held.root, root)) { touch(args.work, args.owner, root); return action(); }
   return require('./deploy').locked(root, async () => {

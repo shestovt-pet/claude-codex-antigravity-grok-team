@@ -163,17 +163,23 @@ test('Codex-1: отказ запуска перезапуска сохранён
 });
 function release(name, complete = true) {
   const root = path.join(RUN, name), id = 'a'.repeat(40), dir = path.join(root, 'live', id);
-  for (const n of ['team', 'codex', ...(complete ? ['antigravity'] : [])]) write(path.join(dir, 'servers', n, 'index.js'), '');
+  for (const n of ['team', 'codex', 'kimi', ...(complete ? ['antigravity'] : [])]) write(path.join(dir, 'servers', n, 'index.js'), '');
   write(path.join(dir, 'common', 'access.js'), fs.readFileSync(path.join(__dirname, '..', 'common', 'access.js')));
   for (const name of ['members.js', 'members-store.js', 'members-default.js', 'paths.js', 'job-identity.js']) write(path.join(dir, 'common', name), fs.readFileSync(path.join(path.join(__dirname, '..'), 'common', name))); /* реестр кандидата А */ // team-v28 Р1
   json(path.join(dir, 'probe-ok.json'), { root, commit: id, at: new Date().toISOString(), servers: ['antigravity', 'codex', 'team'] });
   return { root, dir };
 }
+function expectedProbes(root) {
+  const roster = require('../common/members-store').create(path.join(root, 'state')).read({ initialize: false });
+  const servers = require('../common/members').serversForInstall(roster);
+  return { servers, count: servers.length * (1 + require('../common/member-clients').all(roster.members).length) };
+}
+
 test('Р2 Р3: config-only повторяет все пробы реестра и сохраняет deployed.json', async () => {
   const r = release('legacy'), p = plan('legacy-config'); let probes = 0;
   await d.configure({ release: r.dir, configs: [p.file] }, { probe: async () => { probes++; } });
-  assert.equal(probes, require('../common/members').servers.length * (1 + require('../common/member-clients').all().length)); assert.equal(read(path.join(r.root, 'live/deployed.json')).method, 'внешним сценарием'); // team-v19 К2: + сервер своей семьи у гостей
-  assert.equal(read(path.join(r.dir, 'probe-ok.json')).servers.length, 3);
+  assert.equal(probes, expectedProbes(r.root).count); assert.equal(read(path.join(r.root, 'live/deployed.json')).method, 'внешним сценарием'); // team-v19 К2: + сервер своей семьи у гостей
+  assert.deepEqual(read(path.join(r.dir, 'probe-ok.json')).servers.slice().sort(), expectedProbes(r.root).servers.slice().sort());
 });
 test('Р2: неполный релиз не меняет конфиги и метку', async () => {
   const r = release('incomplete', false), p = plan('incomplete-config'), marker = fs.readFileSync(path.join(r.dir, 'probe-ok.json'), 'utf8');
@@ -186,7 +192,7 @@ test('Р2 Р3 Д4: clients-only пробует релиз, сохраняет о
   write(good, '# Личное\nНе менять\n## Связка четырёх ИИ\nСтарое\n## Мой раздел\nТочное содержимое\n'); write(bad, '# Личное\n');
   let probes = 0;
   const out = await d.configureClients({ release: r.dir }, { probe: async () => { probes++; }, rules: { files: [{ file: bad, role: 'codex' }, { file: good, role: 'antigravity' }] } });
-  assert.equal(probes, require('../common/members').servers.length * (1 + require('../common/member-clients').all().length)); assert.match(out, /отказ/); assert.match(fs.readFileSync(good, 'utf8'), /Связка ИИ/);
+  assert.equal(probes, expectedProbes(r.root).count); assert.match(out, /отказ/); assert.match(fs.readFileSync(good, 'utf8'), /Связка ИИ/);
   assert.equal(read(path.join(r.root, 'live/deployed.json')).commit, path.basename(r.dir));
   assert(fs.existsSync(good + '.prev')); assert(fs.readFileSync(good, 'utf8').endsWith('## Мой раздел\nТочное содержимое\n'));
   assert.match((await require('../common/client-rules').configure({ files: [good], rollback: true })).join(''), /восстановлен/);
@@ -259,7 +265,9 @@ test('63af002a: итоговые уроки проходят действующ�
   const source = fs.readFileSync(path.join(root, 'common/team.js'), 'utf8');
   const block = source.slice(source.indexOf('        if (c.systemic?.length) {'), source.indexOf("        if (hash(this.root) !== c.base)"));
   assert(block.includes('Не закрыты системные замечания'));
-  const run = new Function('c', 'p', 'folder', 'lessonText', 'git', 'require', block);
+  // team-v59 (часть 1): блок системных ворот ссылается на sysOverridden (место, перекрытое словом владельца) и ownerNotices —
+  // оба определены выше по функции merge, вне извлечённого среза; слов владельца в тесте нет → () => false и пустой список.
+  const run = new Function('c', 'p', 'folder', 'lessonText', 'git', 'require', 'sysOverridden', 'ownerNotices', block);
   // Публичная копия без истории (team-v11 Р6): старого коммита нет — сверка против пустого дерева.
   let base = '41fd4f7';
   try { g.git(root, ['cat-file', '-e', base + '^{commit}'], { recoverIndex: false }); } catch { base = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'; }
@@ -268,9 +276,9 @@ test('63af002a: итоговые уроки проходят действующ�
   const files = g.git(root, ['diff', '--name-only', base], { recoverIndex: false });
   const mockGit = (_folder, args) => args.includes('--name-only') ? files : diff;
   const load = name => name === './grok-gate' ? gate : require(name);
-  assert.doesNotThrow(() => run(card, { candidate: 'in-memory' }, root, lessons, mockGit, load));
+  assert.doesNotThrow(() => run(card, { candidate: 'in-memory' }, root, lessons, mockGit, load, () => false, []));
   assert.throws(() => run(card, { candidate: 'in-memory' }, root, lessons,
-    (_folder, args) => mockGit(_folder, args).replaceAll('63af002a', 'missing-id'), load), /Не закрыты системные/);
+    (_folder, args) => mockGit(_folder, args).replaceAll('63af002a', 'missing-id'), load, () => false, []), /Не закрыты системные/);
 });
 const c = { name: 'gate', requestMark: '#12345678', designHash: 'd'.repeat(64), base: 'b'.repeat(40), candidate: 'c'.repeat(40) };
 function job(status, phase, decision = 'ПРИНЯТО') {

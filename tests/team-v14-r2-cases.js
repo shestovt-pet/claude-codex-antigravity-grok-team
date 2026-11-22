@@ -60,7 +60,10 @@ module.exports = ({ test, fixture, job, file, fresh, accept, gate, Team, root, p
       if (String(p) === card && ++reads > 1) throw Object.assign(Error(id + ': EACCES'), { code: 'EACCES' });
       return original(p, ...args);
     };
-    try { const w = await team.refreshWork(team.workFile(f.w.name)); assert.equal(w.stages[0].state, 'принят'); assert.equal(reads, 1); assert(!w.stages[0].gate.warning); }
+    // team-v62: team-v59 «сводка за секунды» — приёмка этапа берётся из сохранённого состояния работы, карточка исторического
+    // автора НЕ перечитывается вовсе (было ровно одно чтение, стало ноль). Страж (бросок на 2-м чтении) остаётся: докажет, что
+    // перечитывания нет и сейчас.
+    try { const w = await team.refreshWork(team.workFile(f.w.name)); assert.equal(w.stages[0].state, 'принят'); assert.equal(reads, 0); assert(!w.stages[0].gate.warning); }
     finally { fs.readFileSync = original; }
   });
   test('КР2 М2: возврат по порядку при одинаковом времени создания', async () => {
@@ -118,6 +121,10 @@ module.exports = ({ test, fixture, job, file, fresh, accept, gate, Team, root, p
     try {
       const refreshed = await team.refreshWork(team.workFile(f.w.name));
       assert.equal(refreshed.stages[0].state, 'принят');
+      // team-v61 (Codex №4): СОХРАНЁННОЕ предупреждение «не удалось проверить … ENOENT» видно и в full (workText),
+      // и в краткой сводке (compact) — строки берутся из сохранённого состояния без переоценки ворот (без чтения материала/хешей).
+      assert(refreshed.stages[0].gate.warning.includes('ENOENT'));
+      assert(require('../common/team').workText(refreshed).includes('ENOENT'));
       assert((await require('../common/summary').compact(team, 'квоты не проверялись')).includes('ENOENT'));
       const submitted = { ...refreshed.stages[0], source_jobs: ['unverified-source'] };
       await team.work({ action: 'update', owner: 'test', name: f.w.name, expected_revision: 1, stages: [submitted] });

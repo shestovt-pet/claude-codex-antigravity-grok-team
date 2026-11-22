@@ -18,7 +18,7 @@ function installServers(root) {
   const roster = require('../../../common/members-store').create(path.join(root, 'state')).read({ initialize: false });
   return members.serversForInstall(require('../../../common/members-v46').forward(roster));
 }
-function release(root, id = 'a'.repeat(40), { old = false, servers = installServers(root), installPhase } = {}) {
+function release(root, id = 'a'.repeat(40), { old = false, servers = installServers(root), installPhase, installed = true } = {}) {
   const dir = path.join(root, 'live', id);
   fs.mkdirSync(dir, { recursive: true });
   if (old) {
@@ -38,7 +38,17 @@ function release(root, id = 'a'.repeat(40), { old = false, servers = installServ
   const modules = path.join(source, 'node_modules');
   if (!fs.existsSync(path.join(modules, 'yaml/package.json'))) throw Error('Подготовка фикстуры: выполните npm ci в тестовом клоне, локальный yaml отсутствует.');
   fs.cpSync(modules, path.join(dir, 'node_modules'), { recursive: true });
-  json(path.join(dir, 'probe-ok.json'), { root, commit: id, at: new Date().toISOString(), servers });
+  let proof = {};
+  if (!old) {
+    // Это макет уже установленного релиза: миграцию и MCP-пробу проверяет kimi-deploy,
+    // а псевдосерверы этой фикстуры служат только проверкам конфигов/доставки правил.
+    const state = path.join(root, 'state'), store = require('../../../common/members-store').create(state);
+    const kimi = require(path.join(dir, 'common/members-kimi.js')), before = store.read();
+    if (installed) kimi.apply(state, before.rev, kimi.installTarget(state, before, dir));
+    const roster = store.read({ initialize: false }), target = kimi.installTarget(state, roster, dir);
+    proof = { sourceRegistryAbsent: false, sourceRegistryRev: roster.rev, sourceRegistryHash: kimi.digest(roster), targetRoster: target, targetRegistryHash: kimi.digest(target) };
+  }
+  json(path.join(dir, 'probe-ok.json'), { root, commit: id, at: new Date().toISOString(), servers, ...proof });
   return dir;
 }
 function operation(root, release, id = 'install') {
