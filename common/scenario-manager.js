@@ -87,6 +87,12 @@ function repend(S) {
 }
 
 // ───────── Действия инструмента team_scenario ─────────
+// quota-622: resume сценария, вставшего на паузу «нет денег», — это слово пользователя (счёт пополнен): шаг, ждавший
+// участника, идёт одной попыткой в обход отметки (force). Не пополнен — отказ провайдера снова поставит на паузу.
+function unpauseBalance(S) {
+  for (const j of Object.values(S.jobs || {})) if (j.balancePaused) { j.balancePaused = false; j.forceOnce = true; }
+  delete S.pauseReason;
+}
 function requireChat() {
   const acc = require('./access');
   // Права: start/stop/resume — любой доказанный чат (или дирижёр). Поручение-исполнитель (гость, но не чат) — отказ.
@@ -160,7 +166,7 @@ async function command(a, opts = {}) {
     // (Б2). repend переотправляет тем же request_id; конечную карточку прежней попытки (отменена/осиротела) распознаёт poll и
     // повторяет ТОМУ ЖЕ участнику новой попыткой — fresh наугад больше не ставим (Б7).
     let by; try { by = require('./access').client(); } catch {}
-    launch(stateDir, id, opts.deps || productionDeps(stateDir, S, by), { prep: St => { repend(St); St.status = 'running'; delete St.error; delete St.warnings; } });
+    launch(stateDir, id, opts.deps || productionDeps(stateDir, S, by), { prep: St => { repend(St); unpauseBalance(St); St.status = 'running'; delete St.error; delete St.warnings; } });
     return 'Сценарий ' + id + ' возобновлён.\n' + scenario.statusLine(scenario.loadState(stateDir, id));
   }
   throw Error('Неизвестное действие сценария: ' + action);
@@ -185,4 +191,4 @@ function resumeAll(stateDir = require('./paths').stateDir) {
   return errors;
 }
 
-module.exports = { command, resumeAll, launch, productionDeps, repend, active };
+module.exports = { command, resumeAll, launch, productionDeps, repend, unpauseBalance, active };

@@ -97,7 +97,7 @@ async function fake() {
     setInterval(() => {}, 1000); return;
   }
   if (scenario === 'change') {
-    const m = JSON.parse(/Карта оригинал → копия:\n([\s\S]*?)\n\nПоручение:/.exec(input)[1]); fs.writeFileSync(path.join(m[0].copy, 'data.txt'), 'подмена');
+    const m = JSON.parse(/Карта оригинал → копия:\n(\[[\s\S]*\])\s*$/.exec(input)[1]); fs.writeFileSync(path.join(m[0].copy, 'data.txt'), 'подмена');
   }
   if (scenario === 'refuse' || scenario === 'exit') {
     emit({ role: 'meta', type: 'system.version', version: '2.5.3' }); emit({ role: 'assistant', content: 'ПРИНЯТО' });
@@ -106,7 +106,7 @@ async function fake() {
   // team-v56 А1: писатель правит оригиналы по карте абсолютных путей. Запись/запуск программы — только если профиль их
   // разрешил (tool_calls сохраняются как доказательство). write-quota: частичная запись и ошибка/квота уже запущенного писателя.
   if (scenario === 'write' || scenario === 'program' || scenario === 'write-quota') {
-    const targets = JSON.parse(/Целевые пути \(абсолютные\):\n([\s\S]*?)\n\nПоручение:/.exec(input)[1]);
+    const targets = JSON.parse(/Целевые пути \(абсолютные\):\n(\[[\s\S]*\])\s*$/.exec(input)[1]);
     emit({ role: 'meta', type: 'system.version', version: '2.5.3' });
     // team-v56 А2: подсказка продолжения — структурированный session_id (+ неисполняемая строка command/content).
     emit({ role: 'meta', type: 'session.resume_hint', session_id: 'session_fixture', command: 'kimi -r session_fixture', content: 'To resume: kimi -r session_fixture' });

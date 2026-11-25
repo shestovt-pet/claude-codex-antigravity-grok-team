@@ -161,10 +161,13 @@ function orphanEntry({ instance, folder, jobId }, state) {
 // рабочий; установочный барьер передаёт свой каталог состояния, чтобы замки и карточки читались из одного источника.
 function entries(state) { return readEntries(state); }
 // team-v56 Н4: releaseOrphan принимает state (по умолчанию рабочий) — снятие точного замка в своём каталоге и под своим мьютексом.
-function releaseOrphan(match, state) {
+// install-gate-simple (ревью Codex п.3): opts.verify(entry) — повторная проверка связи под мьютексом перед снятием (уборка
+// мёртвых поручений: владелец по-прежнему мёртв, поручение замка не ожило). false — замок не снимается.
+function releaseOrphan(match, state, opts = {}) {
   return withMutex(() => {
     const hit = orphanEntry(match, state);
     if (!hit) return { released: false, absent: true };
+    if (opts.verify && !opts.verify(hit.entry)) return { released: false, changed: true };
     fs.unlinkSync(hit.file);
     return { released: true, entry: hit.entry };
   }, state);

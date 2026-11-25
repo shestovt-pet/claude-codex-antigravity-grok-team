@@ -128,10 +128,12 @@ test('О5: чужая отметка готовности (grok) — справ�
   for (const s of servers) json(path.join(st, 'ready', s + '.json'), { release: rel });
   json(path.join(st, 'ready', 'grok.json'), { release: path.join(root, 'live', 'c'.repeat(40)) });
   const drift = require('../common/release-drift');
-  // team-v60: перечень устаревших отметок — в full; краткая сводка показывает их число.
+  // install-gate-simple: отметка сервера вне связки — только в full и с пояснением; краткая сводка её не показывает.
+  // Отметки на экземпляр текущих серверов (<server>.<pid>.json) — штатные, не «устаревшие».
+  json(path.join(st, 'ready', servers[0] + '.12345.json'), { release: path.join(root, 'live', 'e'.repeat(40)) });
   let rows = drift.lines(root, st, { full: true });
-  assert(rows.includes('Устаревшая отметка готовности: grok.json'), rows.join('\n'));
-  assert(drift.lines(root, st).includes('устаревших отметок готовности: 1 — full=true'), drift.lines(root, st).join('\n'));
+  assert(rows.includes('Отметка готовности сервера вне связки (ни на что не влияет): grok.json'), rows.join('\n'));
+  assert(!drift.lines(root, st).some(r => /отмет/i.test(r)), drift.lines(root, st).join('\n'));
   assert(!rows.some(r => /Серверы запущены не из записанной установки/.test(r)), rows.join('\n'));
   json(path.join(st, 'ready', 'codex.json'), { release: path.join(root, 'live', 'd'.repeat(40)) });
   rows = drift.lines(root, st);

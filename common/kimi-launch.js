@@ -79,7 +79,8 @@ function args({ model: alias, jobId, inputFile, profileFile, sessionId } = {}) {
   const out = ['-m', model(alias), '--output-format', 'stream-json'];
   if (sessionId) out.push('--session', sessionId);
   else if (profileFile) out.push('--agent-file', profileFile);
-  out.push('-p', 'Прочитай файл ' + name + ' в текущей папке и выполни поручение. Ответ дай по-русски');
+  // cache-622 (М1): имя файла (в нём номер поручения) — в конце сообщения, постоянная часть — в начале.
+  out.push('-p', 'Прочитай файл поручения в текущей папке и выполни поручение. Ответ дай по-русски. Файл: ' + name);
   return out;
 }
 // team-v56 Л1 (ревью Kimi круг 4): хеш реализации исходящих Kimi. Любая правка кода запуска/материала/ревью/MCP/миграции

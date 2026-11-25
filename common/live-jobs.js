@@ -53,7 +53,8 @@ function unfinished(options) {
 function cardPids(j) {
   const out = [];
   const push = v => { if (Number.isInteger(v) && v > 0) out.push(v); };
-  push(j.pid); push(j.childPid); push(j.owner?.pid); push(j.apply?.owner?.pid); push(j.stopUnconfirmed?.pid);
+  // install-gate-simple (ревью Codex п.1): agyPid — процесс agy Antigravity, тоже исполнитель.
+  push(j.pid); push(j.childPid); push(j.agyPid); push(j.owner?.pid); push(j.apply?.owner?.pid); push(j.stopUnconfirmed?.pid);
   if (Array.isArray(j.observedPids)) j.observedPids.forEach(push);
   return [...new Set(out)];
 }
@@ -61,7 +62,7 @@ function cardPids(j) {
 function liveChildPids(j) {
   const out = [];
   const push = v => { if (Number.isInteger(v) && v > 0) out.push(v); };
-  push(j.pid); push(j.childPid); push(j.stopUnconfirmed?.pid);
+  push(j.pid); push(j.childPid); push(j.agyPid); push(j.stopUnconfirmed?.pid);
   if (Array.isArray(j.observedPids)) j.observedPids.forEach(push);
   return [...new Set(out)];
 }
@@ -106,22 +107,24 @@ function holdsFolder(j, who) {
     'applying', 'needs_decision', 'migration_conflict'].includes(status) ||
     j.write && status === 'stop_unconfirmed' || !stopped && (j.stopUnconfirmed || status === 'stop_unconfirmed') ? true : false;
 }
-async function scan({ stateDir }) {
-  const result = [], stale = [];
-  for (const { who, j, entry, mtimeMs } of cards({ stateDir })) {
-    if (!['running', 'applying', 'cancelling', 'cancel_requested', 'stop_unconfirmed'].includes(j.status) && !j.stopUnconfirmed) continue;
-    const row = { who, id: String(j.id || entry).slice(0, 8), folder: j.folder || j.cwd || j.papka || 'не указана',
-      duration: require('./format').duration(Date.now() - Date.parse(j.startedAt || j.createdAt || new Date())),
-      from: j.from || j.sender || 'не указан', work: j.workName || (typeof j.work === 'string' && j.work) || (j.workUnbound && j.workLabel ? j.workLabel + ' (без привязки)' : null) || 'не указана' };
-    const basis = confirmation(j, who, mtimeMs);
-    if (basis) { stale.push({ ...row, note: 'старая запись: остановка подтверждена (' + basis + ')' }); continue; }
-    // Смерть сервера не подтверждает остановку дочернего процесса (ред. 3: дерево не обходится).
-    result.push(row);
-  }
+// install-gate-simple (24.11.2026): идущие для перезапуска/остановки серверов — по общему определению common/dead-jobs:
+// только поручения с живым процессом (PID есть и запущен не позже записи карточки). Мёртвое — в stale, ничего не держит.
+// Очередь (queued/waiting_quota) перезапуск не ждёт — поднимается после запуска.
+async function scan({ stateDir, table }) {
+  const dj = require('./dead-jobs'), data = dj.load(stateDir);
+  const s = dj.survey(stateDir, { data, table: table !== undefined ? table : await dj.tableAsync(dj.pidsOf(data)) });
+  const row = ({ who, j, entry }) => ({ who, id: String(j.id || entry).slice(0, 8), folder: j.folder || j.cwd || j.papka || 'не указана',
+    duration: require('./format').duration(Date.now() - Date.parse(j.startedAt || j.createdAt || new Date())),
+    from: j.from || j.sender || 'не указан', work: j.workName || (typeof j.work === 'string' && j.work) || (j.workUnbound && j.workLabel ? j.workLabel + ' (без привязки)' : null) || 'не указана' });
+  // Неполный снимок (ревью Codex п.4) — отказ «не удалось проверить», а не молчаливый пропуск.
+  if (s.incomplete.length) throw Error('не удалось проверить, идут ли поручения (' + s.incomplete.slice(0, 2).join('; ') + '), повторите');
+  // Очередь без живого исполнителя не ждём; живой исполнитель держит при любом статусе (ревью Codex п.2).
+  const result = s.live.filter(({ a }) => a.exec || !dj.QUEUE.includes(a.status)).map(({ c }) => row(c));
+  const stale = s.dead.map(({ c, a }) => ({ ...row(c), note: 'мёртвое поручение: ' + a.reason }));
   return { result, stale };
 }
-async function running({ stateDir }) {
-  return (await scan({ stateDir })).result;
+async function running({ stateDir, table }) {
+  return (await scan({ stateDir, table })).result;
 }
 async function staleRecords({ stateDir }) {
   return (await scan({ stateDir })).stale;

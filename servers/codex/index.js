@@ -501,20 +501,7 @@ async function execute(job, folderLock) {
       }),
       200,
     );
-    child.stdin.end(
-      [
-        'Это отдельное поручение пользователя через Claude. Не считай, что знаешь другие чаты.',
-        job.fullAccessApplied
-          ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; каждое действие вне папки поручения перечисли в отчёте.'
-          : job.write
-          ? 'Изменения разрешены только в рамках поручения. Перечисли файлы и проверки.'
-          : 'Только чтение. Не изменяй файлы.',
-        'Не обходи ограничения. Отвечай по-русски.',
-        job.task,
-        job.textFile ? 'Материал в файле: ' + job.textFile : '',
-        ...require('../../common/attachments').promptTail(job),
-      ].join('\n'),
-    );
+    child.stdin.end(require('../../common/prompt-order').build(job)); // cache-622 М1: шапка → материал → вложения → задача
   } catch (e) {
     await finish(null, e.message);
   }
@@ -585,20 +572,8 @@ function killByWord(id) {
   }
 }
 
-function changeReview(a) {
-  if (a.change === undefined) return undefined;
-  if (a.role !== 'проверка' || a.write || a.continue_id)
-    throw Error('Параметр change допустим для нового поручения Codex с ролью «проверка» и без записи.');
-  const { inside, name } = require('../../common/team-git');
-  const id = name(a.change);
-  const file = inside(stateDir, 'changes', id + '.json');
-  let card;
-  try { card = JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch (e) { if (e.code === 'ENOENT') throw Error('Изменение связки не найдено: ' + id); throw e; }
-  if (card?.name !== id || !card.base || !card.candidate || ['слито', 'закрыто без слияния'].includes(card.status))
-    throw Error('Нужна открытая карточка изменения связки: ' + id);
-  return { name: id, base: card.base, candidate: card.candidate };
-}
+// cache-622 (Б2): общая проверка поля change — common/change-review (та же у Kimi и DeepSeek).
+function changeReview(a) { return require('../../common/change-review').resolve(a, stateDir, 'Codex'); }
 
 async function send(a) {
   access.guard('codex', 'codex_send', a);
@@ -616,7 +591,7 @@ async function send(a) {
   // единственный участник сценария под лимитом всё равно запускался бы на продолжении. Проверка общая для нового и продолжения.
   if (a.force !== true && !access.guest()) {
     const qm = require('../../common/quota-mark').blocked(list());
-    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('Codex', qm.at), 'Дождитесь сброса или передайте force: true.');
+    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('Codex', qm.at, qm.kind), qm.kind === 'balance' ? 'Пополните счёт и передайте force: true.' : 'Дождитесь сброса или передайте force: true.');
   }
   // team-v63 (п.1): вложения читаются мостом сейчас (отказ на нечитаемом файле — до постановки).
   // team-v63 (п.16): гостю-исполнителю без полного доступа вложения ограничены его папкой поручения; владельцу/доказанному чату — без пределов.

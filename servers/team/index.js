@@ -280,7 +280,7 @@ register(
     scenario_file: z.string().optional().describe('start: абсолютный путь JSON-файла сценария (рядом — крючок; cwd = папка сценария).'),
     hook: z.object({ interp: z.string(), script: z.string() }).optional().describe('start: крючок { interp, script } абсолютными путями, если не задан в файле сценария.'),
     parallel: z.number().int().positive().optional().describe('start: предел одновременных поручений (по умолчанию без предела).'),
-    id: z.string().optional().describe('status/stop/resume: номер сценария.'),
+    id: z.string().optional().describe('status/stop/resume: номер сценария. resume продолжает остановленный или вставший на паузу (например, «нет денег на счёте DeepSeek»: шаг повторяется тому же участнику одной попыткой с force).'),
   },
   (a) => require('../../common/scenario-manager').command(a),
 );
@@ -312,6 +312,9 @@ if (require.main === module) {
     // team-v62 (взгляд участников): уборки читают перенесённое состояние (карточки, отметки процессов) — запускаем их
     // только ПОСЛЕ завершения первичной миграции (waitPrimary; при неприменимой миграции — сразу).
     .then(() => { if (process.env.MOST_PROBE_ONLY !== '1') setTimeout(() => { require('../../common/state-migration').waitPrimary().then(() => {
+      // install-gate-simple (24.11.2026): мёртвые поручения закрываются, замки мёртвых владельцев снимаются — при запуске
+      // и раз в сутки, в фоне (снимок процессов асинхронный). Живое не трогается. Только у сервера чата, не у гостя.
+      try { if (!require('../../common/access').guest()) require('../../common/dead-jobs').schedule(require('../../common/paths').stateDir); } catch {}
       try { require('../../common/cards-autocleanup').maybeRun({ stateDir: require('../../common/paths').stateDir, repoRoot: require('../../common/paths').repoRoot }); } catch {}
       // team-v61 (п.12): уборка устаревших отметок процессов (restart-servers/<pid>.json|.watch, ready/<server>.<pid>.json)
       // мёртвых процессов старше суток — в фоне, не на пути ответа сводки, не чаще раза в сутки.

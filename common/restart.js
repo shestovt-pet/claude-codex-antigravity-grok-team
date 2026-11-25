@@ -125,7 +125,13 @@ async function restart({ root, release, state, id, waitCompletion = false, close
     // расхождении (появилось поручение, которого пользователь не видел) — отказ с новым списком, перезапуск не идёт.
     if (overridden && typeof wordListHash === 'string' && wordListHash) {
       const kimi = require('./members-kimi');
-      const b2 = kimi.installationBlockers(state, deps.bootAt ? { bootAt: deps.bootAt } : {});
+      let b2;
+      try { b2 = kimi.installationBlockers(state, { ...(deps.bootAt ? { bootAt: deps.bootAt } : {}), table: deps.table }); }
+      catch (e) {
+        // Неполный снимок (ревью Codex п.4): перезапуск не идёт, пауза снимается, причина — одной строкой.
+        const cancelled = await hold.abort(state, pause, deps.hold || {});
+        throw Object.assign(Error('Настройки переключены, Claude не перезапущен: ' + e.message), { restartNotStarted: cancelled, restartStarted: !cancelled });
+      }
       const h2 = kimi.listHash(b2);
       // §5.1 (team-v58): сверка нужна ТОЛЬКО при непустых находках свежего списка. Если к перезапуску все утверждённые
       // поручения завершились (находок нет) — перезапуск НЕ отказывает, даже если отпечаток отличается от утверждённого.
@@ -141,7 +147,7 @@ async function restart({ root, release, state, id, waitCompletion = false, close
           '.\nНовый полный список:\n' + kimi.listText(b2) + '\nОтпечаток списка (list_hash): ' + h2 + '.\nДайте слово заново по новому списку.'), { restartNotStarted: cancelled, restartStarted: !cancelled });
       }
     } else if (!overridden) try {
-      const live = await (deps.running || require('./live-jobs').running)({ stateDir: state });
+      const live = await (deps.running || require('./live-jobs').running)({ stateDir: state, table: deps.table });
       if (live.length) throw Error('идут поручения ' + require('./live-jobs').describe(live));
     } catch (e) {
       const cancelled = await hold.abort(state, pause, deps.hold || {});

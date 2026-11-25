@@ -34,10 +34,10 @@ try {
 } finally {host.listJobs=oldList;}
 (async()=>{
  const stores=require('../common/team-store'), original=stores.list;
- stores.list=who=>({jobs:who==='antigravity'?[{id:'agy-stop',status:'failed',stopUnconfirmed:{pid:123}}]:[],errors:[]});
+ stores.list=who=>({jobs:who==='antigravity'?[{id:'agy-stop',status:'failed',stopUnconfirmed:{pid:process.pid}},{id:'agy-dead',status:'failed',stopUnconfirmed:{pid:2147480000}}]:[],errors:[]});
  try {
   const summary=await require('../common/summary').compact({root,state:path.join(root,'state','team'),works:()=>[]},'test quota');
-  assert.match(summary,/antigravity agy-stop: НЕ УДАЛОСЬ · ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА/);
+  assert.match(summary,/antigravity agy-stop: НЕ УДАЛОСЬ · ОСТАНОВКА НЕ ПОДТВЕРЖДЕНА/); assert(!summary.includes('agy-dead'),'мёртвое не показано');
  } finally {stores.list=original;}
  console.log('attribution-ui: 20 checks passed');
 })().catch(e=>{console.error(e);process.exitCode=1;});

@@ -130,8 +130,8 @@ async function duplicateReply(r, requestId) {
   return reply({ id: r.jobId, status: 'failed', requestId }, 'Повтор request_id ' + requestId + ': прежняя постановка оборвалась до публикации (владелец ' + owner + '); карточки нет. Повторите с новым request_id.', 'Повторите запрос.', true);
 }
 function view(j, offset = 0) {
-  let body = j.error || '';
-  if (j.status === 'queued') body = access.queued;
+  let body = (j.modelChoiceLine ? j.modelChoiceLine + '\n' : '') + (j.error || ''); // cache-622 (М4): строка выбора модели
+  if (j.status === 'queued') body = (j.modelChoiceLine ? j.modelChoiceLine + '\n' : '') + access.queued;
   if (j.status === 'done' && (!j.resultFile || !fs.existsSync(j.resultFile)))
     throw Error('Файл подтверждённого результата недоступен.');
   if (j.resultFile && fs.existsSync(j.resultFile)) {
@@ -387,12 +387,7 @@ async function execute(job, folderLock) {
       else if (j.status === 'cancelling') stop(job.id, j.stopReason).catch(logFailure);
       else if (require('../../common/chain-deadline').deadlinePassed(j)) stop(job.id, 'timeout').catch(logFailure);
     }), 200);
-    child.stdin.end(['Это отдельное поручение пользователя через Claude. Не считай, что знаешь другие чаты.',
-      job.fullAccessApplied
-        ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; каждое действие вне папки поручения перечисли в отчёте.'
-        : job.write ? 'Изменения разрешены только в рамках поручения. Перечисли файлы и проверки.'
-        : 'Только чтение. Не изменяй файлы.',
-      'Не обходи ограничения. Отвечай по-русски.', job.task, job.textFile ? 'Материал в файле: ' + job.textFile : '', ...require('../../common/attachments').promptTail(job)].join('\n'));
+    child.stdin.end(require('../../common/prompt-order').build(job)); // cache-622 М1: шапка → материал → вложения → задача
   } catch (e) {
     await finish(null, e.message);
   }
@@ -450,7 +445,7 @@ async function send(a) {
   // team-v63 (п.5/п.19): действующая отметка «лимит исчерпан» — не запускаем CLI (в т.ч. на продолжении); force — всегда.
   if (a.force !== true && !access.guest()) {
     const qm = require('../../common/quota-mark').blocked(list());
-    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('Claude', qm.at), 'Дождитесь сброса или передайте force: true.');
+    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('Claude', qm.at, qm.kind), qm.kind === 'balance' ? 'Пополните счёт и передайте force: true.' : 'Дождитесь сброса или передайте force: true.');
   }
   // team-v63 (п.1/п.16): вложения читаются сейчас; гостю без полного доступа — только из его папки поручения.
   const _att = require('../../common/attachments');
@@ -478,7 +473,7 @@ async function send(a) {
       const adm = require('../../common/job-admission');
       const txt = a.text === undefined ? undefined : require('crypto').createHash('sha256').update(a.text).digest('hex');
       const values = [['folder', require('../../common/scratch-folder').folderValue(a, folder)], ['task', a.task], ['text', txt], ['role', a.role], ['write', a.write === true],
-        ['full_access', a.full_access === true], ['level', a.level], ['files', attachData?.hash], ['work', a.work], ['stage', a.stage], ['stageId', a.stageId], ['stageTitle', a.stageTitle], ['gateOrder', a.gateOrder],
+        ['full_access', a.full_access === true], ['level', a.level], ['model', a.model], ['files', attachData?.hash], ['work', a.work], ['stage', a.stage], ['stageId', a.stageId], ['stageTitle', a.stageTitle], ['gateOrder', a.gateOrder],
         ['scopeTask', a.scopeTask], ['replaces', a.replaces], ['replacementEvidence', a.replacementEvidence], ['owner', a.owner],
         ['parentJob', require('../../common/job-chain').fields(a).parentJob], ['opora', a.opora]];
       const r = await adm.begin({ adapter: 'claude-print', access, requestId: a.request_id, values, newJobId: id });
@@ -516,6 +511,15 @@ async function send(a) {
     if (a.text !== undefined) { job.textFile = path.join(dir, id + '.input.txt'); fs.writeFileSync(job.textFile, a.text); }
     // team-v63 (п.1/п.6): вложения отдельным файлом; объём входа в знаках. Уровень — информативно (у Claude нет таблицы моделей).
     if (a.level) job.level = a.level;
+    // cache-622 (М4): модель по классу задачи — simple/read и level=fast → sonnet; прочее → модель аккаунта (без --model).
+    // Явный model в поручении сильнее таблицы.
+    {
+      const mc = require('../../common/model-choice');
+      const choice = mc.choose('claude', { ...a, effort: undefined });
+      const chosenModel = choice.named ? a.model : choice.model;
+      if (chosenModel) job.model = chosenModel;
+      job.modelChoiceLine = mc.line('claude', choice, choice.named, a.model);
+    }
     const attachChars = require('../../common/attachments').attach(job, attachData, path.join(dir, id + '.attach.txt')).chars;
     job.chars_in = require('../../common/usage').charsIn(a, attachChars);
     job.requestId = requestId;
@@ -636,7 +640,8 @@ register('claude_send', 'Поручить Claude-исполнителю', 'На�
   task: z.string().min(1).describe('Поручение.'),
   text: z.string().optional().describe('Материал для работы.'),
   files: z.array(z.union([z.string(), z.object({ path: z.string(), lines: z.string().optional() })])).optional().describe('Вложения: абсолютные пути (строка или { path, lines }); мост читает и вкладывает их в поручение, файлы открывать не нужно.'),
-  level: z.enum(['fast', 'normal', 'strong']).optional().describe('Уровень модели: fast | normal | strong (у Claude-исполнителя информативно; роль и права не меняет).'),
+  level: z.enum(['fast', 'normal', 'strong']).optional().describe('Уровень модели: fast → sonnet; normal | strong → модель аккаунта. Роль и права не меняет; model сильнее.'),
+  model: z.string().regex(/^[A-Za-z0-9._:-]+$/).optional().describe('Модель Claude Code (например sonnet, opus или полный id). Не указывай — мост выберет по задаче.'),
   force: z.boolean().optional().describe('Пробовать даже при действующей отметке «лимит исчерпан».'),
   write: z.boolean().default(false).describe('Разрешить изменения по поручению (Edit в папке поручения).'),
   full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя (Bash); при write=true, роли текст или совет и абсолютной существующей папке.'),

@@ -343,7 +343,7 @@ T('Б.3: antigravity_send принимает files (вложения) и level �
   assert.match(src, /files: z\.array\(z\.union\(\[z\.string\(\), z\.object\(\{ path: z\.string\(\), lines: z\.string\(\)\.optional\(\) \}\)\]\)\)\.optional\(\)/, 'files в схеме most_poruchit');
   assert.match(src, /level: z\.enum\(\['fast', 'normal', 'strong'\]\)\.optional\(\)/, 'level в схеме');
   assert.match(src, /_att\.read\(files, \{ authorize:/, 'files читаются общим модулем attachments');
-  assert.match(src, /mc\.choose\('antigravity', \{ task: poruchenie, rezhim, fayl, opora, role: agyRole, level \}\)/, 'level передан в выбор модели');
+  assert.match(src, /mc\.choose\('antigravity', \{ task: classifyMaterial \? poruchenie \+ '\\n\\n' \+ classifyMaterial : poruchenie, rezhim, fayl, opora, role: agyRole, level \}\)/, 'level передан в выбор модели');
   // level доходит до модели antigravity.
   assert.equal(mc.choose('antigravity', { poruchenie: 'x', level: 'strong' }).model, 'gemini-4-hydrogen-high');
 });

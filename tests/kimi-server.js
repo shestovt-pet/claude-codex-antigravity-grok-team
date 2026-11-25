@@ -153,7 +153,7 @@ const tests = [
       assert.equal(j.previous, null);
       return j;
     }
-    for (const [role, effort] of [['совет', 'low'], ['текст', 'high'], ['проверка', 'max']]) {
+    for (const [role, effort] of [['совет', 'low'], ['текст', 'high'], ['проверка', 'high']]) { // cache-622: обычная проверка — high
       const j = await check({ role }, effort);
       if (role !== 'проверка') { assert.equal(j.voteEligible, false, 'совет/текст: done, но не голос (А1/Б4)'); assert(j.voteIneligibleReason, 'причина неголосования сохранена'); }
     }

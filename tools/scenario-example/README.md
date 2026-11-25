@@ -104,7 +104,7 @@ team_scenario action=start scenario_file="E:\\...\\scenario.json"
 | **kimi** (kimi-code) | ведущий | **да** — через `continue_id` → `--session` (секрет повторён в ходах 2–3) |
 | **deepseek** (dsh flash) | игрок | **да** — через `continue_id` → `--session-id` (секрет повторён в ходах 2–3) |
 | **codex** (gpt) | запас | **да** — через `continue_id` → threadId (проверено отдельной пробой) |
-| **antigravity** (agy) | — | в сценарии память **эмулируется** вложением `memory_file` (CLI умеет `--continue`/`--conversation`, но захват id пока не встроен) |
+| **antigravity** (agy) | — | **да** (с cache-622) — через `continue_id` → `agy --conversation <id>`; id разговора мост берёт из поля `conversation_id` потока agy. Живая проба 23.11.2026 на agy 1.5.15: второй ход вспомнил слово из первого |
 | **claude** | — | продолжение CLI не поддержано — в сценарии **эмуляция** вложением `memory_file` |
 
 Объём входа всего стола (9 поручений): **сценарий ~11 КБ** против «как сейчас» (полный материал каждый ход, без сеансов) —

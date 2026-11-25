@@ -39,16 +39,25 @@ test('О8: завершённые только счётчиком, полная 
   const full = await t.status(undefined, undefined, false, true); assert.match(full, /Закрытый этап/); assert.match(full, /выдан без принятия/);
 });
 test('О9: разные старые счётчики, свежие и активные по строкам, full сохраняет все остановки', async () => {
+  // install-gate-simple: процесс поручения жив (номер этого процесса теста) — поручение видно; мёртвое (нет процесса, старше
+  // суток) в сводке не показывается ни строкой, ни в счётчиках.
+  const me = process.pid;
   const jobs = [
-    { id: 'old-decision', status: 'needs_decision', startedAt: ago(25) },
-    { id: 'stop-old', status: 'stop_unconfirmed', startedAt: ago(25) },
-    { id: 'cancel-old', status: 'cancelled', stopUnconfirmed: true, startedAt: ago(25) },
+    { id: 'old-decision', status: 'needs_decision', pid: me, startedAt: ago(25) },
+    { id: 'stop-old', status: 'stop_unconfirmed', pid: me, startedAt: ago(25) },
+    { id: 'cancel-old', status: 'cancelled', stopUnconfirmed: { pid: me }, startedAt: ago(25) },
     { id: 'new-decision', status: 'needs_decision', startedAt: ago(1) },
     { id: 'cancel-new', status: 'cancelled', stopUnconfirmed: true, startedAt: ago(1) },
-    ...['running', 'queued', 'cancelling', 'cancel_requested', 'delivery_unclear', 'migration_conflict', 'applying'].map((status, i) => ({ id: 'active-' + i, status, startedAt: ago(30) }))
+    ...['running', 'queued', 'cancelling', 'cancel_requested', 'delivery_unclear', 'migration_conflict', 'applying'].map((status, i) => ({ id: 'active-' + i, status, pid: me, startedAt: ago(30) }))
   ];
-  await withJobs({ codex: jobs }, async () => {
+  const deadJobs = [
+    { id: 'dead-decision', status: 'needs_decision', startedAt: ago(25) },
+    { id: 'dead-stop', status: 'stop_unconfirmed', pid: 2147480000, startedAt: ago(2) },
+    { id: 'dead-running', status: 'running', startedAt: ago(30) },
+  ];
+  await withJobs({ codex: [...jobs, ...deadJobs] }, async () => {
     const t = new Team(RUN), text = await t.status();
+    for (const j of deadJobs) assert(!text.includes(j.id.slice(0, 8)), 'мёртвое не показано: ' + j.id);
     assert.match(text, /нужно решение по 1 поручениям старше суток/); assert.match(text, /остановка не подтверждена у 2 поручений старше суток/);
     for (const j of jobs.slice(3)) assert(text.includes(j.id.slice(0, 8)), j.id);
     assert(!text.includes('old-deci')); assert(!text.includes('stop-old')); assert(!text.includes('cancel-o'));
@@ -107,9 +116,9 @@ function statusFixture(root, crowded) {
   // remind — работа-напоминание владельца: не самая свежая активная работа (её updated старше open-24),
   // чтобы при переполнении сохранялся именно блок самой свежей открытой работы (team-v47 О10).
   json(path.join(root, 'works/remind.json'), work('remind', { owner: 'status-owner', created_at: ago(2), updated_at: ago(2), status_sent_at: ago(1) }));
-  for (let i = 0; i < 30; i++) json(path.join(root, 'state/codex-jobs/decision-' + i + '.json'), { id: 'decision-' + i, status: 'needs_decision', startedAt: ago(25) });
+  for (let i = 0; i < 30; i++) json(path.join(root, 'state/codex-jobs/decision-' + i + '.json'), { id: 'decision-' + i, status: 'needs_decision', pid: process.pid, startedAt: ago(25) });
   json(path.join(root, 'state/codex-jobs/running.json'), { id: 'running-o10', status: 'running', startedAt: ago(1) });
-  json(path.join(root, 'state/jobs/applying/card.json'), { id: 'applying', status: 'applying', startedAt: ago(30) });
+  json(path.join(root, 'state/jobs/applying/card.json'), { id: 'applying', status: 'applying', pid: process.pid, startedAt: ago(30) });
   write(path.join(root, 'works/broken.json'), '{');
   json(path.join(root, 'state/team/changes/active.json'), { name: 'active', title: 'Изменение в работе', status: 'разработка', requestMark: '#45e7aa10', request: 'Проверить сводку' });
   json(path.join(root, 'state/deploy-ops/check.json'), { id: 'check', status: 'перезапуск не запущен', createdAt: ago(1) });
@@ -207,22 +216,24 @@ const dead = { fingerprint: pid => pid === fixtureProcess.pid ? null : self() };
 function pause(state, runId, executor = fixtureProcess) { const h = { id: runId, runId, createdAt: new Date().toISOString(), executor }; json(hold.holdFile(state), h); return h; }
 function closing(state, runId, targets = [], proc = fixtureProcess) { const c = { decision: 'закрываю', id: runId, runId, ...proc, publishedAt: new Date().toISOString(), targets }; hold.publish(hold.claimFile(state, runId), c); return c; }
 async function unlocked(state) { const l = await locks.tryLock('job_start', 'all', {}, state); assert(l.ok, 'замок не отпущен'); await l.release(); }
-test('О1–О2: прямое хранилище, живой/мёртвый/неизвестный владелец, apply.owner и ошибки', async () => {
+test('О1–О2: прямое хранилище — идёт только поручение с живым процессом (install-gate-simple), apply.owner и нечитаемая карточка', async () => {
   const state = fresh('live'), live = require('../common/live-jobs');
   const mine = locks.owner(), gone = { instance: 'dead-' + Date.now(), pid: 999999, startedAt: ago(1) };
-  for (const status of ['running', 'cancelling', 'cancel_requested', 'stop_unconfirmed', 'cancelled']) {
-    const file = path.join(state, 'codex-jobs/a.json'); json(file, { id: 'abcdefgh-more', status, stopUnconfirmed: status === 'cancelled', owner: mine, folder: 'чужая-папка', from: 'claude', work: 'другая-работа', startedAt: ago(1) });
-    const rows = await live.running({ stateDir: state }); assert.equal(rows.length, 1); assert.match(live.describe(rows), /abcdefgh.*чужая-папка.*идёт.*claude.*другая-работа/);
-    json(file, { id: 'a', status, stopUnconfirmed: status === 'cancelled', owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 1, 'мёртвый владелец не снимает блокировку: дочерний процесс мог остаться');
+  for (const status of ['running', 'cancelling', 'cancel_requested', 'stop_unconfirmed']) {
+    const file = path.join(state, 'codex-jobs/a.json'); json(file, { id: 'abcdefgh-more', status, owner: mine, folder: 'чужая-папка', from: 'claude', work: 'другая-работа', startedAt: ago(1) });
+    const rows = await live.running({ stateDir: state }); assert.equal(rows.length, 1, status); assert.match(live.describe(rows), /abcdefgh.*чужая-папка.*идёт.*claude.*другая-работа/);
+    json(file, { id: 'a', status, owner: gone, pid: 999998 }); assert.equal((await live.running({ stateDir: state })).length, 0, status + ': ни владельца, ни процесса — мёртвое, установку не держит');
   }
-  json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status: 'cancelled', owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 0, 'мёртвый владелец без stopUnconfirmed не блокирует');
-  json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status: 'cancelled', stopUnconfirmed: { pid: 999999 }, owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 1, 'неподтверждённая остановка блокирует и без владельца');
-  json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status: 'stop_unconfirmed', owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 1);
-  for (const status of ['queued', 'waiting_quota', 'needs_decision', 'done']) { json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status, owner: mine }); assert.equal((await live.running({ stateDir: state })).length, 0); }
+  json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status: 'cancelled', stopUnconfirmed: { pid: process.pid }, owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 1, 'неподтверждённая остановка с живым процессом держит');
+  json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status: 'cancelled', stopUnconfirmed: { pid: 999999 }, owner: gone }); assert.equal((await live.running({ stateDir: state })).length, 0, 'неподтверждённая остановка мёртвого процесса не держит');
+  for (const status of ['queued', 'waiting_quota', 'needs_decision', 'done']) { json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status, owner: mine }); assert.equal((await live.running({ stateDir: state })).length, 0, status); }
   json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'applying', owner: gone, apply: { owner: mine } }); assert.equal((await live.running({ stateDir: state })).length, 1);
   json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'applying', owner: mine, apply: { owner: gone } }); assert.equal((await live.running({ stateDir: state })).length, 1);
-  for (const owner of [mine, null]) { json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'running', owner }); assert.equal((await live.running({ stateDir: state })).length, 1); }
-  write(path.join(state, 'jobs/b/card.json'), '{'); await assert.rejects(live.running({ stateDir: state }), /Не удалось проверить поручения/);
+  json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'running', owner: mine }); assert.equal((await live.running({ stateDir: state })).length, 1);
+  json(path.join(state, 'jobs/b/card.json'), { id: 'b', status: 'running', owner: null, startedAt: ago(1) }); assert.equal((await live.running({ stateDir: state })).length, 0, 'без номеров процессов — не живое');
+  write(path.join(state, 'jobs/b/card.json'), '{'); json(path.join(state, 'codex-jobs/a.json'), { id: 'a', status: 'running', owner: mine });
+  // install-gate-simple (ревью Codex п.4): полноту подтвердить нельзя — отказ «не удалось проверить, повторите», не пропуск.
+  await assert.rejects(live.running({ stateDir: state }), /не удалось проверить.*повторите/, 'нечитаемая карточка — отказ');
 });
 test('О1–О2: team deploy отказывает до установщика; без перезапуска Р1 не вызывается; слово владельца перекрывает и раннюю проверку restart_claude', async () => {
   const root = fresh('team-deploy'), state = path.join(root, 'state'), t = new Team(root, path.join(state, 'team'));
@@ -237,8 +248,8 @@ test('О1–О2: team deploy отказывает до установщика; �
     for (const restart_claude of [true, false]) {
       const refusal = await t.changeInner({ action: 'deploy', restart_claude });
       assert.match(refusal, /Установка не начата/, 'restart_claude=' + restart_claude);
-      assert.match(refusal, /foreign-job.*чужая-папка.*идёт/, 'полный список идущего поручения');
-      assert.match(refusal, /list_hash/); assert.match(refusal, /будут оборваны/);
+      assert.match(refusal, /codex — папка чужая-папка, идёт/, 'строка идущего поручения');
+      assert.match(refusal, /list_hash/); assert.match(refusal, /установка это оборвёт/);
     }
     assert.equal(calls, 0, 'установщик не вызван без слова');
     // Со словом пользователя и верным отпечатком deploy с restart_claude НЕ отказывает ранней проверкой, а доходит до
@@ -368,7 +379,13 @@ test('О2б, О6к,м: причины отказа, нечитаемые дан�
   pause(other, 'bad'); write(hold.claimFile(other, 'bad'), '{'); assert.equal(hold.admit(other, newer).ok, false);
 });
 test('О6а,ф,х: Р1 и ошибка Р1 отменяют свою паузу; id без операции равен runId', async () => {
-  for (const malformed of [false, true]) {
+  {
+    const root = fresh('r1-malformed'), state = path.join(root, 'state'); write(path.join(state, 'codex-jobs/a.json'), '{'); let launches = 0;
+    // install-gate-simple (ревью Codex п.4): нечитаемая карточка — полнота не подтверждена: перезапуск не идёт, причина одной строкой.
+    await assert.rejects(restart.restart({ root, release: root, state }, { launch: async () => launches++, waitMs: 50 }), /не удалось проверить/, 'нечитаемая карточка — отказ перезапуска');
+    assert.equal(launches, 0);
+  }
+  for (const malformed of [false]) {
     const root = fresh('r1-' + malformed), state = path.join(root, 'state'), file = path.join(state, 'codex-jobs/a.json');
     write(file, malformed ? '{' : JSON.stringify({ id: 'running', status: 'running', owner: locks.owner() }));
     let launches = 0;
@@ -796,7 +813,7 @@ test('О6т: все входы закрытия проходят протоко�
       m.require = name => name === './team-git' ? { ...require('../common/team-git'), repository() {}, hash: () => id } : Module.createRequire(filename)(name);
       m._compile(fs.readFileSync(filename).toString('utf8'), filename); action = () => m.exports.deploy({ root, configs: [config], restartClaude: true }, deps);
     }
-    await assert.rejects(action(), /идут поручения/); assert(!launched, route); assert(!fs.existsSync(hold.holdFile(state))); await unlocked(state);
+    await assert.rejects(action(), /идут поручения|Сейчас работает/); assert(!launched, route); assert(!fs.existsSync(hold.holdFile(state))); await unlocked(state);
   } } finally { for (const [k,v] of Object.entries(saved)) v === undefined ? delete process.env[k] : process.env[k] = v; }
   const state = path.join(RUN, 'state'), file = path.join(state, 'codex-jobs/fallback-live.json'); json(file, { id: 'fallback-live', status: 'running', owner: locks.owner() });
   const result = await require('../common/fallback').launchDesktop({ evaluate: () => ({ desktopAlive: true }), restartDeps: { launch: async () => { throw Error('не должен закрывать'); } } });

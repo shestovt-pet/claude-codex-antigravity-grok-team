@@ -42,6 +42,16 @@ function referenceSets(stateDir, repoRoot) {
     try { text = fs.readFileSync(f, 'utf8'); w = JSON.parse(text); } catch { continue; }
     if (w.closed !== true) tokens(text, refOpen);
   }
+  // install-gate-simple (ревью Codex, улучшение): возобновляемый сценарий (state.json со статусом не «done» — resume поднимает
+  // running/paused/stopped/failed) держит свои поручения: S.sessions[*].jobId продолжает сеанс (continue_id), S.jobs[*] —
+  // текущий шаг. Нечитаемое состояние сценария — тоже держит (по номерам из текста).
+  for (const id of safeReaddir(path.join(stateDir, 'scenarios'))) {
+    const f = path.join(stateDir, 'scenarios', id, 'state.json'); let text, S;
+    try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
+    try { S = JSON.parse(text.replace(/^\uFEFF/, '')); } catch { S = null; }
+    if (S && S.status === 'done') continue;
+    tokens(text, refOpen);
+  }
   walk(path.join(stateDir, 'locks'), f => { if (f.endsWith('.json')) try { tokens(fs.readFileSync(f, 'utf8'), lockRefs); } catch {} });
   walk(path.join(stateDir, 'admissions'), f => { if (f.endsWith('.json')) try { tokens(fs.readFileSync(f, 'utf8'), lockRefs); } catch {} });
   return { refOpen, lockRefs };
@@ -70,7 +80,7 @@ function plan(stateDir, repoRoot, now = Date.now()) {
       const cardFile = fs.existsSync(bundleCard) ? bundleCard : fs.existsSync(flatCard) ? flatCard : null;
       if (!cardFile) continue; // огрызок без карточки — не трогаем
       result.counts.total++;
-      let card; try { card = JSON.parse(fs.readFileSync(cardFile, 'utf8').replace(/^﻿/, '')); if (!card || typeof card !== 'object') throw 0; }
+      let card; try { card = JSON.parse(fs.readFileSync(cardFile, 'utf8').replace(/^\uFEFF/, '')); if (!card || typeof card !== 'object') throw 0; }
       catch { result.counts.unreadable++; continue; } // нечитаемая — не трогаем
       if (!STABLE.has(card.status)) { result.counts.nonfinal++; continue; } // незнакомый/неконечный — не трогаем
       const paths = names.map(n => path.join(dir, n)), lid = id.toLowerCase();
@@ -87,7 +97,7 @@ function plan(stateDir, repoRoot, now = Date.now()) {
 function removeSet(entry, stateDir, now = Date.now()) {
   const cutoff = now - WEEK;
   // Защитная перепроверка в момент удаления: статус ещё конечный, набор старше отсечки, пути внутри хранилища.
-  let card; try { card = JSON.parse(fs.readFileSync(entry.cardFile, 'utf8').replace(/^﻿/, '')); } catch { return false; }
+  let card; try { card = JSON.parse(fs.readFileSync(entry.cardFile, 'utf8').replace(/^\uFEFF/, '')); } catch { return false; }
   if (!STABLE.has(card.status)) return false;
   if (newestMtime(entry.paths) >= cutoff) return false;
   const root = path.resolve(stateDir);

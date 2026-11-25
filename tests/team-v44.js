@@ -60,7 +60,8 @@ function serverHarness(who) {
 }
 
 test('П1: needs_decision закрывается — cancelled + closedByWord, папка свободна, строка сводки исчезает', async () => {
-  const c = card({ status: 'needs_decision', startedAt: new Date(Date.now() - 25 * 3600000).toISOString() }, 'codex');
+  // install-gate-simple: needs_decision старше суток видно в сводке, пока жив процесс поручения (иначе это мёртвое).
+  const c = card({ status: 'needs_decision', pid: process.pid, startedAt: new Date(Date.now() - 25 * 3600000).toISOString() }, 'codex');
   assert(live.holdsFolder(c.read(), 'codex'), 'до закрытия папка held');
   const before = require('../common/summary');
   assert.match(await before.compact(team, 'Квоты: тест', undefined, { budget: 100000 }), /нужно решение/);

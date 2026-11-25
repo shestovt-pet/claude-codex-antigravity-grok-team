@@ -227,7 +227,15 @@ async function locked(root, fn, state) {
 //    список собирается заново: изменился — показать и спросить снова. Пустое/пробельное слово — отказ.
 async function resolveInstallWord(state, options, deps) {
   const kimi = require('./members-kimi');
-  let b = kimi.installationBlockers(state, { bootAt: deps.bootAt }), hash = kimi.listHash(b);
+  // install-gate-simple: перед воротами мёртвые поручения закрываются, замки мёртвых владельцев снимаются (живое не трогается).
+  // Здесь мы уже под замком операции (deployer.locked) и после проверок полномочий (ревью Codex п.8). Таблица процессов
+  // строится ОДИН раз и служит и уборке, и воротам (ревью Gemini г). Неполный снимок — уборка ничего не закрывает, ворота дают
+  // технический отказ одной строкой.
+  const dj = require('./dead-jobs');
+  let table = deps.table;
+  if (table === undefined) table = await dj.tableAsync(dj.pidsOf(dj.load(state)));
+  if (deps.finalizeDead !== false) await dj.finalize(state, { table, deps: deps.deadJobs });
+  let b = kimi.installationBlockers(state, { bootAt: deps.bootAt, table }), hash = kimi.listHash(b);
   const findings = () => b.running.length || b.blockers.length;
   if (!findings()) return {};
   // Слово из чата (канал Claude/участника): отпечаток показанного списка уже проверен сервером (team.js) и пришёл сюда
@@ -246,9 +254,9 @@ async function resolveInstallWord(state, options, deps) {
   for (;;) {
     const print = deps.print || console.log;
     print(kimi.refusalText(b, hash, 'console'));
-    const answer = String(await deps.promptWord('Слово пользователя для перекрытия проверки (Enter — отмена): ') || '').trim();
-    if (!answer) throw Error('Слово не введено — установка отказана (пустое слово перекрытием не является).');
-    const b2 = kimi.installationBlockers(state, { bootAt: deps.bootAt }), hash2 = kimi.listHash(b2);
+    const answer = String(await deps.promptWord('Прервать — слово пользователя; подождать — Enter: ') || '').trim();
+    if (!answer) throw Error('Подождать: установка не начата, запустите её, когда поручения закончатся.');
+    const b2 = kimi.installationBlockers(state, { bootAt: deps.bootAt, table: deps.table }), hash2 = kimi.listHash(b2);
     // team-v57 (task9 п.6, ревью Gemini 3): если за время ввода список изменился и находок больше НЕ осталось — слово не
     // нужно и в операцию не пишется (возвращаем {}). Если находки остались — показываем изменившийся список и спрашиваем снова.
     if (hash2 !== hash) { b = b2; hash = hash2; if (!findings()) return {}; print('Список изменился с момента показа — проверьте заново.'); continue; }

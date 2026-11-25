@@ -266,27 +266,26 @@ console.log(JSON.stringify({ type: 'final', text: 'ОК ' + profile + ' ' + proc
       assert(paths.includes(path.join(local, 'Claude-Data', 'Claude_abc123', 'claude_desktop_config.json')), JSON.stringify(paths));
     } finally { if (oldLocal) process.env.LOCALAPPDATA = oldLocal; else delete process.env.LOCALAPPDATA; if (oldClaude) process.env.MOST_CLAUDE_CONFIGS = oldClaude; }
   }],
-  ['К6б: блокирует без доказательства; reboot/слово/историческая Grok не блокируют', async () => {
+  ['К6б → install-gate-simple: идёт только поручение с живым процессом; без процесса, мёртвый номер, Grok — не идут, слово живое не отменяет', async () => {
     const state = path.join(f.root, 'state'), live = require('../common/live-jobs');
     const put = (rel, j) => { const file = path.join(state, rel); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(j)); return file; };
-    // Активный участник без pid — блокирует (обход дерева запрещён).
+    const ids = async () => (await live.running({ stateDir: state })).map(j => j.id);
+    // Без номера процесса, моложе суток — не идёт (и не закрывается: keep).
     put('codex-jobs/a.json', { id: 'aaaa', status: 'stop_unconfirmed', startedAt: new Date().toISOString() });
-    assert((await live.running({ stateDir: state })).some(j => j.id === 'aaaa'));
-    // Мёртвый записанный pid без основания — всё равно блокирует.
+    assert(!(await ids()).includes('aaaa'));
+    // Мёртвый записанный номер — мёртвое: не идёт, в stale с причиной.
     put('codex-jobs/b.json', { id: 'bbbb', status: 'stop_unconfirmed', stopUnconfirmed: { pid: 999999 }, startedAt: new Date().toISOString() });
-    assert((await live.running({ stateDir: state })).some(j => j.id === 'bbbb'));
-    // Перезагрузка после карточки — не блокирует.
-    put('codex-jobs/c.json', { id: 'cccc', status: 'stop_unconfirmed', startedAt: new Date().toISOString() });
-    const oldBoot = process.env.MOST_TEST_BOOT_AT; process.env.MOST_TEST_BOOT_AT = new Date(Date.now() + 60000).toISOString();
-    try { assert(!(await live.running({ stateDir: state })).some(j => j.id === 'cccc')); assert((await live.staleRecords({ stateDir: state })).some(j => j.id === 'cccc' && /reboot/.test(j.note))); }
-    finally { if (oldBoot === undefined) delete process.env.MOST_TEST_BOOT_AT; else process.env.MOST_TEST_BOOT_AT = oldBoot; }
-    // Слово пользователя в карточке — не блокирует.
-    put('codex-jobs/d.json', { id: 'dddd', status: 'stop_unconfirmed', stopConfirmed: { basis: 'word', quote: 'остановка подтверждена пользователем' }, startedAt: new Date().toISOString() });
-    assert(!(await live.running({ stateDir: state })).some(j => j.id === 'dddd'));
-    // Доказанно историческая Grok без pid (до 13.10.2026) — не блокирует.
+    assert(!(await ids()).includes('bbbb'));
+    assert((await live.staleRecords({ stateDir: state })).some(j => j.id === 'bbbb' && /мёртвое поручение/.test(j.note)));
+    // Живой процесс — идёт, даже если на карточке есть слово (установка его оборвёт).
+    put('codex-jobs/d.json', { id: 'dddd', status: 'stop_unconfirmed', pid: process.pid, stopConfirmed: { basis: 'word', quote: 'остановка подтверждена пользователем' }, startedAt: new Date().toISOString() });
+    assert((await ids()).includes('dddd'));
+    // Историческая Grok без процесса — мёртвое.
     put('grok-jobs/e.json', { id: 'eeee', status: 'stop_unconfirmed', startedAt: '2026-10-01T00:00:00Z' });
-    assert(!(await live.running({ stateDir: state })).some(j => j.id === 'eeee'));
-    assert((await live.staleRecords({ stateDir: state })).some(j => j.id === 'eeee' && /historical/.test(j.note)));
+    assert(!(await ids()).includes('eeee'));
+    assert((await live.staleRecords({ stateDir: state })).some(j => j.id === 'eeee'));
+    for (const n of ['a', 'b', 'd']) fs.rmSync(path.join(state, 'codex-jobs', n + '.json'), { force: true });
+    fs.rmSync(path.join(state, 'grok-jobs', 'e.json'), { force: true });
   }],
   ['reconsider_by_other: отказ выключенного закрывается подтверждением другой семьи; обычное ПРИНЯТО не пересмотр', async () => {
     setB();
@@ -411,16 +410,17 @@ console.log(JSON.stringify({ type: 'final', text: 'ОК ' + profile + ' ' + proc
     assert.equal(require('../common/model-family').family('deepseek-v4-pro'), 'deepseek');
     assert.equal(require('../common/model-family').family('deepseek-v4-flash'), 'deepseek');
   }],
-  ['К6б: живой процесс-ребёнок блокирует и после его смерти', async () => {
+  ['К6б → install-gate-simple: живой процесс-ребёнок держит; после его смерти — нет', async () => {
     const state = path.join(f.root, 'state'), live = require('../common/live-jobs');
     const child = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 60000)'], { stdio: 'ignore' });
     const file = path.join(state, 'codex-jobs', 'p.json');
     try {
+      await new Promise(r => setTimeout(r, 300));
       f.json(file, { id: 'pppp', status: 'stop_unconfirmed', stopUnconfirmed: { pid: child.pid }, startedAt: new Date().toISOString() });
-      assert((await live.running({ stateDir: state })).some(j => j.id === 'pppp'), 'живой процесс блокирует');
+      assert((await live.running({ stateDir: state })).some(j => j.id === 'pppp'), 'живой процесс держит');
       child.kill();
-      await new Promise(r => setTimeout(r, 120));
-      assert((await live.running({ stateDir: state })).some(j => j.id === 'pppp'), 'смерть pid не снимает блокировку: потомок мог остаться');
+      await new Promise(r => setTimeout(r, 300));
+      assert(!(await live.running({ stateDir: state })).some(j => j.id === 'pppp'), 'процесс завершён — поручение мёртвое');
     } finally { try { child.kill(); } catch {} fs.rmSync(file, { force: true }); }
   }],
   ['Голос DeepSeek: чужая семья модели не засчитывается', () => {

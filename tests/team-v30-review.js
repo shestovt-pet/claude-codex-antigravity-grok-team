@@ -39,25 +39,18 @@ f.run([
       assert(!members.get('zzz'));
     } finally { f.json(file, { id: 'job', status: 'done' }); }
   }],
-  ['Р1: поручение удалённого и неизвестного участника блокирует настоящий путь restart', async () => {
+  ['Р1 → install-gate-simple: поручения удалённого и неизвестного участника — мёртвые, перезапуск не держат; живой процесс держит', async () => {
     const state = path.join(f.root, 'state'), file = path.join(state, 'zzz-jobs/job.json');
     const orphan = path.join(state, 'orphan-jobs/card/card.json');
     f.json(file, { id: 'removed', status: 'running' });
     f.json(orphan, { id: 'unknown', status: 'applying' });
-    const hold = require('../common/restart-hold'), begin = hold.begin, abort = hold.abort;
-    let aborted = 0, launched = 0;
-    hold.begin = async () => ({ runId: 'test' }); hold.abort = async () => { aborted++; return true; };
     try {
-      const jobs = await live.running({ stateDir: state });
-      assert.deepEqual(jobs.map(j => j.who).sort(), ['orphan', 'zzz']);
-      await assert.rejects(() => require('../common/restart').restart({ root: f.root, release: f.root, state },
-        { launch: async () => { launched++; } }), e => /не перезапущен.*идут поручения/s.test(e.message) &&
-          /zzz/.test(e.message) && /orphan/.test(e.message));
-      assert.equal(aborted, 1); assert.equal(launched, 0);
+      assert.deepEqual((await live.running({ stateDir: state })).filter(j => ['orphan', 'zzz'].includes(j.who)), [], 'участника нет в реестре — мёртвое');
+      const stale = await live.staleRecords({ stateDir: state });
+      for (const id of ['removed', 'unknown']) assert(stale.some(j => j.id === id && /участник удалён из связки/.test(j.note)), id);
       f.json(file, { id: 'removed', status: 'stop_unconfirmed', owner: { instance: 'dead-review-owner' } });
-      assert((await live.running({ stateDir: state })).some(j => j.id === 'removed'));
+      assert(!(await live.running({ stateDir: state })).some(j => j.id === 'removed'));
     } finally {
-      hold.begin = begin; hold.abort = abort;
       f.json(file, { status: 'done' }); f.json(orphan, { status: 'done' });
     }
   }],

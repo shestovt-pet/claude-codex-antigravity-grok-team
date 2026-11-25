@@ -203,7 +203,11 @@ async function execute(job, folderLock) {
     try {
       const e = JSON.parse(s);
       if (e.type === 'session' && e.sessionId) { job.sessionId = e.sessionId; mutate(job.id, c => { c.sessionId = e.sessionId; }).catch(logFailure); }
-      if (e.type === 'final') { finalText = String(e.text ?? ''); completed = true; const t = require('../../common/usage').genericTokens(e.usage); if (t) job.tokens = { ...(job.tokens || {}), ...t }; }
+      // cache-622 (М3): dsh отдаёт usage в событиях status/step_end (inputTokens без кэша, cacheReadTokens, cacheWriteTokens,
+      // outputTokens; живая проба dsh 0.2.2-rc.5 23.11.2026) — суммируем по шагам хода. usage в final (если появится) главнее.
+      // cache-622 (У2): разбор — общим genericTokens (понимает поля dsh и поля API prompt_cache_hit/miss_tokens).
+      if (e.type === 'status' && e.phase === 'step_end' && e.usage) { const t = require('../../common/usage').genericTokens(e.usage); if (t) { job.stepTokens = require('../../common/usage').addTokens(job.stepTokens, t); job.tokens = job.stepTokens; } }
+      if (e.type === 'final') { finalText = String(e.text ?? ''); completed = true; const t = require('../../common/usage').genericTokens(e.usage); if (t) job.tokens = t; }
       if (e.type === 'tool_call') provenance.observe(job, 'deepseek', { toolNames: [e.tool] });
     } catch {}
   }
@@ -278,7 +282,17 @@ async function execute(job, folderLock) {
           // ТОЛЬКО по диагностике провайдера (stderr/ошибка запуска), как в п.1 (текст ответа в распознавание не идёт).
           // Авто-продолжения у очереди DeepSeek нет — честно просим повторить (новое поручение).
           const q = require('../../common/quota');
-          if (q.quotaExhausted([errors, error].filter(Boolean).join('\n'))) {
+          const diag = [errors, error].filter(Boolean).join('\n');
+          // quota-622 (слово пользователя 23.11.2026): «на счёте нет денег» (dsh ACCOUNT_QUOTA / QUOTA, Insufficient Balance, 402).
+          // Баланс сам не пополняется: повтор по таймеру бесполезен. Карточка — failed (писатель — needs_decision) с отметкой
+          // quotaReason 'balance' + lastQuotaAt: по ней quota-mark даёт быстрый отказ новым поручениям, сценарий обходит/ставит на
+          // паузу, team_status показывает «на счёте нет денег». Снятие — первый успешный ответ (force: true после пополнения).
+          if (q.balanceExhausted(diag)) {
+            const line = diag.split(/\r?\n/).find(l => q.balanceExhausted(l)) || '';
+            const provider = q.providerLine(line);
+            c.error = 'На счёте DeepSeek нет денег' + (provider ? ' (' + provider + ')' : '') + '. Пополните счёт и повторите с force: true или отдайте работу другой семье.';
+            c.errorKind = 'balance'; c.quotaReason = 'balance'; c.retryKind = 'quota'; c.lastQuotaAt = new Date().toISOString();
+          } else if (q.quotaExhausted(diag)) {
             const provider = q.providerLine(errors || error);
             c.error = 'Лимит DeepSeek исчерпан (подписочная квота)' + (provider ? ' (' + provider + ')' : '') + '. Повторите позже или отдайте работу другой семье.';
             c.errorKind = 'quota';
@@ -376,11 +390,7 @@ async function execute(job, folderLock) {
       else if (j.status === 'cancelling') stop(job.id, j.stopReason).catch(logFailure);
       else if (require('../../common/chain-deadline').deadlinePassed(j)) stop(job.id, 'timeout').catch(logFailure);
     }), 200);
-    child.stdin.end(['Это отдельное поручение пользователя через Claude. Не считай, что знаешь другие чаты.',
-      job.fullAccessApplied ? 'Полный доступ: команды выполняются от имени пользователя без песочницы. Запускай только то, что названо в поручении; каждое действие вне папки поручения перечисли в отчёте.'
-        : job.write ? 'Изменения разрешены только в рамках поручения. Перечисли файлы и проверки.'
-        : 'Только чтение. Не изменяй файлы.',
-      'Не обходи ограничения. Отвечай по-русски.', job.task, job.textFile ? 'Материал в файле: ' + job.textFile : '', ...require('../../common/attachments').promptTail(job)].join('\n'));
+    child.stdin.end(require('../../common/prompt-order').build(job)); // cache-622 М1: шапка → материал → вложения → задача
   } catch (e) {
     await finish(null, e.message);
   }
@@ -429,6 +439,8 @@ async function send(a) {
   access.guard('deepseek', 'deepseek_send', a);
   const refusal = fullAccessRefusal(a);
   if (refusal) throw Error(refusal);
+  // cache-622 (Б2): голос по изменению связки — поле change, карточка team_change (те же требования, что у Codex).
+  a.changeReview = require('../../common/change-review').resolve(a, stateDir, 'DeepSeek');
   // team-v48e Г4c: запись по поручению допускается гостю/подпоручению безусловно (тумблер MOST_GUEST_STRICT удалён);
   // серверная карточка проверяется отдельно, замок записи — всегда.
   const support = require('../../common/brief-support');
@@ -440,7 +452,7 @@ async function send(a) {
   // team-v63 (п.19): продолжение (continue_id) при свежей отметке — тот же быстрый отказ (кроме force).
   if (a.force !== true && !access.guest()) {
     const qm = require('../../common/quota-mark').blocked(list());
-    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('DeepSeek', qm.at), 'Дождитесь сброса или передайте force: true.');
+    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('DeepSeek', qm.at, qm.kind), qm.kind === 'balance' ? 'Пополните счёт и передайте force: true.' : 'Дождитесь сброса или передайте force: true.');
   }
   // team-v63 (п.1/п.16): вложения читаются сейчас; гостю без полного доступа — только из его папки поручения.
   const _att = require('../../common/attachments');
@@ -469,6 +481,7 @@ async function send(a) {
         ['full_access', a.full_access === true], ['model', a.model], ['level', a.level], ['files', attachData?.hash], ['continue_id', a.continue_id], ['work', a.work], ['stage', a.stage], ['stageId', a.stageId], ['stageTitle', a.stageTitle], ['gateOrder', a.gateOrder],
         ['scopeTask', a.scopeTask], ['replaces', a.replaces], ['replacementEvidence', a.replacementEvidence], ['owner', a.owner],
         ['parentJob', require('../../common/job-chain').fields(a).parentJob], ['opora', a.opora]];
+      if (a.changeReview) values.push(['change', a.changeReview]);
       const r = await adm.begin({ adapter: 'dsh-headless', access, requestId: a.request_id, values, newJobId: id });
       requestId = r.requestId;
       if (r.duplicate) { require('../../common/scratch-folder').discard(a); try { return view(load(r.jobId)); } catch {} return await duplicateReply(r, requestId); }
@@ -494,7 +507,8 @@ async function send(a) {
     const mc = require('../../common/model-choice');
     const dsChoice = mc.choose('deepseek', a);
     const inherited = prior?.launchModel ?? prior?.model;
-    a.model ??= dsChoice.byLevel ? dsChoice.model : inherited ?? profiles.profileModel(a.profile, params);
+    // cache-622 (уровни): проверка высокого уровня (review_high) — deepseek-v4-pro по таблице; продолжение держит модель сеанса.
+    a.model ??= dsChoice.byLevel ? dsChoice.model : inherited ?? (dsChoice.class === 'review_high' && dsChoice.model ? dsChoice.model : profiles.profileModel(a.profile, params));
     if (!/^[a-z0-9][a-z0-9._:/-]*$/i.test(a.model)) throw Error('Недопустимая модель DeepSeek.');
     const modelChoiceLine = mc.line('deepseek', { ...dsChoice, model: a.model }, dsChoice.named, a.model);
     if (!access.guest() && restartServer) restartHold.assertAdmitted(stateDir, restartServer, { early: true });
@@ -509,7 +523,7 @@ async function send(a) {
       if (!folderLock.ok) throw Error(folderLock.needsDecision ? 'Нужно решение: остановка прежнего исполнителя не подтверждена; замок записи сохранён.' : 'В этой папке (или вложенной) уже идёт поручение с записью.');
     }
     const job = {
-      id, folder, write: a.write, fullAccess: a.full_access === true, model: a.model, launchModel: a.model, modelChoiceLine,
+      id, folder, write: a.write, fullAccess: a.full_access === true, model: a.model, launchModel: a.model, modelChoiceLine, ...(a.changeReview ? { changeReview: a.changeReview } : {}),
       profile: a.profile,
       task: a.task,
       stage: a.stage, stageTitle: a.stageTitle, stageId: a.stageId, gateOrder: a.gateOrder, scopeTask: a.scopeTask, role: a.role, replaces: a.replaces, replacementEvidence: a.replacementEvidence,
@@ -662,6 +676,7 @@ register('deepseek_send', 'Поручить DeepSeek', 'Начать отдел�
   full_access: z.boolean().default(false).describe('Полный доступ для запуска программ пользователя; при write=true, роли текст или совет и абсолютной существующей папке.'),
   model: z.string().regex(/^[A-Za-z0-9._:-]+$/).optional().describe('Запрошенная модель; по умолчанию из реестра по роли.'),
   continue_id: z.string().optional().describe('Номер предыдущего поручения.'),
+  change: z.string().optional().describe('Имя открытого изменения из team_change для нового поручения с ролью «проверка», без записи.'),
   stage: z.string().optional().describe('Этап.'),
   owner: z.string().optional().describe('Метка сеанса владельца работы.'),
   work: z.string().optional().describe('Работа.'),

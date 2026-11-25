@@ -32,10 +32,13 @@ function lines(root, state, { full = false } = {}) {
   if (fs.existsSync(ready)) {
     // team-v28 Р3: отметки готовности только текущих участников; чужие (Grok выключен) — справкой, без «⚠».
     const servers = require('./members').installedServers, files = fs.readdirSync(ready).filter(n => n.endsWith('.json'));
-    const stale = files.filter(n => !servers.includes(n.slice(0, -5)));
-    // team-v60: перечень устаревших отметок — только в full; краткая сводка показывает одно число (их уборку не ждёт).
-    if (stale.length) rows.push(full ? 'Устаревшая отметка готовности: ' + stale.join(', ') : 'устаревших отметок готовности: ' + stale.length + ' — full=true');
-    const releases = files.filter(n => !stale.includes(n)).map(n => {
+    // install-gate-simple (24.11.2026): отметки на экземпляр <server>.<pid>.json ТЕКУЩИХ серверов — штатные (их по сроку
+    // убирает restart-mark-cleanup), устаревшими не считаются и в сводку не попадают. Устаревшая — только отметка сервера,
+    // которого нет в связке (Grok выключен): краткая сводка её не показывает вовсе, полная — перечнем.
+    const base = n => n.slice(0, -5).replace(/\.\d+$/, '');
+    const stale = files.filter(n => !servers.includes(base(n)));
+    if (stale.length && full) rows.push('Отметка готовности сервера вне связки (ни на что не влияет): ' + stale.join(', '));
+    const releases = files.filter(n => !stale.includes(n) && servers.includes(n.slice(0, -5))).map(n => {
       const rec = JSON.parse(fs.readFileSync(path.join(ready, n), 'utf8'));
       return rec.release && path.resolve(rec.release);
     });

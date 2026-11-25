@@ -1197,9 +1197,25 @@ class Team {
             !j.stopUnconfirmed && !['running', 'queued', 'waiting_quota', 'needs_decision', 'cancelling', 'cancel_requested', 'delivery_unclear', 'applying', 'stop_unconfirmed'].includes(j.status)
           )
             continue;
-          const confirmed = require('./live-jobs').confirmed(j, who);
+          // install-gate-simple (24.11.2026): мёртвое поручение (общее определение common/dead-jobs: снимок процессов с временем
+          // запуска на запрос, номер жив и запущен не позже карточки) в полной сводке не числится «идёт»/«нужно решение»:
+          // показывается как потерянное с причиной.
+          // Подтверждённая остановка (слово, stop_confirm) скрывается, как и прежде.
+          // Ревью Codex п.7: тот же снимок процессов и реестра на запрос, что у краткой сводки (dead-jobs.requestContext).
+          const dead = require('./dead-jobs').assessJob(j, await require('./dead-jobs').requestContext(snapshot));
+          const alive = dead.kind === 'live';
+          const confirmed = !alive && require('./live-jobs').confirmed(j, who);
+          if (dead.kind === 'dead') {
+            // Как прежде: подтверждённая остановка скрывается, если по состоянию «владелец мёртв» поручение не ждёт решения и
+            // не числится активным (delivery_unclear/migration_conflict и пишущие needs_decision остаются видны).
+            const eff = require('./live-jobs').effectiveStatus(j, 'dead');
+            const hidden = confirmed && eff !== 'needs_decision' && !['running', 'queued', 'waiting_quota', 'cancelling', 'cancel_requested', 'delivery_unclear', 'migration_conflict', 'applying'].includes(eff);
+            if (!hidden) rows.push(format(who === 'codex' ? 'Codex' : 'Antigravity', { ...j, stopUnconfirmed: null, status: 'lost' },
+              'Мёртвое поручение: ' + dead.reason + '; закроется уборкой (при запуске моста, раз в сутки, перед установкой).', 'Действий не требуется.'));
+            continue;
+          }
           const owner = await snapshot.ownerState(j.owner);
-          const status = j.archived ? 'lost' : require('./live-jobs').effectiveStatus(j, owner);
+          const status = j.archived ? 'lost' : alive ? j.status : require('./live-jobs').effectiveStatus(j, owner);
           if (confirmed && status !== 'needs_decision' && !['running', 'queued', 'waiting_quota', 'cancelling', 'cancel_requested', 'delivery_unclear', 'migration_conflict', 'applying'].includes(status)) continue;
           rows.push(
             format(

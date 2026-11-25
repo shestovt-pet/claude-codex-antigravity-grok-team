@@ -48,6 +48,13 @@ function classifyCodex(event) {
 function quotaExhausted(text) {
   return /usage limit|quota[ _-]*(?:exceeded|exhausted|limit)|RESOURCE_EXHAUSTED/i.test(String(text || ''));
 }
+// quota-622 (слово пользователя 23.11.2026): у DeepSeek на счёте нет денег. dsh отдаёт код ACCOUNT_QUOTA (баланс аккаунта
+// DeepSeek, «Insufficient Balance», HTTP 402) или QUOTA (то же по API-ключу: dsh-llm классифицирует 402 как QUOTA и для
+// аккаунтного маршрута переписывает в ACCOUNT_QUOTA). Это НЕ окно квоты: баланс сам не пополняется. Как и quotaExhausted —
+// только по диагностике провайдера (stderr/ошибка запуска) поручения, завершившегося с ошибкой; тексту ответа — никогда.
+function balanceExhausted(text) {
+  return /\bACCOUNT_QUOTA\b|\bdsh:\s*QUOTA\b|Insufficient[ _-]*Balance|\b402\b[^\n]{0,40}Payment Required/i.test(String(text || ''));
+}
 // Исходная строка провайдера без ссылок и локальных путей (их подставлять в ответ нельзя): убираем URL и пути Windows/POSIX,
 // схлопываем пробелы и обрезаем. Нужна, чтобы показать причину провайдера рядом с понятным сообщением моста.
 function providerLine(text, max = 400) {
@@ -250,6 +257,7 @@ module.exports = {
   classifyAgy,
   classifyCodex,
   quotaExhausted,
+  balanceExhausted,
   providerLine,
   retryPlan,
   windows,

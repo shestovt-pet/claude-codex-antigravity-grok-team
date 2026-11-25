@@ -12,6 +12,8 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { randomUUID, createHash } = require('crypto');
+// cache-622 (М2): участники, у которых *_send принимает continue_id и продолжает сеанс (Claude-исполнитель — нет).
+const CAN_CONTINUE = new Set(['codex', 'deepseek', 'kimi', 'antigravity']);
 
 function nowIso() { return new Date().toISOString(); }
 // team-v63 (п.13): id сценария — та же проверка, что в create (без разделителей пути и обхода `..\..`).
@@ -88,7 +90,9 @@ async function dispatch(stateDir, S, key, deps) {
   j.member = member; j.resume = false;
   const sess = cmd.session ? S.sessions[cmd.session] : null;
   // Продолжение сеанса — только тем же участником, без fresh и без вынужденного рестарта (обход участника).
-  const continueId = sess && sess.member === member && !cmd.fresh && !j.forcedFresh ? sess.jobId : null;
+  // cache-622 (М2): продолжение умеют codex, deepseek, kimi и (с cache-622) antigravity — agy --conversation. У Claude-
+  // исполнителя продолжения нет: ему сеанс начинается заново с memory_file, а не отказ «не поддерживает continue_id».
+  const continueId = sess && sess.member === member && CAN_CONTINUE.has(member) && !cmd.fresh && !j.forcedFresh ? sess.jobId : null;
   const files = Array.isArray(cmd.files) ? [...cmd.files] : [];
   // Память сценария: когда сеанс начинается заново (нет continue_id), крючок может указать memory_file — вкладываем целиком.
   // Нет такого файла — пропускаем (эмулировать нечем): отсутствующая память не должна ронять всё поручение.
@@ -111,7 +115,10 @@ async function dispatch(stateDir, S, key, deps) {
     return true;
   };
   const r = await deps.runner.start({ scenarioId: S.id, key, member, role: cmd.role, level: cmd.level, task: cmd.task,
-    files: files.length ? files : undefined, continueId, timeout_sec: cmd.timeout_sec, requestId, resuming, notStopped });
+    files: files.length ? files : undefined, continueId, timeout_sec: cmd.timeout_sec, requestId, resuming, notStopped,
+    // quota-622: после resume сценария, вставшего «нет денег», — одна попытка в обход отметки (слово пользователя).
+    ...(j.forceOnce ? { force: true } : {}) });
+  j.forceOnce = false;
   // Остановка перехватила отправку до вызова — поручение осталось `sending`, подъём переотправит его тем же request_id.
   if (r && r.stopped) return;
   j.jobId = r.jobId; j.status = 'running';
@@ -150,11 +157,20 @@ async function pollRound(S, deps) {
       }
       // Отказ/квота/сбой: пробуем следующего участника тем же ключом (сеанс заново с memory_file, если задан).
       j.membersLeft = j.membersLeft.filter(m => m !== j.member);
+      // quota-622 (слово пользователя 23.11.2026): «на счёте нет денег» — недоступность участника, а не провал игрока. Есть
+      // запасной участник — переходим к нему (ниже). Нет — сценарий встаёт на паузу с причиной; шаг остаётся ждущим тому же
+      // участнику (тот же сеанс, новая попытка) и продолжается через resume, крючок «провала» не получает.
+      if (p.status === 'balance' && !j.membersLeft.length) {
+        j.membersLeft = [j.member]; j.status = 'pending'; j.jobId = null; j.attempts = (j.attempts || 0) + 1; j.balancePaused = true;
+        S.status = 'paused'; S.pauseReason = 'нет денег на счёте ' + memberTitle(j.member) + ' (шаг ' + S.step + ', ключ ' + key + '); пополните счёт и продолжите resume';
+        continue;
+      }
       if (j.membersLeft.length) { j.status = 'pending'; j.forcedFresh = true; j.jobId = null; j.attempts = (j.attempts || 0) + 1; }
       else { j.status = 'collected'; j.result = { key, member: j.member, status: p.status, error: p.error, ...clean(usage) }; }
     }
   }
 }
+function memberTitle(m) { return { deepseek: 'DeepSeek', codex: 'Codex', kimi: 'Kimi', antigravity: 'Antigravity', claude: 'Claude' }[m] || m; }
 function clean(o) { const r = {}; for (const [k, v] of Object.entries(o)) if (v !== undefined && v !== null) r[k] = v; return r; }
 // team-v63 (п.24): копим объём неудачных попыток отдельной строкой итога (secondsFailed/charsInFailed/charsOutFailed/attempts).
 function addFailedUsage(S, member, p) {
@@ -310,7 +326,7 @@ function statusLine(S) {
   const failedLine = f.attempts ? ' · неудачных попыток ' + f.attempts + ' (вход ' + (f.chars_in || 0) + ' / выход ' + (f.chars_out || 0) + ' знаков, время ' + Math.round(f.seconds || 0) + ' с)' : '';
   return 'Сценарий ' + S.id + ': ' + S.status + '; шаг ' + S.step + (S.phase === 'await_hook' ? ' (ждёт крючок)' : jobLine ? ' (идут: ' + jobLine + ')' : '') +
     '; поручений ' + t.steps + ', объём вход ' + (t.chars_in || 0) + ' / выход ' + (t.chars_out || 0) + ' знаков, время ' + Math.round(t.seconds || 0) + ' с' +
-    failedLine + (S.note ? ' · ' + S.note : '') + ((S.warnings && S.warnings.length) ? ' · ⚠ ' + S.warnings.join('; ') : '') + (S.error ? ' · ОШИБКА: ' + S.error : '');
+    failedLine + (S.status === 'paused' && S.pauseReason ? ' · ПАУЗА: ' + S.pauseReason : '') + (S.note ? ' · ' + S.note : '') + ((S.warnings && S.warnings.length) ? ' · ⚠ ' + S.warnings.join('; ') : '') + (S.error ? ' · ОШИБКА: ' + S.error : '');
 }
 
 // Число идущих сценариев — для краткой team_status (без тяжёлых чтений: только status.json каждого).
@@ -319,9 +335,15 @@ function runningCount(stateDir) {
   for (const id of listIds(stateDir)) { try { if (loadState(stateDir, id).status === 'running') n++; } catch {} }
   return n;
 }
+// quota-622: сценарии на паузе (например, «нет денег на счёте DeepSeek») — для краткой сводки.
+function pausedList(stateDir) {
+  const out = [];
+  for (const id of listIds(stateDir)) { try { const S = loadState(stateDir, id); if (S.status === 'paused') out.push(id + (S.pauseReason ? ' (' + S.pauseReason + ')' : '')); } catch {} }
+  return out;
+}
 
 module.exports = {
   scenariosDir, dirOf, saveState, commit, loadState, appendStep, listIds,
   tick, drive, dispatch, pollRound, pickMember, safeKey, validId, assertId,
-  spawnHook, killTree, create, riskLine, statusLine, runningCount, nowIso,
+  spawnHook, killTree, create, riskLine, statusLine, runningCount, pausedList, nowIso, CAN_CONTINUE,
 };

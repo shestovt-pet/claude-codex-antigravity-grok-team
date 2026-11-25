@@ -47,6 +47,8 @@ function buildArgs(files, params = {}, job = {}, helpText = '') {
     ...(supported.has('--no-session-persistence') ? ['--no-session-persistence'] : []),
     '--tools', tools.join(','),
     ...(allowed.length ? ['--allowedTools', ...allowed] : []),
+    // cache-622 (М4): модель по классу задачи (sonnet для простых и чтения) или названная в поручении; без неё — модель аккаунта.
+    ...(typeof job.model === 'string' && job.model ? ['--model', job.model] : []),
     '--strict-mcp-config',
     '--mcp-config', files.mcpConfig,
     ...(supported.has('--setting-sources') ? ['--setting-sources', ''] : []),

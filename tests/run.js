@@ -19,6 +19,9 @@ async function main(args = process.argv.slice(2)) {
   files.push('team-v61-night.js');
   files.push('team-v62-rehearsal.js');
   files.push('team-v63-scenario.js');
+  files.push('cache-622.js');
+  files.push('deepseek-balance.js');
+  files.push('install-gate-simple.js');
   if (args.some(f => !files.includes(f))) throw Error('Неизвестный набор тестов.');
   const temp = fs.mkdtempSync(path.join(__dirname, '.tmp-windows-'));
   fs.writeFileSync(log, '');

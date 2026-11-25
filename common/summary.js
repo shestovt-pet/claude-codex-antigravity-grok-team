@@ -107,6 +107,7 @@ async function compact(team, quota, snapshot = require('./job-snapshot').create(
   } catch (e) { add(e.message); }
   // team-v63 (п.4): одна строка о сценариях без тяжёлых чтений (только state.json каждого сценария).
   try { const n = require('./scenario').runningCount(require('./paths').stateDir); if (n) add('Сценарии: ' + n + ' идёт', 2); } catch {}
+  try { const p = require('./scenario').pausedList(require('./paths').stateDir); if (p.length) add('Сценарии на паузе: ' + p.join('; '), 2); } catch {}
   for (const line of options.required || []) add(line);
   for (const line of options.restartWarnings || require('./restart-hold').warnings(path.dirname(team.state))) add(line);
   await section(() => require('./release-drift').lines(team.root, require('./paths').stateDir).forEach(line => add(line)));
@@ -136,9 +137,16 @@ async function compact(team, quota, snapshot = require('./job-snapshot').create(
     // team-v63 (Д): сценарные поручения в краткой сводке по одному НЕ перечисляем — их считает строка «Сценарии: N идёт».
     // team-v63 (п.23): НО из счётчиков решений/остановок сценарные не выпадают — нужно решение/неподтверждённая остановка
     // сценарного поручения видна в сводке через эти счётчики (прежде фильтр !j.scenario выбрасывал их целиком).
+    // install-gate-simple (ревью Codex п.7): одно определение живости с воротами установки — общий снимок процессов и реестра
+    // на запрос (dead-jobs.requestContext), одно сравнение времени запуска. Мёртвое не показывается ни как «идёт», ни в
+    // счётчиках; живое показывается своим статусом; время запуска неизвестно — «не проверено», считается живым.
+    const deadCtx = await require('./dead-jobs').requestContext(snapshot);
     for (const j of result.jobs.filter(j => !j.archived && (j.stopUnconfirmed || [...active, 'needs_decision', 'stop_unconfirmed'].includes(j.status)))) {
-      const confirmed = require('./live-jobs').confirmed(j, who);
-      const status = require('./live-jobs').effectiveStatus(j, ['running', 'cancelling', 'stop_unconfirmed'].includes(j.status) ? await snapshot.ownerState(j.owner) : 'unknown');
+      const verdict = require('./dead-jobs').assessJob(j, deadCtx);
+      if (verdict.kind === 'dead') continue;
+      const alive = verdict.kind === 'live';
+      const confirmed = !alive && require('./live-jobs').confirmed(j, who);
+      const status = alive ? j.status : require('./live-jobs').effectiveStatus(j, ['running', 'cancelling', 'stop_unconfirmed'].includes(j.status) ? await snapshot.ownerState(j.owner) : 'unknown');
       if (confirmed && status !== 'needs_decision' && !active.includes(status) && status !== 'waiting_quota') continue;
       const stopped = !confirmed && (j.stopUnconfirmed || j.status === 'stop_unconfirmed');
       // Сценарное поручение индивидуальной строкой не показываем, но в счётчики решений/остановок включаем.

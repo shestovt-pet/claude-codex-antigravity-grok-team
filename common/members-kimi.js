@@ -304,7 +304,7 @@ async function stopServers(state, deps = {}) {
   // перед остановкой старых серверов (иначе общее слово перекрыло бы барьер assertNoJobs, но установка всё равно упала бы
   // здесь на тех же идущих поручениях). С непустым словом идущие поручения уже показаны пользователю и перекрыты его словом.
   const overridden = typeof deps.word === 'string' && deps.word.trim() !== '';
-  const jobs = overridden ? [] : await require('./live-jobs').running({ stateDir: state });
+  const jobs = overridden ? [] : await require('./live-jobs').running({ stateDir: state, table: deps.table });
   if (jobs.length) throw Error('Перед миграцией нужно завершить поручения: ' + require('./live-jobs').describe(jobs));
   const seen = new Set(targets.map(p => p.pid)); let changed;
   do { changed = false; for (const p of rows) if (seen.has(p.ppid) && !seen.has(p.pid)) { seen.add(p.pid); changed = true; } } while (changed);
@@ -316,33 +316,6 @@ async function stopServers(state, deps = {}) {
   }
   await assertServersStopped(state, seen, deps);
   return [...seen];
-}
-// team-v56 А5: строгий установочный барьер поверх v55. Вместо узкого running() — полный проход cards({strictStores:true}),
-// флаги/удержания, незавершённые admission/reservation и необъяснённые (осиротевшие) замки записи. Старые нормально
-// завершённые карточки (done/applied/failed/cancelled/stop_confirmed) без блокирующих флагов и живого дерева проходят —
-// нового общего атрибута от них не требуется. Неизвестный статус/битая карточка/ошибка перечисления — отдельный блокер
-// с путём. lost блокирует до явного подтверждения остановки. Смысл running() не расширяется — это отдельная проверка.
-const INSTALL_BLOCKING = ['queued', 'running', 'waiting_quota', 'applying', 'cancelling', 'cancel_requested', 'delivery_unclear', 'needs_decision', 'migration_conflict', 'stop_unconfirmed'];
-const TERMINAL_OK = ['done', 'applied', 'failed', 'cancelled', 'stop_confirmed'];
-// team-v56 А5: терминальная карточка «успеха» (done) проверяется по признакам завершения СВОЕГО адаптера — не по одному
-// статусу. Признаки — существующие поля штатного finish (не новый общий атрибут): так старые нормально завершённые
-// карточки Codex/Claude/DeepSeek проходят, а «голый» done без результата/exitCode/идентификатора сеанса блокируется.
-// failed/cancelled/stop_confirmed — уже терминально-негативные исходы: для них достаточно проверенных выше флагов/удержаний.
-// Прочие адаптеры (antigravity/kimi) своей строгой схемы здесь не получают (не названы в положительных фикстурах замысла).
-// team-v56 И6 (ревью Kimi 4): resultFile должен существовать, быть файлом и читаться — не просто непустая строка.
-// dir — каталог карточки (для разрешения относительного пути результата).
-function resultReadable(dir, resultFile) {
-  if (typeof resultFile !== 'string' || !resultFile.trim()) return false;
-  const p = path.isAbsolute(resultFile) ? resultFile : path.join(dir, resultFile);
-  try { if (!fs.statSync(p).isFile()) return false; fs.readFileSync(p); return true; } catch { return false; }
-}
-function terminalIncomplete(who, j, dir) {
-  if (j.status !== 'done') return null;
-  const finished = Number.isFinite(Date.parse(j.finishedAt)) && j.exitCode === 0;
-  if (who === 'codex') return finished && j.threadId && resultReadable(dir, j.resultFile) ? null : 'done без подтверждённого завершения Codex (threadId/finishedAt/exitCode=0/читаемый resultFile)';
-  if (who === 'claude') return finished && resultReadable(dir, j.resultFile) ? null : 'done без подтверждённого завершения Claude (finishedAt/exitCode=0/читаемый resultFile)';
-  if (who === 'deepseek') return finished && j.sessionId && (j.result !== undefined || resultReadable(dir, j.resultFile)) ? null : 'done без подтверждённого завершения DeepSeek (sessionId/finishedAt/exitCode=0/результат)';
-  return null;
 }
 // team-v57 (ред.5): слово пользователя на карточке перекрывает проверку перед установкой БЕЗ условий на PID (требование
 // владельца, не предмет ревью). Слово на карточке — статус stop_confirmed либо stopConfirmed.basis как непустая строка
@@ -397,97 +370,18 @@ function resilientCards(state) {
   }
   return { cards, errors };
 }
+// install-gate-simple (слово пользователя 24.11.2026): ворота установки видят ТОЛЬКО живое — поручения с живым процессом и замки
+// записи с живым владельцем (общее определение — common/dead-jobs). Мёртвое (lost, stop_unconfirmed, needs_decision, карточки
+// удалённых участников, замки мёртвых владельцев, «пропущенное по слову/перезагрузке») не выводится вообще и слова не требует;
+// его закрывает уборка dead-jobs.finalize (при запуске моста, перед установкой и раз в сутки). Поля passedByCardWord/
+// passedByReboot оставлены пустыми для совместимости записи операции. deps.table/now/stores — тестовые подстановки.
+// Ревью Codex п.4: снимок неполон (не прочитана карточка/замок, таблица процессов) — технический отказ одной строкой
+// «не удалось проверить, повторите» (исключение с code GATE_INCOMPLETE), а не молчаливый пропуск. Только чтение.
 function installationBlockers(state, deps = {}) {
-  const live = require('./live-jobs');
-  const running = [], blockers = [], passedByCardWord = [], passedByReboot = [];
-  let cards;
-  try { cards = live.cards({ stateDir: state, strictStores: true }); }
-  catch (e) {
-    // Нечитаемая карточка/хранилище не прекращает весь сбор: доступные записи перечисляются как обычно, каждая ошибка
-    // чтения — отдельным блокером с путём (остаётся блокером, снимается только общим словом установки).
-    const res = resilientCards(state);
-    cards = res.cards;
-    for (const err of res.errors) blockers.push(err);
-    if (!res.errors.length) blockers.push('ошибка перечисления поручений: ' + e.message);
-  }
-  // team-v57 (ред.6): полные номера поручений (без усечения до 8) — и в показанном списке, и в отпечатке.
-  // team-v57 (task9 п.2, ревью Gemini 5/Codex 2/Kimi 3): статус карточки входит в единый снимок (показ/отпечаток/запись).
-  const row = (who, j, entry) => ({ who, id: String(j.id || entry), status: j.status, folder: j.folder || j.cwd || j.papka || 'не указана',
-    duration: require('./format').duration(Date.now() - Date.parse(j.startedAt || j.createdAt || new Date())), from: j.from || j.sender || 'не указан',
-    work: j.workName || (typeof j.work === 'string' && j.work) || 'не указана' });
-  // Пропущенная карточка (по слову или перезагрузке) несёт те же поля, что running: участник, номер, статус, папка, отправитель.
-  const cardFolder = j => j.folder || j.cwd || j.papka || 'не указана', cardFrom = j => j.from || j.sender || 'не указан';
-  const ops = require('./deploy-ops'), boot = (deps.bootAt || installBootAt)();
-  // Перезагрузка: boot — конечное число, mtime карточки — конечное число > 0 (ошибка stat → mtime 0 → основание НЕ действует,
-  // чтобы недоступное время не стало ложным «reboot»), загрузка строго позже записи.
-  const rebootPassed = mtimeMs => Number.isFinite(boot) && Number.isFinite(mtimeMs) && mtimeMs > 0 && boot > mtimeMs;
-  for (const { who, j, entry, file, mtimeMs } of cards) {
-    const status = j.status, id = String(j.id || entry);
-    const word = cardWord(j), reboot = !word && rebootPassed(mtimeMs), cleared = word || reboot;
-    // Все причины карточки собираются БЕЗ раннего выхода (полный список для человека). cleared снимает: статус из
-    // INSTALL_BLOCKING, каждый флаг удержания (stopUnconfirmed/treeWarning/holdsFolder) по отдельности и lost.
-    // Неизвестный статус и неполный done остаются блокером независимо от слова на карточке/перезагрузки.
-    const passedReasons = [];
-    const flags = [[j.stopUnconfirmed, 'неподтверждённая остановка'], [j.treeWarning, 'предупреждение по дереву процессов'], [j.holdsFolder === true, 'удержание папки']];
-    for (const [present, text] of flags) if (present) {
-      const r = who + ' ' + id + ': ' + text + ' (' + status + ')';
-      if (cleared) passedReasons.push(r); else blockers.push(r);
-    }
-    if (INSTALL_BLOCKING.includes(status)) {
-      if (cleared) passedReasons.push(who + ' ' + id + ': идёт (' + status + ')'); else running.push(row(who, j, entry));
-    } else if (status === 'lost') {
-      if (cleared) passedReasons.push(who + ' ' + id + ': статус lost'); else blockers.push(who + ' ' + id + ': статус lost без подтверждённой остановки');
-    } else if (!TERMINAL_OK.includes(status)) {
-      blockers.push(who + ' ' + id + ': неизвестный статус «' + status + '» — заблокировано');
-    } else {
-      const inc = terminalIncomplete(who, j, path.dirname(file));
-      if (inc) blockers.push(who + ' ' + id + ': ' + inc);
-    }
-    if (cleared && passedReasons.length)
-      (word ? passedByCardWord : passedByReboot).push({ kind: 'card', who, id, status, folder: cardFolder(j), from: cardFrom(j), basis: word ? wordBasis(j) : 'запись раньше загрузки Windows', reasons: passedReasons });
-  }
-  // Незавершённые admission (постановка без публикации) и активные session-reservation продолжения.
-  try {
-    const adm = require('./job-admission'); let names;
-    try { names = fs.readdirSync(adm.dir(state)); } catch (e) { if (e.code !== 'ENOENT') throw e; names = []; }
-    for (const n of names) {
-      if (!n.endsWith('.json')) continue;
-      const rec = JSON.parse(fs.readFileSync(path.join(adm.dir(state), n), 'utf8').replace(/^﻿/, ''));
-      if (n.startsWith('session-')) { if (['active', 'recovery_required'].includes(rec.status)) blockers.push('reservation сеанса ' + (rec.jobId || '?') + ': ' + rec.status); }
-      // team-v56 Б0 п.4: пара save/commit восстановима по карточке. Незакоммиченная admission блокирует только когда её
-      // карточка НЕ опубликована; если карточка на диске есть — публикация состоялась, отставший commit не блокирует.
-      else if (rec.committed === false) {
-        const published = rec.jobId && cards.some(c => c.j && typeof c.j.id === 'string' && c.j.id === rec.jobId);
-        if (!published) blockers.push('admission поручения ' + (rec.jobId || '?') + ': постановка не завершена');
-      }
-    }
-  } catch (e) { blockers.push('ошибка проверки admission/reservation: ' + e.message); }
-  // Замки записи. (ред.5) Замок, чья карточка закрыта СЛОВОМ пользователя, не мешает — сразу в passedByCardWord. Замок при
-  // карточке, прошедшей по ПЕРЕЗАГРУЗКЕ, проверяется как брошенный (не пропускается молча). «Брошен» — владелец мёртв
-  // (alive===false) И mtime файла замка конечное > 0 И boot конечное И загрузка позже записи замка; иначе блокирует.
-  try {
-    const abandoned = (entry, mtimeMs) => ops.alive(entry.pid) === false && Number.isFinite(mtimeMs) && mtimeMs > 0 && Number.isFinite(boot) && boot > mtimeMs;
-    for (const { entry, mtimeMs } of require('./write-lock').entries(state)) {
-      const card = entry.jobId && cards.find(c => c.j && typeof c.j.id === 'string' && c.j.id === entry.jobId);
-      if (card) {
-        const word = cardWord(card.j), reboot = !word && rebootPassed(card.mtimeMs);
-        const terminal = TERMINAL_OK.includes(card.j.status), lost = card.j.status === 'lost';
-        // (ред.5) Замок, чья карточка закрыта СЛОВОМ пользователя, не мешает — сразу в passedByCardWord.
-        if (word) { passedByCardWord.push({ kind: 'lock', instance: entry.instance, jobId: entry.jobId, folder: entry.folder, basis: wordBasis(card.j), reasons: ['замок при карточке со словом пользователя ' + entry.jobId] }); continue; }
-        // Доказанно брошенный замок (владелец мёртв, запись раньше загрузки) — в passedByReboot.
-        if (abandoned(entry, mtimeMs)) { passedByReboot.push({ kind: 'lock', instance: entry.instance, jobId: entry.jobId, folder: entry.folder, basis: 'владелец мёртв, замок записан раньше загрузки', reasons: ['брошенный замок при карточке ' + entry.jobId] }); continue; }
-        // Иначе замок — отдельная причина полного списка (в т.ч. при идущей карточке): текст по виду карточки.
-        const kind = terminal ? 'терминальной' : lost ? 'потерянной (lost)' : reboot ? 'прошедшей по перезагрузке' : 'идущей';
-        blockers.push('неснятый замок записи instance ' + entry.instance + ' при ' + kind + ' карточке ' + entry.jobId + ' (' + card.j.status + '), папка ' + entry.folder + ': удержание папки');
-        continue;
-      }
-      if (abandoned(entry, mtimeMs)) { passedByReboot.push({ kind: 'lock', instance: entry.instance, jobId: entry.jobId || null, folder: entry.folder, basis: 'владелец мёртв, замок записан раньше загрузки', reasons: ['осиротевший замок брошен до перезагрузки'] }); continue; }
-      const liveness = ops.alive(entry.pid);
-      const note = liveness === false ? 'владелец мёртв' : liveness === true ? 'владелец жив, карточки нет' : 'владелец не проверяется';
-      blockers.push('осиротевший замок записи instance ' + entry.instance + (entry.jobId ? ' (поручение ' + entry.jobId + ')' : '') + ', папка ' + entry.folder + ' (' + note + ')');
-    }
-  } catch (e) { blockers.push('необъяснённый/нечитаемый замок записи: ' + e.message); }
-  return { running, blockers, passedByCardWord, passedByReboot };
+  const dj = require('./dead-jobs');
+  const g = dj.liveForGate(state, { table: deps.table, now: deps.now, stores: deps.stores, data: deps.data });
+  if (g.incomplete.length) throw Object.assign(Error(dj.incompleteLine(g.incomplete)), { code: 'GATE_INCOMPLETE', incomplete: g.incomplete });
+  return { running: g.running, blockers: g.locks, passedByCardWord: [], passedByReboot: [] };
 }
 // team-v57 (task9 п.2/5, ревью Kimi 4): единый форматтер пропущенной записи — с причинами, папкой, статусом, отправителем;
 // им печатается И показанный список (listText), И итоговое сообщение установки (deploy-ops.wordSummary).
@@ -500,14 +394,11 @@ function fmtPassed(p) {
   if (p.from && p.from !== 'не указан') tail.push('отправитель ' + p.from);
   return head + ' [' + p.basis + ']: ' + p.reasons.join(', ') + (tail.length ? ' — ' + tail.join(', ') : '');
 }
-// Полный список для показа пользователю (по каждой карточке и замку — все причины; отдельно пропущенное по слову и перезагрузке).
+// Показ пользователю: одна строка на живое поручение (участник, папка, сколько идёт, кто отправил) и на живой замок.
 function listText(b) {
-  const live = require('./live-jobs'), parts = [];
-  if (b.running.length) parts.push('идут поручения: ' + live.describe(b.running));
-  if (b.blockers.length) parts.push('удержания: ' + b.blockers.join('; '));
-  if (b.passedByCardWord.length) parts.push('пропущено по слову на карточке: ' + b.passedByCardWord.map(fmtPassed).join('; '));
-  if (b.passedByReboot.length) parts.push('пропущено по перезагрузке Windows: ' + b.passedByReboot.map(fmtPassed).join('; '));
-  return parts.join('\n') || 'удержаний не найдено';
+  const dj = require('./dead-jobs');
+  const rows = [...b.running.map(dj.line), ...b.blockers, ...b.passedByCardWord.map(fmtPassed), ...b.passedByReboot.map(fmtPassed)];
+  return rows.join('\n') || 'ничего не идёт';
 }
 // Отпечаток списка — sha256 канонической записи БЕЗ летучих полей (duration в running меняется во времени).
 // team-v57 (task9 п.2): в отпечаток входят статус running-карточки и состав пропущенных записей (участник, номер, статус,
@@ -529,7 +420,9 @@ function listHash(b) {
 function recordKey(kind, parts) { return kind + ':' + JSON.stringify(parts); }
 function recordKeys(b) {
   const keys = new Set();
-  for (const r of b.running || []) keys.add(recordKey('running', [r.who, r.id, r.status, r.folder, r.from, r.work]));
+  // install-gate-simple: идущее поручение узнаётся по участнику и номеру — смена статуса (отметка словом установки,
+  // cancelling→needs_decision) не делает его новой записью.
+  for (const r of b.running || []) keys.add(recordKey('running', [r.who, r.id]));
   for (const x of b.blockers || []) keys.add(recordKey('blocker', [x]));
   const passed = (arr, tag) => (arr || []).forEach(p => keys.add(recordKey(tag, [p.kind, p.who || null, p.id || null, p.status || null, p.instance || null, p.jobId || null, p.folder || null, p.from || null, p.basis, [...p.reasons].sort()])));
   passed(b.passedByCardWord, 'word'); passed(b.passedByReboot, 'reboot');
@@ -537,7 +430,7 @@ function recordKeys(b) {
 }
 function newRecords(fresh, approved) {
   const old = recordKeys(approved || { running: [], blockers: [], passedByCardWord: [], passedByReboot: [] }), out = [];
-  for (const r of fresh.running || []) if (!old.has(recordKey('running', [r.who, r.id, r.status, r.folder, r.from, r.work]))) out.push(r.who + ' ' + r.id + ' (' + r.status + ')');
+  for (const r of fresh.running || []) if (!old.has(recordKey('running', [r.who, r.id]))) out.push(r.who + ' ' + r.id + ' (' + r.status + ')');
   for (const x of fresh.blockers || []) if (!old.has(recordKey('blocker', [x]))) out.push(x);
   // §5.1/§5.4 (team-v58, task10 д): карточку, остановленную словом ТЕКУЩЕЙ установки (deploy-ops.markOverriddenStopped ставит
   // stopConfirmed.basis='слово установки'), НЕ считаем новой записью: она была в утверждённом списке (running/blocker), и слово
@@ -546,13 +439,11 @@ function newRecords(fresh, approved) {
   passedNew(fresh.passedByCardWord, 'word'); passedNew(fresh.passedByReboot, 'reboot');
   return out;
 }
-// team-v57 (ред.6): в начале показанного списка — предупреждение, что идущие поручения при установке будут оборваны.
-const ABORT_WARNING = '⚠ Идущие поручения при установке будут оборваны (их работа не откатывается).';
 function refusalText(b, hash, channel) {
   const how = channel === 'console'
-    ? 'Наберите слово пользователя с клавиатуры, чтобы перекрыть проверку, или завершите поручения.'
-    : 'Передайте слово пользователя (quote) с этим отпечатком (list_hash), чтобы перекрыть проверку, или завершите поручения.';
-  return 'Установка не начата:\n' + ABORT_WARNING + '\n' + listText(b) + '\nОтпечаток списка (list_hash): ' + hash + '.\n' + how;
+    ? 'Подождать или прервать? Подождать — Enter (установка отменится, запустите её позже); прервать — наберите слово пользователя.'
+    : 'Подождать или прервать? Подождать — повторить установку позже; прервать — слово пользователя (quote) с этим отпечатком (list_hash).';
+  return 'Установка не начата.\nСейчас работает (установка это оборвёт):\n' + listText(b) + '\n' + how + '\nОтпечаток списка (list_hash): ' + hash + '.';
 }
 // §5.4 (team-v58): после установки по слову карточки ПЕРЕКРЫТЫХ поручений (overriddenByWord.running и блокеры-карточки)
 // получают отметку остановки с основанием — словом установки (тот же вид отметки stopConfirmed, что ставит stop_confirm;
@@ -585,8 +476,14 @@ function markOverriddenStopped(state, w) {
 // Двухшаговый канал чата: без слова — отказ с полным списком и отпечатком; со словом и верным отпечатком — разрешение.
 // Доступ (чат участника связки, не поручение) проверяет вызывающий (team.js); здесь — только сверка списка/отпечатка/
 // непустоты слова. channel — имя клиента-участника, из чьего чата пришло слово (по умолчанию claude для совместимости).
-function deployGate(state, { quote, listHash: provided, bootAt, channel = 'claude' } = {}) {
-  const b = installationBlockers(state, { bootAt }), h = listHash(b);
+// install-gate-simple (ревью Codex п.8): предварительная проверка в Team.changeInner — ТОЛЬКО чтение. Ворота и так видят лишь
+// живое; закрытие мёртвого идёт позже, на пути установки (deploy.resolveInstallWord) — после проверок полномочий и под замком
+// операции. Неполный снимок — технический отказ одной строкой.
+function deployGate(state, { quote, listHash: provided, bootAt, channel = 'claude', table } = {}) {
+  let b;
+  try { b = installationBlockers(state, { bootAt, table }); }
+  catch (e) { if (e.code === 'GATE_INCOMPLETE') return { refusal: e.message, technical: true }; throw e; }
+  const h = listHash(b);
   if (!b.running.length && !b.blockers.length) return { ok: true, list: b, listHash: h };
   const word = typeof quote === 'string' ? quote.trim() : '';
   if (!word) return { refusal: refusalText(b, h, channel), list: b, listHash: h };
@@ -600,7 +497,7 @@ function deployGate(state, { quote, listHash: provided, bootAt, channel = 'claud
 //    running и blockers пусты (мешающего не осталось и общее слово не понадобилось);
 //  overriddenByWord { quote, channel, at, listHash, running, blockers } — ТОЛЬКО когда установка разрешена общим словом.
 async function assertNoJobs(state, opts = {}) {
-  const live = require('./live-jobs'), b = installationBlockers(state, { bootAt: opts.bootAt });
+  const b = installationBlockers(state, { bootAt: opts.bootAt, table: opts.table, stores: opts.stores });
   const hash = listHash(b), findings = b.running.length || b.blockers.length;
   const word = typeof opts.word === 'string' ? opts.word.trim() : '';
   const at = new Date().toISOString();
@@ -613,7 +510,7 @@ async function assertNoJobs(state, opts = {}) {
   }
   if (!word) {
     await write(gatePassed && { gatePassed });
-    throw Object.assign(Error('Установка не начата: идут поручения: ' + live.describe(b.running) + (b.blockers.length ? '; ' + b.blockers.join('; ') : '') + '. ' + refusalText(b, hash, opts.channel)), { listHash: hash, list: b });
+    throw Object.assign(Error(refusalText(b, hash, opts.channel)), { listHash: hash, list: b });
   }
   // team-v57 (task9 п.1, ревью Gemini 1-2/Codex 1/Kimi 2): утверждённый отпечаток идёт вместе со словом до изменяющего шага.
   // Если передан ожидаемый отпечаток и он НЕ совпал с текущим — список изменился после показа: ОТКАЗ с новым списком и
@@ -621,7 +518,7 @@ async function assertNoJobs(state, opts = {}) {
   // под замком запуска поручений (job_start), поэтому слово перекрывает только то, что видел пользователь.
   if (typeof opts.expectedHash === 'string' && opts.expectedHash && opts.expectedHash !== hash) {
     await write(gatePassed && { gatePassed });
-    throw Object.assign(Error('Установка не начата: список изменился с момента показа — слово не применено, дайте слово заново по новому списку.\n' + refusalText(b, hash, opts.channel)), { listHash: hash, list: b, stale: true });
+    throw Object.assign(Error('Слово не применено: список изменился с момента показа — дайте слово заново по новому списку.\n' + refusalText(b, hash, opts.channel)), { listHash: hash, list: b, stale: true });
   }
   const overriddenByWord = { quote: word, channel: opts.channel || null, at, listHash: hash, running: b.running, blockers: b.blockers };
   await write({ ...(gatePassed ? { gatePassed } : {}), overriddenByWord });
@@ -633,7 +530,7 @@ async function install(state, release, deps = {}) {
   // deps.bootAt — внутренняя тестовая подстановка времени загрузки (в бою не задаётся: берётся настоящее из Windows).
   const record = deps.opFile ? (patch => require('./deploy-ops').update(deps.opFile, patch)) : undefined;
   // team-v57 (task9 п.1): утверждённый отпечаток (deps.listHash) сверяется и здесь, и под замком запуска поручений в beforeHold.
-  await assertNoJobs(state, { word: deps.word, channel: deps.channel, bootAt: deps.bootAt, expectedHash: deps.listHash, record });
+  await assertNoJobs(state, { word: deps.word, channel: deps.channel, bootAt: deps.bootAt, expectedHash: deps.listHash, record, table: deps.table });
   if (!supported(release)) return null;
   const store = require('./members-store').create(state), current = store.read({ initialize: false });
   const wanted = installTarget(state, current, release), changed = wanted.rev !== current.rev;
@@ -651,7 +548,7 @@ async function install(state, release, deps = {}) {
     // hold.begin и с теми же record и ожидаемым отпечатком — это проверенный снимок до изменений. После записи holdFile и
     // recoveryFile новые поручения уже не стартуют (restart-hold.admit отказывает по pending-миграции), поэтому stopServers
     // ниже видит лишь поручения из утверждённого списка и отдельной сверки отпечатка не требует.
-    const h = await hold.begin(state, { runId: id, beforeHold: () => assertNoJobs(state, { word: deps.word, channel: deps.channel, bootAt: deps.bootAt, expectedHash: deps.listHash, record }) }, deps.hold || {});
+    const h = await hold.begin(state, { runId: id, beforeHold: () => assertNoJobs(state, { word: deps.word, channel: deps.channel, bootAt: deps.bootAt, expectedHash: deps.listHash, record, table: deps.table }) }, deps.hold || {});
     const before = proof.sourceRegistryAbsent && proof.targetRoster.rev === 0 ? proof.targetRoster : current;
     op = { id, release, before, expectedRev: current.rev, sourceRegistryAbsent: proof.sourceRegistryAbsent, sourceRegistryHash: proof.sourceRegistryHash, targetRoster: proof.targetRoster, hold: h, status: 'holding', steps: [] };
     atomic(recoveryFile(state), JSON.stringify(op));

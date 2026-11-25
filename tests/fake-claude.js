@@ -6,6 +6,8 @@
 let buf = '';
 process.stdin.on('data', (d) => (buf += d));
 process.stdin.on('end', () => {
+  // cache-622: FAKE_PROMPT_LOG — записать аргументы и вход (порядок частей, --model).
+  if (process.env.FAKE_PROMPT_LOG) require('fs').appendFileSync(process.env.FAKE_PROMPT_LOG, JSON.stringify({ argv: process.argv.slice(2), prompt: buf }) + '\n');
   if (buf.includes('HANG')) { setInterval(() => {}, 1000); return; }
   process.stdout.write(JSON.stringify({ type: 'result', result: 'ПРИНЯТО' }) + '\n');
 });

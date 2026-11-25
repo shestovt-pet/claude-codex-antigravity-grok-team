@@ -81,13 +81,20 @@ function composeLine({ state = path.join(require('./paths').stateDir, 'team'), e
     'agy-cli': agyText,
   };
   const rows = registry.active().flatMap(m => {
-    if (m.adapter !== 'claude-print') return [m.title + ' — ' + (texts[m.adapter] || 'источник квоты не подключён (А)')];
+    if (m.adapter !== 'claude-print') return [m.title + ' — ' + (markText(m) || texts[m.adapter] || 'источник квоты не подключён (А)')];
     const base = [m.title + ' Desktop (отдельно от Claude через Antigravity) — ' + texts['claude-print']];
     // team-v46: исполнитель — отдельный сеанс; в плотной строке квот подпись сокращена (полная — в заголовке «Участники»).
     if (executor) base.push('Claude-исполнитель — ' + claudeExecutorText(state));
     return base;
   });
   return 'Квоты: ' + rows.join('; ') + ' · Квота не удостоверяет модель ответа · снимок ' + new Date().toLocaleString('ru-RU');
+}
+// quota-622 (слово пользователя 23.11.2026): у DeepSeek источника квоты нет, но мост знает отказ провайдера — «на счёте нет
+// денег» (ACCOUNT_QUOTA) или «лимит исчерпан» — по отметке на карточках (quota-mark). Показываем её со временем отметки.
+// Только для DeepSeek (dsh-headless): чтение карточек одного участника, локально, без внешних процессов.
+function markText(m) {
+  if (m.adapter !== 'dsh-headless') return null;
+  try { return require('./quota-mark').statusText(require('./team-store').list(m.id, false).jobs); } catch { return null; }
 }
 async function quotaLine(opts = {}) {
   const state = opts.state || path.join(require('./paths').stateDir, 'team');
@@ -124,4 +131,4 @@ async function buildLine(opts = {}) {
   const line = composeLine(opts, snap.codexText, snap.agyText);
   return line + (advice ? '\n' + require('./quota-advice').codexAdvice(snap.c) + '\n' + require('./quota-advice').agyAdvice(snap.a, agyModel) : '');
 }
-module.exports = { quotaLine, buildLine, refreshLineCache, readExtCache, writeExtCache, externalSnapshot, claudeText, claudeExecutorText, claudeExecutorRow, resetCodexCache, codexQuotaCached };
+module.exports = { quotaLine, buildLine, composeLine, markText, refreshLineCache, readExtCache, writeExtCache, externalSnapshot, claudeText, claudeExecutorText, claudeExecutorRow, resetCodexCache, codexQuotaCached };

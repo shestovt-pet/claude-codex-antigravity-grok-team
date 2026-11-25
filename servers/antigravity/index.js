@@ -366,13 +366,8 @@ function saveJob(job) {
   replaceFileAtomicSync(cardPath(job.id), JSON.stringify(job, null, 1));
 }
 // Результат уже зафиксирован (result.txt + meta.json совпадают)? Тогда задание — готово.
-function committedMeta(id) {
-  try {
-    const meta = JSON.parse(fs.readFileSync(metaPath(id), "utf8"));
-    const t = fs.readFileSync(resultPath(id), "utf8");
-    return sha(t) === meta.hash ? meta : null;
-  } catch (e) { return null; }
-}
+// install-gate-simple: штатная проверка зафиксированного результата — общая с уборкой мёртвых поручений (common/agy-recover).
+function committedMeta(id) { return require("../../common/agy-recover").committedMeta(jobDir(id)); }
 function loadJob(id) {
   const p = cardPath(id);
   if (!fs.existsSync(p)) return null;
@@ -485,13 +480,9 @@ async function normalizeJob(job) {
         if (cur.status !== "running") return false; // пока мы решали, карточку уже обновили
         const st2 = await ownerState(cur.owner);
         if (st2 === "alive" || st2 === "unknown" || (st2 === "self" && ACTIVE.has(cur.id))) return false;
-        let meta = null, resText = null;
-        try { meta = JSON.parse(fs.readFileSync(metaPath(job.id), "utf8")); } catch (e) {}
-        try { resText = fs.readFileSync(resultPath(job.id), "utf8"); } catch (e) {}
-        if (meta && resText != null && sha(resText) === meta.hash) {
-          Object.assign(cur, { status: "done", resultHash: meta.hash, words: meta.words, warnings: meta.warnings || [], problems: [],
-            finishedAt: meta.finishedAt, durationSec: meta.durationSec, usage: meta.usage || null, provenance: meta.provenance || provenance.forJob(cur, 'antigravity'), draftStatus: "not_attempted",
-            recovered: "результат был зафиксирован, но владелец задания завершился до обновления карточки" });
+        const meta = committedMeta(job.id);
+        if (meta) {
+          Object.assign(cur, require("../../common/agy-recover").recoveredFields(meta, cur, "результат был зафиксирован, но владелец задания завершился до обновления карточки"));
         } else {
           Object.assign(cur, { status: "lost", finishedAt: nowIso(),
             problems: ["связь с владельцем задания потеряна (" + OWNER_WORDS.dead + "); подтверждённого готового результата нет"] });
@@ -705,46 +696,64 @@ function renderBlock(bl, k, lineOffset, full) {
 function numberLines(text, offset) {
   return splitLines(text).map((l, i) => (i + 1 + offset) + "| " + l).join("\n");
 }
-function buildRules(rezhim, work, opora, markers) {
-  const r = ["ПРАВИЛА ОТВЕТА:",
+function ruleParts(rezhim, work, opora, markers) {
+  // cache-622 (М1): правила ответа делятся на постоянные (зависят только от режима и наличия текста/опоры) и меняющиеся
+  // от поручения к поручению (номер редакции реестра и паузы, маски MCP из реестра, метки результата со случайным кодом).
+  // Постоянные идут в начало поручения, меняющиеся — в самый конец (кэш префикса у поставщика модели).
+  const fixed = ["ПРАВИЛА ОТВЕТА:",
     "- Не вызывай инструменты изменения файлов (write_to_file, replace_file_content и любые подобные) и не запускай команды (run_command): это запрещено. Всё нужное уже есть в поручении."];
-  r.push(require('../../common/members').rules());
-  r.push(require('../../common/agy-tools').instruction());
+  const varying = [require('../../common/members').rules(), require('../../common/agy-tools').instruction()];
   if (rezhim === "zamechaniya") {
-    r.push("- Дай только замечания по ТЕКСТУ ДЛЯ РАБОТЫ. Не переписывай текст и не возвращай исправленную версию.");
-    r.push("- Строки текста пронумерованы («12| …»); это номера строк исходного файла.");
-    r.push("- Формат каждого замечания: «Строка 12: «короткая дословная цитата» — суть замечания». Цитата — только сам текст, дословно, не длиннее 15 слов, БЕЗ префикса с номером (без «12| »). Не нумеруй замечания списком: каждое начинается прямо со слова «Строка».");
-    r.push("- Без приветствий, вступлений и заключения: сразу первое замечание.");
-    if (opora.length) r.push("- ОПОРА дана для справки: на неё можно ссылаться; короткие цитаты из неё допустимы с пометкой «(опора: имя файла)».");
+    fixed.push("- Дай только замечания по ТЕКСТУ ДЛЯ РАБОТЫ. Не переписывай текст и не возвращай исправленную версию.");
+    fixed.push("- Строки текста пронумерованы («12| …»); это номера строк исходного файла.");
+    fixed.push("- Формат каждого замечания: «Строка 12: «короткая дословная цитата» — суть замечания». Цитата — только сам текст, дословно, не длиннее 15 слов, БЕЗ префикса с номером (без «12| »). Не нумеруй замечания списком: каждое начинается прямо со слова «Строка».");
+    fixed.push("- Без приветствий, вступлений и заключения: сразу первое замечание.");
+    if (opora.length) fixed.push("- ОПОРА дана для справки: на неё можно ссылаться; короткие цитаты из неё допустимы с пометкой «(опора: имя файла)».");
   } else {
-    r.push("- Выведи результат строго между двумя служебными строками: сначала отдельной строкой (вне блоков кода) " + markers.start + ", затем сам текст, затем отдельной строкой (вне блоков кода) " + markers.end + ". Внутри меток — только сам текст: без приветствий, вступлений, пояснений, отчётов, кавычек вокруг и без markdown-обёртки ```. Всё, что окажется вне этих строк, мост отбросит — ничего нужного вне них не пиши, а сами метки никак не форматируй и в отчёте не повторяй.");
-    if (work) r.push("- Меняй в тексте только то, о чём просит поручение. Всё остальное верни дословно, строка в строку, не склеивая строки. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО писать «…остальной текст без изменений…» или как-либо сокращать текст.");
-    if (opora.length) r.push("- ОПОРА дана только для справки: не переписывай и не цитируй её в ответе.");
+    fixed.push("- Результат выведи между двумя служебными строками-метками; сами метки названы в конце поручения.");
+    if (work) fixed.push("- Меняй в тексте только то, о чём просит поручение. Всё остальное верни дословно, строка в строку, не склеивая строки. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО писать «…остальной текст без изменений…» или как-либо сокращать текст.");
+    if (opora.length) fixed.push("- ОПОРА дана только для справки: не переписывай и не цитируй её в ответе.");
+    varying.push("- Выведи результат строго между двумя служебными строками: сначала отдельной строкой (вне блоков кода) " + markers.start + ", затем сам текст, затем отдельной строкой (вне блоков кода) " + markers.end + ". Внутри меток — только сам текст: без приветствий, вступлений, пояснений, отчётов, кавычек вокруг и без markdown-обёртки ```. Всё, что окажется вне этих строк, мост отбросит — ничего нужного вне них не пиши, а сами метки никак не форматируй и в отчёте не повторяй.");
   }
-  return r.join("\n");
+  return { fixed: fixed.join("\n"), varying: ["ПРАВИЛА ОТВЕТА (окончание):", ...varying].join("\n") };
+}
+function buildRules(rezhim, work, opora, markers) {
+  const r = ruleParts(rezhim, work, opora, markers);
+  return r.fixed + "\n" + r.varying;
 }
 function workShown(rezhim, work) { return rezhim === "zamechaniya" ? numberLines(work.text, work.range ? work.range.from - 1 : 0) : work.text; }
 
-function buildInlinePrompt(poruchenie, rezhim, work, opora, markers) {
-  const parts = [poruchenie.trim(), "", buildRules(rezhim, work, opora, markers)];
+// cache-622 (М1): порядок — постоянные правила → ТЕКСТ ДЛЯ РАБОТЫ → ОПОРА → материал и вложения → поручение →
+// меняющиеся правила (реестр, маски MCP, метки результата). material — готовый блок материала (text режима text и
+// вложения files) или пусто.
+function buildInlinePrompt(poruchenie, rezhim, work, opora, markers, material) {
+  const rules = ruleParts(rezhim, work, opora, markers);
+  const parts = [rules.fixed];
   if (work) parts.push("", "=== ТЕКСТ ДЛЯ РАБОТЫ ===", workShown(rezhim, work), "=== КОНЕЦ ТЕКСТА ДЛЯ РАБОТЫ ===");
   for (const o of opora) parts.push("", "=== ОПОРА (только для справки): " + o.label + " ===", o.text, "=== КОНЕЦ ОПОРЫ ===");
+  if (material && String(material).trim()) parts.push("", String(material).trim());
+  parts.push("", "=== ПОРУЧЕНИЕ ===", poruchenie.trim(), "", rules.varying);
   return parts.join("\n");
 }
-// Файловый режим: тексты (а при длинном поручении — и оно само) лежат во временной папке.
-function buildFilePrompt(poruchenie, rezhim, work, opora, inputDir, markers) {
+// Файловый режим: тексты (а при длинном поручении — и оно само) лежат во временной папке. Строки с путями временной
+// папки (меняются от поручения к поручению) — в самом конце.
+function buildFilePrompt(poruchenie, rezhim, work, opora, inputDir, markers, material) {
   const files = [];
   if (work) { fs.writeFileSync(path.join(inputDir, work.copyName), workShown(rezhim, work), "utf8"); files.push("Текст для работы: " + path.join(inputDir, work.copyName)); }
   for (const o of opora) { fs.writeFileSync(path.join(inputDir, o.copyName), o.text, "utf8"); files.push("ОПОРА (только для справки): " + path.join(inputDir, o.copyName)); }
   const readHow = "Прочитай эти файлы инструментом просмотра файлов (view_file) по абсолютным путям. Терминал не используй.";
-  const body = [poruchenie.trim(), "", buildRules(rezhim, work, opora, markers), "", "Тексты лежат файлами. " + readHow, ...files].join("\n");
+  const rules = ruleParts(rezhim, work, opora, markers);
+  const body = [rules.fixed, ...(material && String(material).trim() ? ["", String(material).trim()] : []), "", "=== ПОРУЧЕНИЕ ===", poruchenie.trim(), "", rules.varying,
+    ...(files.length ? ["", "Тексты лежат файлами. " + readHow, ...files] : [])].join("\n");
   if (poruchenie.length <= PORUCHENIE_FILE_THRESHOLD && cmdlineLength(AGY.bin, AGY.pre.concat(["--print", body])) <= MAX_INLINE_CHARS) return { prompt: body, poruchenieFile: false };
   const pf = path.join(inputDir, "poruchenie.txt");
   fs.writeFileSync(pf, body, "utf8");
+  // cache-622 (М1): путь временной папки — последней строкой (меняется от поручения к поручению).
   const stub = ["Твоё поручение, правила ответа и тексты лежат файлами.",
-    "Сначала прочитай инструментом просмотра файлов (view_file) файл " + pf + ".",
+    "Сначала прочитай инструментом просмотра файлов (view_file) файл поручения (путь — в последней строке).",
     "Затем прочитай файлы с текстами, указанные в нём, и выполни поручение.",
-    "В финальном ответе дай ТОЛЬКО то, что требует поручение: никаких отчётов о прочитанном, вступлений, кавычек или markdown-блоков. Не вызывай инструменты записи и не запускай команды."].join("\n");
+    "В финальном ответе дай ТОЛЬКО то, что требует поручение: никаких отчётов о прочитанном, вступлений, кавычек или markdown-блоков. Не вызывай инструменты записи и не запускай команды.",
+    "Файл поручения — прочитай файл " + pf].join("\n");
   return { prompt: stub, poruchenieFile: true };
 }
 
@@ -858,7 +867,7 @@ function runAgy(args, jobId, onSpawn, cwd, stdin) {
           denied: denied && (Array.isArray(denied) ? denied.length : true) ? denied : null,
           toolCalls: obj.tool_calls || obj.toolCalls || null,
           provenanceObservation: provenance.agyObservation(raw, obj),
-          usage: obj.usage || null, json: true,
+          usage: obj.usage || null, json: true, conversationId: parsed.conversationId || (typeof obj.conversation_id === 'string' ? obj.conversation_id : null), turnUsage: parsed.turnUsage || null,
         }));
       } else resolve(Object.assign(base, { output: stripAnsi(raw), json: false }));
     };
@@ -919,6 +928,19 @@ async function requestStop(jobId, reason, opts) {
 }
 
 // ---------- выполнение задания ----------
+// cache-622 (М2/У1): расход ЭТОГО хода. Новый разговор — result.usage. Продолжение — сумма usage шагов; если её нет —
+// разность накопленного итога result.usage и итога исходного хода (usageTotal; у старых карточек без продолжения — usage);
+// если и её не вычислить — null (неизвестно), а не накопленный итог как расход хода.
+function turnUsage(card, res) {
+  if (!card.continuedFrom) return res.usage || null;
+  if (res.turnUsage) return res.turnUsage;
+  const prior = loadJob(card.continuedFrom);
+  const prev = prior && !prior.corrupt ? (prior.usageTotal || (!prior.continuedFrom ? prior.usage : null)) : null;
+  if (!res.usage || !prev || typeof prev !== 'object') return null;
+  const d = {};
+  for (const [k, v] of Object.entries(res.usage)) if (Number.isFinite(v) && Number.isFinite(prev[k]) && v >= prev[k]) d[k] = v - prev[k];
+  return Object.keys(d).length ? d : null;
+}
 async function runJob(job, args, inputDir, papkaCanon, genLock) {
   ACTIVE.add(job.id);
   try {
@@ -934,6 +956,19 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
       job.retry.args = args;
       await updateJob(job.id, c => { Object.assign(c, modelFields(selection), { modelSelectionPending: false }); c.retry.args = args; });
     }
+    // cache-622 (Б3, взгляд Kimi): продолжение разговора (--conversation) не меняет модель — ни при отложенном выборе модели
+    // (очередь гостя), ни при повторе по квоте/сбою. Если модель запуска разошлась с моделью разговора, задание не
+    // запускается: понятная ошибка, отметка «продолжено» с исходной карточки снимается (её можно продолжить заново).
+    if (job.continuedFrom && args.includes('--conversation')) {
+      const mi = args.indexOf('--model'), runModel = mi >= 0 ? args[mi + 1] : null, convModel = job.conversationModel || null;
+      if (runModel !== convModel) {
+        const why = 'Продолжение разговора Antigravity ' + job.conversationId + ' не меняет модель: разговор шёл на ' + (convModel || 'модели по умолчанию') +
+          ', запуск — на ' + (runModel || 'модели по умолчанию приложения') + '. Задание не запущено; начните новый сеанс без continue_id или дождитесь квоты модели разговора.';
+        await updateJob(job.id, c => { if (c.status !== 'running') return false; Object.assign(c, { status: 'failed', draftStatus: 'not_attempted', error: why, finishedAt: nowIso() }); c.problems = (c.problems || []).concat([why]); });
+        await updateJob(job.continuedFrom, c => { if (c.continuedBy !== job.id) return false; delete c.continuedBy; }).catch(() => {});
+        return;
+      }
+    }
     const run = async () => {
       const result = await runAgy(args, job.id, pid => { updateJob(job.id, c => { c.agyPid = pid; c.agyStartedAt = nowIso(); }).catch(() => {}); }, job.papka, job.retry?.stdin);
       await updateJob(job.id, c => { provenance.observe(c, 'antigravity', result.provenanceObservation); });
@@ -944,14 +979,14 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
     if (protocolReason && !job.protocolFallback && !shuttingDown && !fs.existsSync(cancelPath(job.id))) {
       const legacyArgs = args.filter((value, i) => value !== '--input-format' && args[i - 1] !== '--input-format');
       legacyArgs[legacyArgs.indexOf('--output-format') + 1] = 'json';
-      let prompt = buildInlinePrompt(job.poruchenie, job.rezhim, job.work, job.retry.refs || [], job.markers), fileMode = false, poruchenieFile = false;
+      let prompt = buildInlinePrompt(job.poruchenie, job.rezhim, job.work, job.retry.refs || [], job.markers, job.material), fileMode = false, poruchenieFile = false;
       if (cmdlineLength(AGY.bin, AGY.pre.concat(legacyArgs, ['--print', prompt])) > MAX_INLINE_CHARS) {
         fileMode = true;
         inputDir = path.join(INPUT_DIR, job.id);
         fs.mkdirSync(inputDir, { recursive: true });
-        const fp = buildFilePrompt(job.poruchenie, job.rezhim, job.work ? { ...job.work, copyName: "tekst_dlya_raboty.txt" } : null, job.retry.refs || [], inputDir, job.markers);
+        const fp = buildFilePrompt(job.poruchenie, job.rezhim, job.work ? { ...job.work, copyName: "tekst_dlya_raboty.txt" } : null, job.retry.refs || [], inputDir, job.markers, job.material);
         prompt = fp.prompt; poruchenieFile = fp.poruchenieFile;
-        legacyArgs.push('--add-dir', inputDir);
+        if (!legacyArgs.includes(inputDir)) legacyArgs.push('--add-dir', inputDir);
       }
       legacyArgs.push('--print', prompt);
       if (cmdlineLength(AGY.bin, AGY.pre.concat(legacyArgs)) > MAX_CMDLINE_CHARS) throw Error('Запасное поручение превышает предел командной строки.');
@@ -991,7 +1026,9 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
             return;
           }
           const plan = classified.kind === 'quota' ? quotaRetry(c, classified, snapshot, modelList) : retryPlan(c, classified);
-          Object.assign(c, plan, { usage: res.usage || null });
+          Object.assign(c, plan, { usage: turnUsage(c, res) });
+          if (res.usage) c.usageTotal = res.usage;
+          if (res.conversationId && !c.conversationId) c.conversationId = res.conversationId; // разговор есть и у неуспешного хода
           if (res.output) replaceFileAtomicSync(path.join(jobDir(c.id), 'partial.txt'), res.output);
         });
         return;
@@ -1011,7 +1048,12 @@ async function runJob(job, args, inputDir, papkaCanon, genLock) {
       const finishedAt = nowIso();
       cur.finishedAt = finishedAt;
       cur.durationSec = Math.round((Date.parse(finishedAt) - Date.parse(cur.startedAt)) / 1000);
-      cur.usage = res.usage || null;
+      // cache-622 (М2): у продолженного разговора result.usage — накопленный итог всех ходов; берём расход этого хода.
+      // cache-622 (У1): без пошагового usage — разность накопленных итогов (этого и исходного хода), иначе неизвестно.
+      cur.usage = turnUsage(cur, res);
+      if (res.usage) cur.usageTotal = res.usage; // накопленный итог разговора agy (для разности у следующего продолжения)
+      { const t = require('../../common/usage').genericTokens(cur.usage); if (t) cur.tokens = t; else delete cur.tokens; }
+      if (res.conversationId) cur.conversationId = res.conversationId; // cache-622 (М2): id разговора agy для continue_id
       cur.provenance = provenance.observe(cur, 'antigravity', res.provenanceObservation);
       delete cur.stopUnconfirmed;
       const deadlines = require('../../common/chain-deadline');
@@ -1172,6 +1214,8 @@ function register(oldName, description, schema, fn) {
       level: z.enum(['fast', 'normal', 'strong']).optional().describe('Уровень модели: fast | normal | strong; не меняет роль и права. model сильнее.'),
       // team-v63 (п.2): идемпотентный повтор — тот же request_id возвращает уже созданное задание (а не второе после перезапуска).
       request_id: z.string().optional().describe('Идентификатор запроса для идемпотентного повтора; повтор того же request_id возвращает тот же номер задания.'),
+      // cache-622 (М2): продолжение разговора agy (--conversation) по номеру своего прошлого задания.
+      continue_id: z.string().optional().describe('Номер своего прошлого задания Antigravity: продолжить тот же разговор (та же модель, роль и папка).'),
     });
   if (oldName === 'most_perenesti' || oldName === 'most_otmenit')
     inputSchema.owner = z.string().optional().describe('Запасной режим: метка сеанса дирижёра.');
@@ -1213,7 +1257,9 @@ function register(oldName, description, schema, fn) {
             context.getStore().textFile = old.fayl;
             old.rezhim = old.rezhim || 'zamechaniya';
             if (old.rezhim === 'tekst') {
-              old.poruchenie += '\nМатериал:\n' + args.text;
+              // cache-622 (М1): материал режима text — отдельным блоком ПЕРЕД поручением (не приклеен к нему в конце).
+              old.materialText = args.text;
+              old.materialFile = old.fayl; // cache-622 (Б1): путь для материала выше порога
               old.fayl = undefined;
             }
           }
@@ -1330,7 +1376,7 @@ register(
     model: z.string().optional().describe("Модель: код или имя из antigravity_status, например gemini-3.1-pro-high. Не указывай — модель по умолчанию."),
     rezhim: z.enum(["pravka", "zamechaniya", "tekst"]).optional().describe("edit (по умолчанию при file), review (нужен file), text (по умолчанию без file)."),
   },
-  async ({ papka_proekta, poruchenie, fayl, stroki, opora, model, rezhim, files, level, request_id }) => {
+  async ({ papka_proekta, poruchenie, fayl, stroki, opora, model, rezhim, files, level, request_id, materialText, materialFile, continue_id }) => {
     if (shuttingDown) return fail("мост останавливается");
     if (!access.guest()) { const gate = restartHold.admit(STATE_DIR, restartServer, { early: true }); if (!gate.ok) return restartRefusal(gate); }
     if (!AGY) return fail("agy не найден.");
@@ -1365,7 +1411,16 @@ register(
     const _attFolder = papka_proekta || (fayl ? path.dirname(path.resolve(fayl)) : null);
     try { attachData = _att.read(files, { authorize: _att.guestAuthorizer({ guest: access.guest() && !access.chatSession(), folder: _attFolder, fullAccess: false }) }); }
     catch (e) { return fail(errText(e)); }
-    if (attachData) poruchenie = poruchenie.trim() + '\n\n' + require('../../common/attachments').NOTE + attachData.text;
+    // cache-622 (М1): материал режима text и вложения — отдельным блоком перед поручением (не приклеены к нему).
+    // cache-622 (Б1): материал — по общему порогу (prompt-order.inlineLimit): выше порога — «Материал в файле: <путь>» на том
+    // же месте; файл кладётся во временную папку задания (INPUT_DIR/<id>), которую agy открывает через --add-dir.
+    const attachPart = attachData ? require('../../common/attachments').NOTE + attachData.text : '';
+    const materialLarge = typeof materialText === 'string' && materialText.length > require('../../common/prompt-order').inlineLimit();
+    const materialBlock = file => [typeof materialText === 'string'
+      ? require('../../common/prompt-order').material({ textFile: file || '(материал вклеивается текстом)' }, { readFile: () => materialText }).lines.join('\n') + (materialLarge ? '\nПрочитай его инструментом просмотра файлов (view_file) по абсолютному пути. Терминал не используй.' : '')
+      : '', attachPart].filter(Boolean).join('\n\n');
+    let agyMaterial = materialLarge ? null : materialBlock(null); // выше порога — после выбора id задания (путь файла)
+    const classifyMaterial = [typeof materialText === 'string' ? 'Материал:\n' + materialText : '', attachPart].filter(Boolean).join('\n\n');
     // team-v60: папка проекта необязательна. Новый текст без файла — служебная папка (тот же scratch-folder, что у codex/
     // deepseek/kimi); edit/review с файлом без папки — папка файла.
     if (!papka_proekta || !String(papka_proekta).trim()) {
@@ -1380,15 +1435,46 @@ register(
     const papka = path.resolve(papka_proekta);
     const draftPath = path.join(papka, DRAFT_NAME);
 
+    // cache-622 (М2): продолжение разговора Antigravity (agy --conversation <id>; живая проба agy 1.5.15 23.11.2026 — второй
+    // ход помнит первый, id разговора тот же). id захвачен из потока прошлого поручения (conversationId в карточке).
+    // Проверки — как у других адаптеров: тот же автор, родитель и владелец, завершённая карточка, та же роль, та же папка,
+    // та же модель (продолжение модель не меняет), не продолжено ранее. Права у Antigravity не меняются (на диск он не пишет).
+    let priorConv = null;
+    if (continue_id !== undefined && continue_id !== null) {
+      const cid = String(continue_id);
+      if (!/^[A-Za-z0-9_-]{6,80}$/.test(cid)) return fail("некорректный номер продолжаемого поручения (continue_id)");
+      const prior = loadJob(cid);
+      if (!prior || prior.corrupt) return fail("продолжение недоступно: нет карточки Antigravity " + cid);
+      const callerArgs = context.getStore()?.args || {};
+      if ((prior.from || null) !== (reqFrom || null)) return fail("продолжение доступно только автору исходного поручения Antigravity");
+      if ((prior.parentJob || null) !== (require('../../common/job-chain').fields(callerArgs).parentJob || null)) return fail("продолжение доступно только тому же родительскому поручению (parentJob)");
+      if ((prior.ownerLabel || null) !== (callerArgs.owner || null)) return fail("продолжение доступно только тому же владельцу (owner)");
+      // cache-622 (Б5, взгляд DeepSeek): допустимые статусы — как у codex/deepseek/kimi: завершённая карточка (done/applied у
+      // Antigravity, а также failed — неуспешный ход тоже оставляет разговор agy), без неподтверждённой остановки и без
+      // закрытия словом пользователя. Идущие (running/queued/waiting_quota), отменённые и потерянные — нет.
+      if (prior.closedByWord) return fail("поручение закрыто словом пользователя; продолжение недоступно");
+      if (!["done", "applied", "failed"].includes(prior.status)) return fail("продолжение недоступно: исходное поручение " + cid + " не завершено (статус " + prior.status + ")");
+      if (prior.stopUnconfirmed) return fail("продолжение недоступно: остановка исходного поручения " + cid + " не подтверждена");
+      if (!prior.conversationId) return fail("продолжение недоступно: у исходного поручения нет id разговора agy (не захвачен из вывода)");
+      if (prior.continuedBy) return fail("это поручение уже продолжено (" + prior.continuedBy + "); продолжайте последнее в цепочке");
+      // cache-622 (У4): обрыв между сохранением карточки-продолжения и отметкой continuedBy — карточка с continuedFrom уже
+      // есть; повторно продолжать нельзя (как у Kimi, team-v56 И9).
+      { const other = listJobs().find(x => x.continuedFrom === cid); if (other) return fail("это поручение уже продолжено (" + other.id + ", отметка на исходном не успела записаться); продолжайте последнее в цепочке"); }
+      if ((prior.role || null) !== (callerArgs.role || null)) return fail("сохраните роль исходного продолжаемого поручения");
+      if (!prior.papkaCanon || prior.papkaCanon !== papkaCanon) return fail("сохраните папку проекта исходного продолжаемого поручения");
+      if (!prior.modelId) return fail("продолжение недоступно: у исходного поручения не записана модель");
+      priorConv = prior;
+    }
+
     // team-v59 ч4: если модель не названа — её выбирает мост по классу задачи (common/model-choice); у Antigravity уровень
     // вшит в id модели. Выбор доходит до реального запуска (--model), а не остаётся моделью по умолчанию приложения: для
     // чата-гостя он сохраняется в requestedModel и resolveModel подхватывает его при старте (modelSelectionPending).
     const mc = require('../../common/model-choice');
     const agyRole = context.getStore()?.args?.role;
     const modelNamed = model !== undefined && model !== null;
-    const modelChoice = mc.choose('antigravity', { task: poruchenie, rezhim, fayl, opora, role: agyRole, level });
-    if (!modelNamed) model = modelChoice.model;
-    let modelChoiceLine = mc.line('antigravity', modelChoice, modelNamed, model);
+    const modelChoice = mc.choose('antigravity', { task: classifyMaterial ? poruchenie + '\n\n' + classifyMaterial : poruchenie, rezhim, fayl, opora, role: agyRole, level }); // класс — по поручению вместе с материалом, как прежде
+    if (!modelNamed) model = priorConv ? priorConv.modelId : modelChoice.model;
+    let modelChoiceLine = priorConv && !modelNamed ? 'модель и уровень: ' + priorConv.modelId + ' — продолжение разговора ' + priorConv.id : mc.line('antigravity', modelChoice, modelNamed, model);
 
     let m = access.guest() ? { id: model || null } : await resolveModel(model);
     // team-v63 (п.б): выбранной мостом модели ревью кода (neon-low) нет в списке аккаунта — откат на прежний выбор
@@ -1401,6 +1487,7 @@ register(
     // приложения (слово вызывающего так не теряется: при названной модели ошибка остаётся отказом, как прежде).
     if (m.error && !modelNamed) { model = null; m = access.guest() ? { id: null } : await resolveModel(null); modelChoiceLine += ' (модель моста недоступна в аккаунте — модель по умолчанию приложения)'; }
     if (m.error) return fail(m.error);
+    if (priorConv && (m.id || null) !== priorConv.modelId) return fail('продолжение не меняет модель: исходное поручение шло на ' + priorConv.modelId + ', запрошена ' + (m.id || 'модель по умолчанию приложения') + '. Начните новый сеанс без continue_id.');
 
     let work = null;
     try {
@@ -1449,12 +1536,21 @@ register(
     const markers = rezhim === "zamechaniya" ? null : makeMarkers();
     const baseArgs = [];
     if (m.id) baseArgs.push("--model", m.id);
+    if (priorConv) baseArgs.push("--conversation", priorConv.conversationId); // cache-622 (М2)
     // team-v48e «нет срока» (§2.6): --print-timeout больше не передаётся (тумблеры MOST_PRINT_TIMEOUT/MOST_WATCHDOG_MS удалены;
     // agy без флага ждёт завершения хода).
     baseArgs.push("--output-format", STREAM_INPUT ? "stream-json" : "json");
     if (STREAM_INPUT) baseArgs.push("--input-format", "stream-json");
     let stdin;
     try {
+      if (materialLarge) {
+        inputDir = path.join(INPUT_DIR, id);
+        fs.mkdirSync(inputDir, { recursive: true });
+        const materialPath = path.join(inputDir, 'material.txt');
+        fs.writeFileSync(materialPath, materialText, 'utf8');
+        baseArgs.push('--add-dir', inputDir);
+        agyMaterial = materialBlock(materialPath);
+      }
       const stageArgs = context.getStore()?.args;
       if (stageArgs) {
         stageArgs.model = m.id;
@@ -1464,28 +1560,29 @@ register(
         if (stageArgs.work && !stageArgs.role) stageArgs.role = 'совет';
         const originalTask = stageArgs.task || '';
         await require('../../common/stage-gate').prepareJob(stageArgs, 'antigravity');
-        // poruchenie уже содержит материал режима text; добавляем только замечания замены.
+        // материал режима text и вложения идут отдельным блоком (agyMaterial); добавляем только замечания замены.
         if (stageArgs.task !== originalTask) poruchenie += stageArgs.task.slice(originalTask.length);
       }
-      prompt = buildInlinePrompt(poruchenie, rezhim, work, opList, markers);
-      if (STREAM_INPUT) prompt = agyInput.INLINE_NOTICE + '\n' + prompt;
+      prompt = buildInlinePrompt(poruchenie, rezhim, work, opList, markers, agyMaterial);
+      // cache-622 (Б1): материал выше порога лежит файлом — пометка «всё приложено» была бы неправдой.
+      if (STREAM_INPUT) prompt = (materialLarge ? agyInput.FILE_MATERIAL_NOTICE : agyInput.INLINE_NOTICE) + '\n' + prompt;
       const event = agyInput.userEvent(prompt);
       if (STREAM_INPUT) stdin = event;
       if (!STREAM_INPUT && cmdlineLength(AGY.bin, AGY.pre.concat(baseArgs, ["--print", prompt])) > MAX_INLINE_CHARS) {
         fileMode = true;
         inputDir = path.join(INPUT_DIR, id);
         fs.mkdirSync(inputDir, { recursive: true });
-        const fp = buildFilePrompt(poruchenie, rezhim, work, opList, inputDir, markers);
+        const fp = buildFilePrompt(poruchenie, rezhim, work, opList, inputDir, markers, agyMaterial);
         prompt = fp.prompt; poruchenieFile = fp.poruchenieFile;
       }
-      const args0 = STREAM_INPUT ? baseArgs : baseArgs.concat(fileMode ? ["--add-dir", inputDir] : [], ["--print", prompt]);
+      const args0 = STREAM_INPUT ? baseArgs : baseArgs.concat(fileMode && !baseArgs.includes(inputDir) ? ["--add-dir", inputDir] : [], ["--print", prompt]);
       if (cmdlineLength(AGY.bin, AGY.pre.concat(args0)) > MAX_CMDLINE_CHARS) throw new Error("поручение слишком длинное даже после выноса текстов в файлы");
     } catch (e) {
       await lock.release();
       if (inputDir) { try { keepRm(inputDir, { recursive: true, force: true }); } catch (e2) {} }
       return fail(errText(e));
     }
-    const args = STREAM_INPUT ? baseArgs : baseArgs.concat(fileMode ? ["--add-dir", inputDir] : [], ["--print", prompt]);
+    const args = STREAM_INPUT ? baseArgs : baseArgs.concat(fileMode && !baseArgs.includes(inputDir) ? ["--add-dir", inputDir] : [], ["--print", prompt]);
 
     const chainFields = require('../../common/job-chain').fields(context.getStore()?.args);
     const dl = require('../../common/chain-deadline').applyDeadline(chainFields, access.client(), 'antigravity');
@@ -1497,7 +1594,8 @@ register(
       work: work ? { path: work.path, range: work.range, fileHash: work.fileHash, bom: work.bom, text: work.text } : null,
       ...modelFields(m), modelSelectionPending: access.guest(), requestedModel: model || null, modelChoiceLine, modelByBridge: !modelNamed,
       fileMode, poruchenieFile, promptChars: prompt.length, markers,
-      poruchenie, task: context.getStore()?.args.scopeTask ?? poruchenie,
+      ...(priorConv ? { continuedFrom: priorConv.id, conversationId: priorConv.conversationId, conversationModel: priorConv.modelId } : {}),
+      poruchenie, material: agyMaterial || undefined, task: context.getStore()?.args.scopeTask ?? poruchenie,
       owner: { instance: INSTANCE, pid: process.pid, startedAt: STARTED_AT },
       ...(request_id ? { requestId: request_id } : {}), // team-v63 (п.2): идемпотентный ключ на карточке
       ...(dl.deadline ? { deadline: dl.deadline } : {}),
@@ -1514,6 +1612,21 @@ register(
       if (inputDir) { try { keepRm(inputDir, { recursive: true, force: true }); } catch (e2) {} }
       return e.restartHold ? restartRefusal({ reason: e.message }) : fail("не удалось сохранить карточку задания: " + errText(e));
     }
+    // cache-622 (М2, У4 по взгляду DeepSeek): отметка «продолжено» на исходной карточке — ПОСЛЕ успешного сохранения новой
+    // карточки, атомарно под замком исходной. Сбой сохранения не оставляет висячей отметки; обрыв между сохранением и
+    // отметкой ловит проверка continuedFrom выше. Проигравший гонку (отметку уже поставил другой) не запускается: его
+    // карточка — failed без continuedFrom (чтобы не блокировать цепочку).
+    if (priorConv) {
+      let taken = false;
+      try { await updateJob(priorConv.id, c => { if (c.continuedBy && c.continuedBy !== id) return false; c.continuedBy = id; taken = true; }); } catch (e) { taken = false; }
+      if (!taken) {
+        const why = 'это поручение уже продолжено другим заданием; продолжайте последнее в цепочке';
+        await updateJob(id, c => { Object.assign(c, { status: 'failed', draftStatus: 'not_attempted', error: why, finishedAt: nowIso(), continueRefused: c.continuedFrom }); delete c.continuedFrom; }).catch(() => {});
+        await lock.release();
+        if (inputDir) { try { keepRm(inputDir, { recursive: true, force: true }); } catch (e2) {} }
+        return fail(why);
+      }
+    }
     log("задание " + id + " запущено: режим " + rezhim + ", модель " + job.model + ", " +
       (work ? (work.range ? "строки " + work.range.from + "–" + work.range.to : "весь файл") : "новый текст") +
       (fileMode ? ", текст файлами" + (poruchenieFile ? " (и поручение)" : "") : "") + ", опор: " + opList.length);
@@ -1524,6 +1637,7 @@ register(
       "Задание " + id + (access.guest() ? " в очереди. Режим: " : " запущено. Режим: ") + modeNames[rezhim] + ".",
       access.guest() ? access.queued : "",
       modelChoiceLine,
+      priorConv ? 'Продолжение разговора Antigravity ' + priorConv.conversationId + ' (поручение ' + priorConv.id + ').' : '',
       "Модель: " + job.model + (job.modelWarning ? " — " + job.modelWarning : ""),
       work ? "Исходник: " + work.path + (work.range ? ", строки " + work.range.from + "–" + work.range.to : ", весь файл") : "Новый текст.",
       fileMode ? "Текст длинный: Antigravity получит его файлами во временной папке" + (poruchenieFile ? " (поручение — тоже файлом)" : "") + "." : "Текст передан прямо в поручении.",

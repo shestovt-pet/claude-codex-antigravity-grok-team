@@ -53,6 +53,8 @@ const CODEX_ASTRA = 'gpt-6.2-astra';
 const DEEPSEEK_FLASH = 'deepseek-flash';
 const DEEPSEEK_PRO = 'deepseek-v4-pro';
 const KIMI_MODEL = require('./kimi-launch').DEFAULT;
+// cache-622 (М4): Claude-исполнитель — псевдоним модели Claude Code CLI (--model sonnet). null — без флага (модель аккаунта).
+const CLAUDE_FAST = 'sonnet';
 
 // Таблица: участник → класс → { model, effort }. У Antigravity уровень в id модели, у DeepSeek отдельного effort нет.
 const TABLE = {
@@ -86,16 +88,27 @@ const TABLE = {
     simple:      { model: DEEPSEEK_FLASH },
     read:        { model: DEEPSEEK_FLASH },
     review:      { model: DEEPSEEK_FLASH },
-    review_high: { model: DEEPSEEK_FLASH },
+    review_high: { model: DEEPSEEK_PRO },   // cache-622: проверка высокого уровня и голос по изменению связки — v4-pro
     text:        { model: DEEPSEEK_FLASH },
     write:       { model: DEEPSEEK_FLASH },
     run:         { model: DEEPSEEK_FLASH },
+  },
+  // cache-622 (М4): simple и read — sonnet; прочие классы — модель аккаунта (без флага --model), как прежде.
+  claude: {
+    simple:      { model: CLAUDE_FAST },
+    read:        { model: CLAUDE_FAST },
+    advice:      {},
+    review:      {},
+    review_high: {},
+    text:        {},
+    write:       {},
+    run:         {},
   },
   kimi: {
     simple:      { model: KIMI_MODEL, effort: 'low' },
     read:        { model: KIMI_MODEL, effort: 'low' },
     advice:      { model: KIMI_MODEL, effort: 'high' },
-    review:      { model: KIMI_MODEL, effort: 'max' },
+    review:      { model: KIMI_MODEL, effort: 'high' },   // cache-622: обычная проверка и голос — high (слово владельца 23.11.2026)
     review_high: { model: KIMI_MODEL, effort: 'max' },
     text:        { model: KIMI_MODEL, effort: 'high' },
     write:       { model: KIMI_MODEL, effort: 'high' },
@@ -122,6 +135,11 @@ const LEVELS = {
     normal: { model: DEEPSEEK_FLASH },
     strong: { model: DEEPSEEK_PRO },
   },
+  claude: {
+    fast: { model: CLAUDE_FAST },
+    normal: {},
+    strong: {},
+  },
   kimi: {
     fast: { model: KIMI_MODEL, effort: 'low' },
     normal: { model: KIMI_MODEL, effort: 'high' },
@@ -143,6 +161,10 @@ function isHigh(a) {
   return false;
 }
 
+// Голос по изменению связки: changeReview заполняет сервер по карточке team_change (поле change у Codex, Kimi и DeepSeek; common/change-review). Для вызовов без
+// поля распознаём метку изменения (#xxxxxxxx) и хеш коммита в тексте задачи.
+function changeVote(a, task) { return !!(a.changeReview || /#[a-f0-9]{8}\b/i.test(task) && /\b(?:[a-f0-9]{12}|[a-f0-9]{40}|[a-f0-9]{64})\b/i.test(task)); }
+
 // Класс задачи по признакам поручения (без участия вызывающего). a — аргументы *_send (у Antigravity поля иные: poruchenie/rezhim/fayl/opora).
 function classify(participant, a = {}) {
   const role = a.role;
@@ -161,10 +183,15 @@ function classify(participant, a = {}) {
   if (role === 'проверка' || mode === 'zamechaniya') {
     if (participant === 'codex') {
       // changeReview заполняет сервер по карточке team_change. Для старых вызовов распознаём метку и хеш в тексте.
-      if (high || a.changeReview || /#[a-f0-9]{8}\b/i.test(task) && /\b(?:[a-f0-9]{12}|[a-f0-9]{40}|[a-f0-9]{64})\b/i.test(task)) return 'review_high';
+      if (high || changeVote(a, task)) return 'review_high';
       const files = Array.isArray(a.files) ? a.files.map(f => typeof f === 'string' ? f : f?.path) : [];
       return codeReview(a) || files.some(f => CODE_FILE.test(String(f || ''))) ? 'review_code' : 'review';
     }
+    // cache-622 (уровни, слово владельца 23.11.2026): у Kimi и DeepSeek review_high — только проверка высокого уровня (этап
+    // «высокий», кандидат замены) и голос по изменению связки (карточка team_change или метка #xxxxxxxx с хешем в задаче),
+    // как у Codex. Ревью кода у них — обычная проверка (review), а не review_high: иначе любая проверка .js уходила бы на
+    // max/v4-pro. У Antigravity прежнее правило (код → review_high → review_code).
+    if (participant === 'kimi' || participant === 'deepseek') return (high || changeVote(a, task)) ? 'review_high' : 'review';
     return (high || codeReview(a)) ? 'review_high' : 'review';
   }
   // team-v59 (DeepSeek №1): режим pravka у Antigravity — правка СОДЕРЖИМОГО файла; это запись, сильная конфигурация (write),
@@ -209,7 +236,7 @@ function line(participant, chosen, named = chosen.named, namedModel, namedEffort
     const what = [namedModel, namedEffort].filter(Boolean).join(' ') || 'по поручению';
     return 'модель и уровень: ' + what + ' — названо в поручении';
   }
-  const what = [chosen.model, chosen.effort].filter(Boolean).join(' ') || 'по умолчанию участника';
+  const what = [chosen.model, chosen.effort].filter(Boolean).join(' ') || (participant === 'claude' ? 'модель аккаунта' : 'по умолчанию участника');
   if (chosen.byLevel) return 'модель и уровень: ' + what + ' — уровень задан поручением (' + chosen.level + ')';
   return 'модель и уровень: ' + what + ' — выбрал мост (класс: ' + chosen.class + ')';
 }

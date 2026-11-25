@@ -48,11 +48,47 @@ T('Codex — чтение, запись кода, запуск программ,
   for (const [args, cls, model, effort] of cases) assert.deepEqual(pick(mc.choose('codex', args)), { class: cls, model, effort });
 });
 
-T('Kimi — чтение low, совет с материалом high, проверка max', () => {
+T('Kimi — чтение low, совет с материалом high, проверка high, проверка высокого уровня max (cache-622)', () => {
   const material = { role: 'совет', files: ['report.md'] };
   assert.equal(mc.choose('kimi', { ...material, task: 'Прочитай отчёт' }).effort, 'low');
   assert.equal(mc.choose('kimi', { ...material, task: 'Предложи правки' }).effort, 'high');
-  assert.equal(mc.choose('kimi', { ...material, role: 'проверка', task: 'Оцени отчёт' }).effort, 'max');
+  assert.equal(mc.choose('kimi', { ...material, role: 'проверка', task: 'Оцени отчёт' }).effort, 'high');
+  // cache-622: ревью кода у Kimi — обычная проверка (high); max — этап «высокий», кандидат замены, голос по изменению связки.
+  assert.deepEqual([mc.choose('kimi', { role: 'проверка', task: 'проверь патч', file: 'x.js' }).class, mc.choose('kimi', { role: 'проверка', task: 'проверь патч', file: 'x.js' }).effort], ['review', 'high']);
+  assert.equal(mc.choose('kimi', { role: 'проверка', task: 'x', stageLevel: 'высокий' }).effort, 'max');
+  assert.equal(mc.choose('kimi', { role: 'проверка', task: 'Голос #a1234567 ' + 'b'.repeat(40) }).effort, 'max');
+  assert.equal(mc.choose('kimi', { role: 'проверка', task: 'x', replaces: { who: 'codex', reason: 'r' } }).effort, 'max');
+  assert.equal(mc.choose('kimi', { role: 'совет', task: 'x', level: 'strong' }).effort, 'max');
+});
+
+T('cache-622: DeepSeek — review_high на deepseek-v4-pro, обычная проверка и код — flash; level=strong — v4-pro', () => {
+  const ds = a => { const c = mc.choose('deepseek', a); return [c.class, c.model]; };
+  assert.deepEqual(ds({ role: 'проверка', task: 'оцени ответ' }), ['review', 'deepseek-flash']);
+  assert.deepEqual(ds({ role: 'проверка', task: 'проверь патч', file: 'x.js' }), ['review', 'deepseek-flash']);
+  assert.deepEqual(ds({ role: 'проверка', task: 'x', stageLevel: 'высокий' }), ['review_high', 'deepseek-v4-pro']);
+  assert.deepEqual(ds({ role: 'проверка', task: 'Голос #a1234567 ' + 'b'.repeat(40) }), ['review_high', 'deepseek-v4-pro']);
+  assert.deepEqual(ds({ role: 'совет', task: 'x', level: 'strong' }), ['уровень strong', 'deepseek-v4-pro']);
+  assert.deepEqual(ds({ role: 'совет', task: 'x', level: 'normal' }), ['уровень normal', 'deepseek-flash']);
+});
+
+T('cache-622 (М4): Claude-исполнитель — simple/read и level=fast → sonnet; прочее — модель аккаунта; model сильнее', () => {
+  const cl = a => { const c = mc.choose('claude', a); return [c.class, c.model]; };
+  assert.deepEqual(cl({ task: 'сколько будет 2+2' }), ['simple', 'sonnet']);
+  assert.deepEqual(cl({ role: 'совет', task: 'перескажи', text: 'материал' }), ['read', 'sonnet']);
+  assert.deepEqual(cl({ role: 'проверка', task: 'проверь', text: 'материал' }), ['review', null]);
+  assert.deepEqual(cl({ role: 'текст', task: 'напиши абзац' }), ['text', null]);
+  assert.deepEqual(cl({ role: 'совет', task: 'x', write: true }), ['write', null]);
+  assert.deepEqual(cl({ role: 'совет', task: 'x', level: 'fast' }), ['уровень fast', 'sonnet']);
+  assert.deepEqual(cl({ role: 'совет', task: 'x', level: 'normal' }), ['уровень normal', null]);
+  assert.deepEqual(cl({ role: 'совет', task: 'x', level: 'strong' }), ['уровень strong', null]);
+  assert.equal(mc.choose('claude', { task: '2+2', model: 'opus' }).named, true);
+  assert.match(mc.line('claude', mc.choose('claude', { task: '2+2' })), /модель и уровень: sonnet — выбрал мост \(класс: simple\)/);
+  assert.match(mc.line('claude', mc.choose('claude', { task: 'x', level: 'strong' })), /модель и уровень: модель аккаунта — уровень задан поручением \(strong\)/);
+  const args = require('../common/claude-args');
+  const files = { mcpConfig: require('path').join(require('os').tmpdir(), 'нет-такого-' + Date.now() + '.json'), settings: 's.json' };
+  const withModel = args.buildArgs(files, {}, { model: 'sonnet' }, '');
+  assert.deepEqual(withModel.slice(withModel.indexOf('--model'), withModel.indexOf('--model') + 2), ['--model', 'sonnet']);
+  assert.equal(args.buildArgs(files, {}, {}, '').includes('--model'), false, 'без модели — флага нет (модель аккаунта)');
 });
 
 // (2b) team-v59 (DeepSeek №1): правка СОДЕРЖИМОГО файла (rezhim=pravka) — класс write (hydrogen-high), а не дешёвое чтение.

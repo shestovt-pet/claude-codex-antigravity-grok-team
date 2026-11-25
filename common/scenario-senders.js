@@ -67,7 +67,9 @@ function findCard(stateDir, member, rid, jobId) {
 }
 
 // Текстовый ответ без карточки: отметка лимита (quota-mark) отвечает waiting_quota БЕЗ карточки — это «обход по лимиту».
+// quota-622: отказ отметки «на счёте нет денег» — 'balance' (недоступность участника, не провал игрока).
 function statusFromText(text, isError) {
+  if (/нет денег/i.test(text || '')) return 'balance';
   if (/Лимит .* исчерпан|waiting_quota|повторите после сброса/i.test(text || '')) return 'quota';
   return isError ? 'failed' : 'failed';
 }
@@ -117,7 +119,7 @@ function senderRunner(stateDir, S, opts = {}) {
     return p;
   }
 
-  async function start({ key, member, role, level, task, files, continueId, timeout_sec, requestId, resuming, notStopped }) {
+  async function start({ key, member, role, level, task, files, continueId, timeout_sec, requestId, resuming, notStopped, force }) {
     const rid = requestId || ('sc-' + S.id + '-' + randomUUID().slice(0, 8));
     const handle = member + ':' + rid;
     const args = { folder: S.folder, task, request_id: rid };
@@ -125,6 +127,8 @@ function senderRunner(stateDir, S, opts = {}) {
     if (level) args.level = level;
     if (files && files.length) args.files = files;
     if (continueId) args.continue_id = continueId;
+    // quota-622: resume сценария, вставшего на паузу «нет денег», — слово пользователя: отметку обходим одной попыткой.
+    if (force === true) args.force = true;
     if (Number.isFinite(timeout_sec) && timeout_sec > 0) args.timeout_sec = timeout_sec;
     const rec = { member, rid, key, settled: false, resuming: !!resuming };
     inflight.set(handle, rec);
@@ -157,7 +161,9 @@ function senderRunner(stateDir, S, opts = {}) {
     patchOrigin(stateDir, member, card, S, key);
     const map = { done: 'done', applied: 'done', waiting_quota: 'quota', cancelled: 'cancelled',
       cancelling: 'cancelled', cancel_requested: 'cancelled', stop_unconfirmed: 'cancelled' };
-    const status = map[card.status] || (card.status === 'needs_decision' ? 'done' : 'failed');
+    // quota-622: карточка «на счёте нет денег» (errorKind/quotaReason 'balance') — недоступность участника, а не провал.
+    const status = (card.quotaReason === 'balance' || card.errorKind === 'balance') && card.status !== 'done' ? 'balance'
+      : map[card.status] || (card.status === 'needs_decision' ? 'done' : 'failed');
     // team-v63 (п.2): результат участника. У большинства — card.resultFile; у Antigravity его в карточке нет, а результат
     // лежит комплектом <member-jobs>/<id>/result.txt. Читаем и его.
     let text, resultFile = card.resultFile;

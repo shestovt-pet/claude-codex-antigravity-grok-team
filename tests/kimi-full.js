@@ -203,6 +203,135 @@ const tests = [
     assert(!obs.argv.includes('--agent-file'), 'продолжение не передаёт профиль');
     assert(fs.existsSync(path.join(cont.executionFolder, 'run-' + cont.id)), 'материал продолжения в отдельной поддиректории');
   }],
+  ['cache-622 (М1): порядок входа Kimi — шапка → материал → вложения → задача → карта копий (меняющееся в конце)', async () => {
+    const folder = freshFolder('order-read');
+    fs.writeFileSync(path.join(folder, 'вложение.txt'), 'ВЛОЖЕНИЕ-К');
+    const { r, j } = await run('FAKE:read-session ЗАДАЧА-К', { role: 'совет', folder, text: 'МАТЕРИАЛ-К', files: [path.join(folder, 'вложение.txt')] });
+    assert(!r.isError, h.text(r)); assert.equal(j.status, 'done', j.error);
+    const input = fs.readFileSync(j.inputFile, 'utf8');
+    const at = s => { const i = input.indexOf(s); assert(i >= 0, 'нет «' + s + '» во входе'); return i; };
+    const order = [at('Отдельное поручение. Только чтение'), at('Обнаружение, не запрет'), at('Материал:\nМАТЕРИАЛ-К'), at('ВЛОЖЕНИЕ-К'), at('Поручение:\nFAKE:read-session ЗАДАЧА-К'), at('Карта оригинал → копия:')];
+    assert.deepEqual(order, [...order].sort((a, b) => a - b), 'порядок частей: ' + order.join(', '));
+    assert(at('Карта оригинал → копия:') > at('ЗАДАЧА-К'), 'карта копий (служебная папка поручения) — после задачи');
+    assert(!/вердикт ревью — последняя строка\.\s*$/.test(input), 'напоминания «что ответить» в конце нет');
+    assert(at('вердикт ревью — последняя строка') < at('МАТЕРИАЛ-К'), 'напоминание об ответе — в постоянной шапке');
+    // Шапка одинакова у двух поручений с разной задачей и материалом (общий префикс до материала).
+    const { j: j2 } = await run('FAKE:read-session ДРУГАЯ', { role: 'совет', folder, text: 'ИНОЙ' });
+    const input2 = fs.readFileSync(j2.inputFile, 'utf8');
+    const prefix = input.slice(0, at('Материал:'));
+    assert(input2.startsWith(prefix), 'префикс до материала совпадает у разных поручений');
+  }],
+  ['cache-622 (М1): писатель Kimi — целевые пути после задачи', async () => {
+    f.roles({ writer: true });
+    const folder = freshFolder('order-write');
+    const { r, j } = await run('FAKE:write ЗАДАЧА-П', { role: 'текст', write: true, folder, text: 'МАТЕРИАЛ-П' });
+    assert(!r.isError, h.text(r)); assert.equal(j.status, 'done', j.error);
+    const input = fs.readFileSync(j.inputFile, 'utf8');
+    const order = ['Отдельное поручение с правом записи', 'Материал:\nМАТЕРИАЛ-П', 'Поручение:\nFAKE:write ЗАДАЧА-П', 'Целевые пути (абсолютные):'].map(s => input.indexOf(s));
+    assert(order.every(i => i >= 0) && order.every((v, i) => !i || v > order[i - 1]), 'порядок: ' + order.join(', '));
+  }],
+  ['cache-622 (М5): продолжение держит уровень исходного сеанса; другой effort — новый сеанс с пояснением', async () => {
+    const folder = freshFolder('effort-cont');
+    const { j: prior } = await run('FAKE:read-session', { role: 'совет', folder, effort: 'max' });
+    assert.equal(prior.status, 'done', prior.error); assert.equal(prior.effort, 'max');
+    // Без явного уровня: класс нового хода дал бы low («простой» короткий вопрос), но продолжение держит max.
+    const { r, j: cont } = await run('FAKE:read-session', { role: 'совет', folder, continue_id: prior.id });
+    assert(!r.isError, h.text(r)); assert.equal(cont.status, 'done', cont.error);
+    assert.equal(cont.previous, prior.id); assert.equal(cont.effort, 'max');
+    const obs = JSON.parse(fs.readFileSync(path.join(cont.tempFolder, 'observed.json')));
+    assert.equal(obs.effort, 'max', 'CLI получил уровень исходного сеанса'); assert(obs.argv.includes('--session'));
+    assert.match(cont.modelChoiceLine, /продолжение сеанса .*уровень исходного сеанса/);
+    // Тот же явный уровень — продолжение.
+    const { j: same } = await run('FAKE:read-session', { role: 'совет', folder, continue_id: cont.id, effort: 'max' });
+    assert.equal(same.previous, cont.id); assert.equal(same.effort, 'max');
+    // Другой явный уровень — новый сеанс, пояснение в ответе.
+    const { r: r2, j: fresh } = await run('FAKE:read-session', { role: 'совет', folder, continue_id: same.id, effort: 'low' });
+    assert(!r2.isError, h.text(r2)); assert.equal(fresh.status, 'done', fresh.error);
+    assert.equal(fresh.previous, null, 'новый сеанс, не продолжение'); assert.equal(fresh.effort, 'low');
+    assert.match(h.text(r2), /Продолжение .* не выполнено: исходный сеанс шёл с уровнем рассуждения max, запрошен low — начат новый сеанс/);
+    const obs2 = JSON.parse(fs.readFileSync(path.join(fresh.tempFolder, 'observed.json')));
+    assert(!obs2.argv.includes('--session'), 'новый сеанс без --session'); assert.equal(obs2.effort, 'low');
+    assert.equal(h.cards(f).find(x => x.id === same.id).continuedBy, undefined, 'исходная карточка не помечена продолженной');
+    // level, дающий другой уровень, — тоже новый сеанс.
+    const { r: r3, j: byLevel } = await run('FAKE:read-session', { role: 'совет', folder, continue_id: same.id, level: 'fast' });
+    assert.equal(byLevel.previous, null); assert.match(h.text(r3), /запрошен low — начат новый сеанс/);
+  }],
+  ['cache-622 (Б4): чужой/недопустимый continue_id с другим уровнем — отказ, а не новый сеанс; свой — новый сеанс с пометкой', async () => {
+    const folder = freshFolder('effort-foreign');
+    // Чужой владелец (owner) исходного сеанса.
+    const { j: foreign } = await run('FAKE:read-session', { role: 'совет', folder, effort: 'max', owner: 'чужой-сеанс' });
+    assert.equal(foreign.status, 'done', foreign.error);
+    const before = h.cards(f).length;
+    const bad = await c.callTool({ name: 'kimi_send', arguments: { folder, task: 'FAKE:read-session', role: 'совет', continue_id: foreign.id, effort: 'low' } });
+    assert(bad.isError, h.text(bad)); assert.match(h.text(bad), /тому же владельцу/); assert.doesNotMatch(h.text(bad), /начат новый сеанс/);
+    assert.equal(h.cards(f).length, before, 'карточка не создана');
+    // Другая роль (недопустимое продолжение) с другим уровнем — тоже отказ.
+    const badRole = await c.callTool({ name: 'kimi_send', arguments: { folder, task: 'FAKE:read-session', role: 'текст', continue_id: foreign.id, effort: 'low', owner: 'чужой-сеанс' } });
+    assert(badRole.isError, h.text(badRole)); assert.match(h.text(badRole), /Сохраните роль/);
+    // Уже продолженный — отказ даже при другом уровне.
+    const { j: cont } = await run('FAKE:read-session', { role: 'совет', folder, continue_id: foreign.id, owner: 'чужой-сеанс' });
+    assert.equal(cont.previous, foreign.id);
+    const twice = await c.callTool({ name: 'kimi_send', arguments: { folder, task: 'FAKE:read-session', role: 'совет', continue_id: foreign.id, effort: 'low', owner: 'чужой-сеанс' } });
+    assert(twice.isError, h.text(twice)); assert.match(h.text(twice), /уже продолжено/);
+    // Свой допустимый сеанс с другим уровнем — новый сеанс с пометкой (уровень своего сеанса).
+    const { r: ok, j: fresh } = await run('FAKE:read-session', { role: 'совет', folder, continue_id: cont.id, effort: 'low', owner: 'чужой-сеанс' });
+    assert(!ok.isError, h.text(ok)); assert.equal(fresh.previous, null); assert.match(h.text(ok), /уровнем рассуждения max, запрошен low — начат новый сеанс/);
+  }],
+  ['cache-622 (Б1): порог материала Kimi — 300 000 знаков текстом, 300 001 — путём к копии в служебной папке (порядок частей тот же)', async () => {
+    const folder = freshFolder('inline-limit');
+    for (const [n, inline] of [[300000, true], [300001, false]]) {
+      const big = 'я'.repeat(n - 1) + 'Ж';
+      const { r, j } = await run('FAKE:read-session ЗАДАЧА-ПОРОГ', { role: 'совет', folder, text: big });
+      assert(!r.isError, h.text(r)); assert.equal(j.status, 'done', j.error);
+      const input = fs.readFileSync(j.inputFile, 'utf8');
+      const at = s => { const i = input.indexOf(s); assert(i >= 0, n + ': нет «' + s + '»'); return i; };
+      if (inline) {
+        assert(input.includes(big), n + ': материал вклеен текстом'); assert(!input.includes('Материал в файле:'));
+        assert(at('Материал:\n') < at('Поручение:\nFAKE:read-session ЗАДАЧА-ПОРОГ'));
+      } else {
+        assert(!input.includes(big), n + ': материал не вклеен');
+        const m = /Материал в файле: (.+)/.exec(input); assert(m, 'строка пути');
+        assert.equal(path.dirname(m[1].trim()), j.executionFolder, 'путь — в служебной папке поручения (cwd Kimi)');
+        assert.equal(fs.readFileSync(m[1].trim(), 'utf8'), big, 'копия материала доступна CLI');
+        assert(at('Отдельное поручение. Только чтение') < at('Материал в файле:') && at('Материал в файле:') < at('Поручение:\nFAKE:read-session ЗАДАЧА-ПОРОГ') && at('Поручение:') < at('Карта оригинал → копия:'), 'порядок частей');
+        assert.equal(j.readOnlyCheck.status, 'passed', 'копия материала не считается изменением служебной папки');
+      }
+    }
+  }],
+  ['cache-622 (Б2): поле change у kimi_send — карточка team_change даёт changeReview и review_high (max); требования как у Codex', async () => {
+    const changeReview = { name: 'kimi-vote', base: 'a'.repeat(40), candidate: 'b'.repeat(40) };
+    const changeFile = path.join(f.state, 'changes', changeReview.name + '.json');
+    fs.mkdirSync(path.dirname(changeFile), { recursive: true });
+    fs.writeFileSync(changeFile, JSON.stringify({ ...changeReview, status: 'кандидат' }));
+    const { r, j } = await run('FAKE:success Дай оценку этому изменению', { role: 'проверка', change: changeReview.name });
+    assert(!r.isError, h.text(r)); assert.deepEqual(j.changeReview, changeReview);
+    assert.equal(j.effort, 'max', 'голос по изменению — review_high'); assert.match(j.modelChoiceLine, /review_high/);
+    // Без поля и без метки в тексте — обычная проверка (high).
+    const { j: plain } = await run('FAKE:success Дай оценку этому изменению', { role: 'проверка' });
+    assert.equal(plain.effort, 'high'); assert.equal(plain.changeReview, undefined);
+    for (const [extra, re] of [[{ change: 'missing' }, /не найдено/], [{ role: 'совет' }, /допустим для нового поручения Kimi/]]) {
+      const bad = await c.callTool({ name: 'kimi_send', arguments: { folder: f.folder, task: 'FAKE:success', role: 'проверка', change: changeReview.name, ...extra } });
+      assert(bad.isError, JSON.stringify(extra)); assert.match(h.text(bad), re);
+    }
+    fs.writeFileSync(changeFile, JSON.stringify({ ...changeReview, status: 'закрыто без слияния' }));
+    const closed = await c.callTool({ name: 'kimi_send', arguments: { folder: f.folder, task: 'FAKE:success', role: 'проверка', change: changeReview.name } });
+    assert(closed.isError); assert.match(h.text(closed), /открытая карточка/);
+  }],
+  ['cache-622 (М3): токены Kimi — из журнала сеанса CLI (wire.jsonl, последний ход), tokens_in/tokens_cached/tokens_out', async () => {
+    const home = path.join(f.root, 'kimi-code-home'), sessionDir = path.join(home, 'sessions', 'wd_x', 'read_fixture');
+    fs.mkdirSync(path.join(sessionDir, 'agents', 'main'), { recursive: true });
+    fs.writeFileSync(path.join(home, 'session_index.jsonl'), JSON.stringify({ sessionId: 'read_fixture', sessionDir, workDir: 'x' }) + '\n');
+    fs.writeFileSync(path.join(sessionDir, 'agents', 'main', 'wire.jsonl'), [
+      { type: 'turn.prompt' }, { type: 'usage.record', usage: { inputOther: 999, output: 9, inputCacheCreation: 0 } },
+      { type: 'turn.prompt' }, { type: 'usage.record', usage: { inputOther: 2595, output: 115, inputCacheCreation: 0 } },
+      { type: 'token_counting.measured', tokens: 17946 }, { type: 'usage.record', usage: { inputOther: 15223, output: 163, inputCacheRead: 2560, inputCacheCreation: 0 } },
+    ].map(e => JSON.stringify(e)).join('\n') + '\n');
+    await c.close(); c = await h.client(f, 'claude', { MOST_KIMI_CODE_HOME: home });
+    const { j } = await run('FAKE:read-session', { role: 'совет', folder: freshFolder('tokens') });
+    assert.equal(j.status, 'done', j.error);
+    assert.deepEqual(j.tokens, { tokens_in: 2595 + 15223 + 2560, tokens_cached: 2560, tokens_out: 115 + 163 }, 'только последний ход');
+    await c.close(); c = await h.client(f);
+  }],
   ['recovery_required (А2/Б0): оборванный commit перехода вершины блокирует продолжение до восстановления', async () => {
     await c.close(); c = await h.client(f, 'claude', { MOST_FAKE_STOP_FAULT: 'continue-commit' });
     f.roles({ writer: true });

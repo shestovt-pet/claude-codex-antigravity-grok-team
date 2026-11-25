@@ -296,7 +296,8 @@ test('Пауза: обе сводки и уборка видят останов�
   const owner = require('../common/work-owner');
   assert(owner.hasLiveJobs(c.j.work)); assert(cleanup.liveJobsInFolder(f.project).some(s => s.includes(c.id)));
   let compact = await summary.compact(team, '', undefined, { budget: 100000 });
-  assert(compact.includes(c.id.slice(0, 8))); assert.match(compact, /остановка не подтверждена у/);
+  // install-gate-simple: процессы карточек мертвы — мёртвое в краткой сводке не показывается ни строкой, ни счётчиком.
+  assert(!compact.includes(c.id.slice(0, 8))); assert.doesNotMatch(compact, /остановка не подтверждена у/);
   let full = await team.status(undefined, undefined, false, true); assert.match(full, /visible-v42-card/);
   await stop({ job_ids: [c.id, decision.id] });
   compact = await summary.compact(team, '', undefined, { budget: 100000 });
@@ -318,6 +319,9 @@ for (const status of ['queued', 'waiting_quota', 'needs_decision', 'delivery_unc
     assert(full.includes(c.id));
     const compact = await summary.compact(team, '', undefined, { budget: 100000 });
     if (status === 'waiting_quota') assert.match(compact, /Ждут квоту/);
+    // install-gate-simple: delivery_unclear с мёртвыми процессами — мёртвое, в краткой сводке не показывается; очередь,
+    // needs_decision моложе суток и migration_conflict (ревью Codex п.5: только вручную) — показываются.
+    else if (status === 'delivery_unclear') assert(!compact.includes(c.id.slice(0, 8)));
     else assert(compact.includes(c.id.slice(0, 8)));
     const from = full.indexOf(' · поручение ' + c.id.slice(0, 8) + ' ·');
     assert(from >= 0);
@@ -403,12 +407,11 @@ test('Claim без записи переводит мёртвое поручен
   } finally { pause(); }
 });
 
-test('Старые вычисляемые needs_decision и lost сворачиваются по вычисленному состоянию', async () => {
+test('Старые мёртвые running/cancelling (процессы мертвы, старше суток) в краткой сводке не показываются и не считаются (install-gate-simple)', async () => {
   const jobs = ['running', 'cancelling'].flatMap(status => [true, false].map(write => card({ status, write, startedAt: '2001-01-01T00:00:00Z' }, 'codex', 'old-' + status + '-' + write + '-v42')));
   const compact = await summary.compact(team, '', undefined, { budget: 100000 });
   for (const c of jobs) assert(!compact.includes(c.id.slice(0, 8)));
-  assert.match(compact, /нужно решение по .*поручениям старше суток/);
-  assert.match(compact, /остановка не подтверждена у .*поручений старше суток/);
+  assert(!compact.split('\n').some(l => /old-(running|cancelling)/.test(l)));
 });
 const yaml = '# вне блока: сохранить  \n# most:begin (правит team_change deploy)\n' +
   '- insert:\n    - id: session-log-deepseek\n      name: logger\n      config:\n        text: "перенос \\\n          строки"\n    - id: mcp-most-team\n      name: old\n      config:\n        serverName: team\n        args: [old]\n' +
@@ -637,7 +640,9 @@ test('v55: папка без card.json, содержимое=' + nonempty + ', �
   if (nonempty) f.write(path.join(dir, 'result.txt'), 'сохранённый файл');
   const c = flat ? card({}, 'codex', id) : card();
   for (const strictStores of [false, true]) assert.equal(live.cards({ stateDir: state, strictStores }).filter(c => c.j.id === id).length, flat ? 1 : 0);
-  assert((await live.running({ stateDir: state })).some(r => r.id === c.id.slice(0, 8)));
+  // install-gate-simple: процесс карточки мёртв — перезапуск/установку она не держит (номер плоской карточки уникален;
+  // у карточки по умолчанию префикс v42-0000 общий с живыми карточками других проверок — её не сверяем).
+  if (flat) assert(!(await live.running({ stateDir: state })).some(r => r.id === c.id.slice(0, 8)));
   assert.match(await stop({ job_ids: [c.id] }), /снято/); if (nonempty) assert.equal(fs.readFileSync(path.join(dir, 'result.txt'), 'utf8'), 'сохранённый файл');
 });
 test('v55: битая/неверная card.json, EACCES и ENOENT плоской карточки остаются ошибками', async () => {

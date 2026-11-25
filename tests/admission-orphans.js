@@ -146,8 +146,9 @@ const tests = [
     // Чужая завершённая постановка (committed) другого поручения — её не трогаем.
     const a2 = await adm.reserve({ state: st, adapter: 'codex-cli', principal: 'chat:codex', requestId: 'r-keep', hash: h1, newJobId: 'keep-job' });
     adm.commit(st, a2.admissionId);
-    // Барьер блокируется незавершённой постановкой.
-    assert(migration.installationBlockers(st).blockers.some(x => x.includes('orph-job') && x.includes('постановка не завершена')), 'незавершённая постановка блокирует');
+    // install-gate-simple (24.11.2026): ворота установки видят только живые процессы — незавершённая постановка без процесса
+    // установку не держит и не выводится.
+    { const b = migration.installationBlockers(st); assert(!b.running.length && !b.blockers.length, 'незавершённая постановка ворота не держит: ' + JSON.stringify(b)); }
     // Отзыв по jobId снимает admission и reservation осиротевшего поручения; чужую committed-запись сохраняет.
     const revoked = adm.revokeByJob(st, 'orph-job').removed;
     assert(revoked.length >= 2, 'сняты admission и reservation: ' + revoked.join(','));

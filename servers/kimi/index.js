@@ -70,6 +70,7 @@ function view(j, offset = 0) {
   let body = j.error || '';
   if (j.status === 'queued') body = access.queued;
   if (j.modelChoiceLine) body += '\n' + j.modelChoiceLine; // team-v59 ч4: строка выбора модели — в карточке и ответе
+  if (j.continueNote) body += '\n' + j.continueNote; // cache-622 (М5): продолжение заменено новым сеансом
   // team-v60: исчерпание подписочной квоты видно одной строкой с временем (пока не было успешного поручения Kimi).
   if (j.retryKind === 'quota' && j.lastQuotaAt) body += '\nЛимит Kimi исчерпан с ' + new Date(j.lastQuotaAt).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) + '; сброс — когда 5-часовое окно закончится.';
   body += '\nЗапрошено: ' + (j.requestedModel || j.model || launch.DEFAULT) + '; передано CLI: ' + (j.modelArgumentConfirmed ? j.launchModel : 'не подтверждено') + '; модель провайдером не подтверждена (requested_only).';
@@ -158,6 +159,8 @@ async function execute(job) {
       if (Number.isFinite(c.chars_out)) c.sessionCharsOut = (c.sessionCharsOut || 0) + c.chars_out;
       c.errorKind = parsed.errorKind || (error ? 'unknown' : null); c.diagnostic = stderr.replace(/[A-Z]:\\[^\r\n]*/gi, '[локальный путь]').slice(-6000);
       if (parsed.session) c.sessionId = parsed.session;
+      // cache-622 (М3): токены Kimi — из журнала сеанса CLI (wire.jsonl, события usage.record последнего хода); поток их не несёт.
+      try { const t = require('../../common/usage').kimiTokens(parsed.session || c.sessionId); if (t) c.tokens = t; } catch {}
       if (check) { if (c.write) c.writeCheck = { ...c.writeCheck, ...check }; else c.readOnlyCheck = { ...c.readOnlyCheck, ...check }; }
       c.voteEligible = false;
       // team-v56 А3: учёт исходящих. Делегации идут через существующий job-chain дочерними карточками с parentJob=этого
@@ -393,11 +396,13 @@ function resolveContinuation(a, { write, fullAccess, from, folder, parentJob, ow
 }
 async function send(a) {
   const refusal = launch.refusal(a); if (refusal) throw Error(refusal);
+  // cache-622 (Б2): голос по изменению связки — поле change, карточка team_change (те же требования, что у Codex).
+  a.changeReview = require('../../common/change-review').resolve(a, stateDir, 'Kimi');
   // team-v63 (п.5): действующая отметка «лимит исчерпан» (меньше 10 минут, без позднего успеха) — не запускаем CLI; force — всегда.
   // team-v63 (п.19): продолжение (continue_id) при свежей отметке — тот же быстрый отказ (кроме force).
   if (a.force !== true && !access.guest()) {
     const qm = require('../../common/quota-mark').blocked(list());
-    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('Kimi', qm.at), 'Дождитесь сброса или передайте force: true.');
+    if (qm.blocked) return reply({ status: 'waiting_quota' }, require('../../common/quota-mark').refusalText('Kimi', qm.at, qm.kind), qm.kind === 'balance' ? 'Пополните счёт и передайте force: true.' : 'Дождитесь сброса или передайте force: true.');
   }
   // team-v63 (п.1/п.20): вложения мост читает сейчас (отказ на нечитаемом файле — до постановки). Текст вложений НЕ вклеивается
   // в a.task/job.task (как у codex/deepseek): он уходит в отдельный файл (.attach.txt) и подмешивается на этапе сборки input
@@ -405,11 +410,12 @@ async function send(a) {
   const _att = require('../../common/attachments');
   const attachData = _att.read(a.files, { authorize: _att.guestAuthorizer({ guest: access.guest() && !access.chatSession(), folder: a.folder, fullAccess: a.full_access === true || a.fullAccess === true }) }); // team-v63 (п.16)
   const mc = require('../../common/model-choice');
-  const choice = mc.choose('kimi', { ...a, model: undefined, effort: undefined });
+  // cache-622 (М5/Б4): класс задачи — по аргументам вызова, как прежде (до дополнения материала опорой и ворот этапа);
+  // модель и уровень выбираются ниже, после полной проверки продолжения.
+  const chooseArgs = { ...a, model: undefined, effort: undefined };
   const modelNamed = a.model !== undefined || a.effort !== undefined;
-  const effort = a.effort ?? choice.effort;
-  a.model = launch.model(a.model ?? choice.model); access.guard('kimi', 'kimi_send', a);
-  const modelChoiceLine = mc.line('kimi', choice, modelNamed, a.model, effort);
+  if (a.model !== undefined) launch.model(a.model);
+  access.guard('kimi', 'kimi_send', a);
   if (closing) throw Error('Сервер останавливается.');
   // team-v59 (часть 3 п.3в): роль «совет»/«текст» без записи и «проверка» text — папка необязательна (служебная пустая).
   require('../../common/scratch-folder').ensure(a);
@@ -428,11 +434,34 @@ async function send(a) {
   const write = a.write === true, fullAccess = a.full_access === true || a.fullAccess === true;
   const folder = fs.realpathSync(a.folder);
   const from = require('../../common/job-identity').memberId(access.client()) || access.client();
+  // cache-622 (М5, Б4 по взгляду DeepSeek): продолжение держит уровень рассуждения ИСХОДНОГО сеанса (иначе
+  // KIMI_MODEL_THINKING_EFFORT брался бы из класса нового хода). Явно запрошенный другой уровень (effort или level) —
+  // не продолжение: новый сеанс с пометкой в ответе. Но сначала ПОЛНАЯ проверка продолжения (resolveContinuation: автор,
+  // родитель, владелец, статус, остановка, «уже продолжено», роль, права, папка, CLI): чужой, незавершённый или уже
+  // продолженный continue_id получает отказ, как прежде, а не тихо превращается в новый сеанс (и чужой уровень в пометку
+  // не попадает). Тот же или не названный уровень — продолжение; resolveContinuation ниже, после дедупа request_id.
+  let contPrior = null, continueNote = null;
+  if (a.continue_id) {
+    let seen = null; try { seen = load(a.continue_id); } catch { seen = null; }
+    const lvl = mc.levelOf(a);
+    const asked = a.effort !== undefined ? a.effort : lvl ? mc.LEVELS.kimi[lvl].effort : undefined;
+    if (seen && asked !== undefined && asked !== (seen.effort ?? null)) {
+      const own = resolveContinuation(a, { write, fullAccess, from, folder, parentJob: chain.parentJob, owner: a.owner }).prior;
+      continueNote = 'Продолжение ' + a.continue_id + ' не выполнено: исходный сеанс шёл с уровнем рассуждения ' + (own.effort ?? 'по умолчанию CLI') + ', запрошен ' + asked + ' — начат новый сеанс (память прежнего сеанса не передана).';
+      delete a.continue_id; delete chooseArgs.continue_id;
+    } else contPrior = seen; // свой ли он — проверит resolveContinuation до публикации карточки
+  }
+  const choice = mc.choose('kimi', chooseArgs);
+  const effort = contPrior ? (contPrior.effort ?? undefined) : (a.effort ?? choice.effort);
+  a.model = launch.model(a.model ?? (contPrior?.model || choice.model));
+  const modelChoiceLine = contPrior && !modelNamed
+    ? 'модель и уровень: ' + [a.model, effort].filter(Boolean).join(' ') + ' — продолжение сеанса ' + contPrior.id + ' (уровень исходного сеанса)'
+    : mc.line('kimi', choice, modelNamed, a.model, effort);
   // team-v56 А2 (ревью Codex №4): явное продолжение собственного сеанса (continue_id) разрешается ПОСЛЕ проверки request_id
   // (ниже), иначе идемпотентный повтор уже принятого продолжения из needs_decision упирался бы в «уже продолжено» вместо
   // возврата прежнего jobId. Поля продолжения дописываются в job после дедупа; reservation и передача вершины цепочки —
   // под общей короткой секцией. previous=null у нового сеанса.
-  const job = { id, folder, requestedFolder: a.folder, task: a.task, model: a.model, effort, requestedModel: a.model, modelChoiceLine, write, fullAccess, previous: null,
+  const job = { id, folder, requestedFolder: a.folder, task: a.task, model: a.model, effort, requestedModel: a.model, modelChoiceLine, ...(a.changeReview ? { changeReview: a.changeReview } : {}), ...(continueNote ? { continueNote } : {}), write, fullAccess, previous: null,
     role: a.role, work: a.work, workLabel: a.workLabel, workUnbound: a.workUnbound, stage: a.stage, stageId: a.stageId, stageTitle: a.stageTitle, scopeTask: a.scopeTask, gateOrder: a.gateOrder, replaces: a.replaces, replacementEvidence: a.replacementEvidence,
     from, ...chain, ownerLabel: a.owner, owner: null,
     status: 'queued', startedAt: new Date().toISOString(), rev: require('../../common/members').rev(), ...(dl.deadline ? { deadline: dl.deadline } : {}) };
@@ -462,6 +491,7 @@ async function send(a) {
       ['replaces', a.replaces], ['replacementEvidence', a.replacementEvidence], ['owner', a.owner], ['level', a.level],
       ['continue_id', a.continue_id], ['parentJob', chain.parentJob], ['deadline', dl.deadline], ['opora', a.opora]];
     if (a.effort !== undefined) values.push(['effort', a.effort]);
+    if (a.changeReview) values.push(['change', a.changeReview]);
     const r = await adm.begin({ adapter: 'kimi-cli', access, requestId: a.request_id, values, newJobId: id });
     job.requestId = r.requestId; job.admissionId = r.admissionId;
     if (r.duplicate) {
@@ -594,7 +624,7 @@ async function start(testOptions = {}) {
   }
   register('kimi_send', 'Поручить Kimi: чтение/проверка, запись write=true, программы full_access=true по профилю; продолжение своего сеанса continue_id; совет/текст может сам давать поручения Codex/DeepSeek и спрашивать дирижёра (MCP проекта), «проверка» — только чтение без делегирования', { folder: z.string().optional(), ...require('../../common/stage-schema').send, task: z.string().min(1), text: z.string().optional(),
     files: z.array(z.union([z.string(), z.object({ path: z.string(), lines: z.string().optional() })])).optional(), level: z.enum(['fast', 'normal', 'strong']).optional(), force: z.boolean().optional(),
-    model: z.string().optional(), effort: z.enum(['low', 'high', 'max']).optional(), write: z.boolean().default(false), full_access: z.boolean().default(false), continue_id: z.string().optional(), owner: z.string().optional(), work: z.string().optional(), stage: z.string().optional(), request_id: z.string().optional() }, send);
+    model: z.string().optional(), effort: z.enum(['low', 'high', 'max']).optional(), write: z.boolean().default(false), full_access: z.boolean().default(false), continue_id: z.string().optional(), change: z.string().optional().describe('Имя открытого изменения из team_change для нового поручения с ролью «проверка», без записи.'), owner: z.string().optional(), work: z.string().optional(), stage: z.string().optional(), request_id: z.string().optional() }, send);
   register('kimi_result', 'Результат Kimi', { id: z.string(), wait_sec: z.number().int().min(0).max(40).default(0), from_char: z.number().int().min(0).default(0) }, async a => {
     const end = Date.now() + a.wait_sec * 1000; let j = await normalized(a.id);
     while (['queued', 'running', 'cancelling'].includes(j.status) && Date.now() < end) { await sleep(100); j = await normalized(a.id); }

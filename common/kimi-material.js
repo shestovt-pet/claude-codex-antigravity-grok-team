@@ -103,6 +103,17 @@ function writeMcp(folder, mcp) {
   }
   return require('./kimi-mcp').write(folder, mcp);
 }
+// cache-622 (Б1): материал — по общему порогу (prompt-order.inlineLimit, MOST_INLINE_MATERIAL_CHARS, 300 000 знаков):
+// до порога текстом, выше — строкой «Материал в файле: <путь>» на том же месте. Путь — копия в служебной папке поручения
+// (cwd Kimi), доступная CLI; файл пишется ДО снимка executionBefore, поэтому сверка копий его не считает новым.
+function materialPart(job, folder) {
+  if (!job.textFile) return [];
+  const text = fs.readFileSync(job.textFile, 'utf8');
+  const copyPath = path.join(folder, 'most-kimi-material-' + job.id + '.txt');
+  const m = require('./prompt-order').material({ textFile: copyPath }, { readFile: () => text });
+  if (!m.inline) fs.writeFileSync(copyPath, text, { encoding: 'utf8', flag: 'wx' });
+  return [m.lines.join('\n')];
+}
 function prepare(job, bundle, profile, mcp) {
   // team-v59 (A4): поручение БЕЗ записи (чтение/проверка/совет/текст) НЕ берёт замок папки — несколько таких поручений Kimi
   // в одной папке идут параллельно в любом количестве. Сверка «до/после» привязана к поручению: каждое снимает материал на
@@ -122,11 +133,13 @@ function prepare(job, bundle, profile, mcp) {
       copy(before[i].snapshot, mapping[i].copy);
       if (diff(before[i].snapshot, snapshot(mapping[i].copy)).length || diff(before[i].snapshot, snapshot(covered[i])).length || JSON.stringify(before[i].git) !== JSON.stringify(git(covered[i]))) throw Error('Материал изменился при копировании.');
     }
-    const input = ['Отдельное поручение. Только чтение: не изменяй файлы и не запускай Git в копии. Обращайся к копиям материалов по карте; история и зависимости не скопированы.', NOTE,
-      'Карта оригинал → копия:\n' + JSON.stringify(mapping, null, 2), 'Поручение:\n' + job.task,
-      'Материал:\n' + (job.textFile ? fs.readFileSync(job.textFile, 'utf8') : ''),
+    // cache-622 (М1): порядок ради кэша префикса — постоянная шапка → материал → вложения → задача → меняющееся (карта
+    // копий: в путях служебная папка поручения и run-<jobId>). Напоминание об ответе — в постоянной шапке, не в конце.
+    const input = ['Отдельное поручение. Только чтение: не изменяй файлы и не запускай Git в копии. Обращайся к копиям материалов по карте (она в конце поручения); история и зависимости не скопированы. Ответ по-русски; вердикт ревью — последняя строка.', NOTE,
+      ...materialPart(job, loc.executionFolder),
       // team-v63 (п.20): вложения `files` идут из отдельного файла (.attach.txt), а НЕ вклеены в job.task — карточка не раздута.
-      ...require('./attachments').promptTail(job), 'Ответ по-русски; вердикт ревью — последняя строка.'].join('\n\n');
+      ...require('./attachments').promptTail(job), 'Поручение:\n' + job.task,
+      'Карта оригинал → копия:\n' + JSON.stringify(mapping, null, 2)].join('\n\n');
     const inputFile = path.join(loc.executionFolder, 'most-kimi-task-' + job.id + '.md'); fs.writeFileSync(inputFile, input, { encoding: 'utf8', flag: 'wx' });
     const profileFile = job.sessionCwd ? null : writeProfile(loc.executionFolder, profile);
     const mcpConfig = writeMcp(loc.executionFolder, mcp);
@@ -157,12 +170,13 @@ function prepareWrite(job, bundle, profile, mcp) {
     for (const root of covered) { const l = require('./write-lock').acquire(root, { jobId: job.id, writer: true }); if (!l.ok) throw Error('Целевая папка занята писателем или остановка прежнего дерева не подтверждена.'); held.push(l); }
     const before = covered.map(root => ({ snapshot: snapshot(root), git: git(root) }));
     fs.mkdirSync(loc.executionFolder, { recursive: true }); fs.mkdirSync(loc.tempFolder, { recursive: true });
-    const input = ['Отдельное поручение с правом записи. Правь только файлы по карте целевых путей; cwd — служебная папка моста, не проект.',
+    // cache-622 (М1): постоянная шапка → материал → вложения → задача → меняющееся (целевые пути).
+    const input = ['Отдельное поручение с правом записи. Правь только файлы по карте целевых путей (она в конце поручения); cwd — служебная папка моста, не проект. Ответ по-русски; итог — последняя строка.',
       job.fullAccess ? 'Разрешён запуск названных в поручении программ (Bash); точная программа — контракт поручения.' : 'Запуск программ (Bash) запрещён профилем.', NOTE,
-      'Целевые пути (абсолютные):\n' + JSON.stringify(covered, null, 2), 'Поручение:\n' + job.task,
-      'Материал:\n' + (job.textFile ? fs.readFileSync(job.textFile, 'utf8') : ''),
+      ...materialPart(job, loc.executionFolder),
       // team-v63 (п.20): вложения `files` из отдельного файла (.attach.txt), не вклеены в job.task.
-      ...require('./attachments').promptTail(job), 'Ответ по-русски; итог — последняя строка.'].join('\n\n');
+      ...require('./attachments').promptTail(job), 'Поручение:\n' + job.task,
+      'Целевые пути (абсолютные):\n' + JSON.stringify(covered, null, 2)].join('\n\n');
     const inputFile = path.join(loc.executionFolder, 'most-kimi-task-' + job.id + '.md'); fs.writeFileSync(inputFile, input, { encoding: 'utf8', flag: 'wx' });
     // team-v56 А2: продолжение не передаёт профиль заново (CLI запрещает --agent-file с --session); режим доступа не повышается.
     const profileFile = job.sessionCwd ? null : writeProfile(loc.executionFolder, profile);
@@ -188,4 +202,4 @@ function writeCheck(prepared, bundle) {
   return { status: errors.length ? 'unknown' : 'passed', changed, errors, manifestFile, manifestHash: sha(serialized),
     gitHeadBefore: m.before.map(s => s.git?.head || null), gitHeadAfter: after.map(s => s.git?.head || null) };
 }
-module.exports = { RULES, NOTE, binding, snapshot, git, diff, roots, locations, prepare, verify, prepareWrite, writeCheck, canonical, inside };
+module.exports = { materialPart, RULES, NOTE, binding, snapshot, git, diff, roots, locations, prepare, verify, prepareWrite, writeCheck, canonical, inside };

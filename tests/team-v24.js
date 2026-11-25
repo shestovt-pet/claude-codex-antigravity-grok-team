@@ -148,15 +148,20 @@ test('О5: Promise один на полную метку, включая одн�
   });
 });
 for (const full of [false, true]) test('О5: ' + (full ? 'полная' : 'краткая') + ' сводка проверяет только активных владельцев', async () => {
-  const f = fixture(), owner = { instance: 'owner-test', pid: 123, startedAt: 'start' };
+  // install-gate-simple: владельцы — живые процессы (номер теста и его родителя); с мёртвыми номерами поручения мёртвые и
+  // владельцев сводка не проверяет вовсе.
+  const f = fixture(), owner = { instance: 'owner-test', pid: process.pid, startedAt: 'start' };
   const ids = [job(f, 'codex', 0, { status: 'running', owner }), job(f, 'antigravity', 0, { status: 'running', owner }),
-    job(f, 'codex', 0, { status: 'running', owner: { ...owner, pid: 456 } }), job(f, 'codex', 0, { status: 'running', owner: { ...owner, startedAt: 'other' } })];
+    job(f, 'codex', 0, { status: 'running', owner: { ...owner, pid: process.ppid } }), job(f, 'codex', 0, { status: 'running', owner: { ...owner, startedAt: 'other' } })];
   job(f, 'codex', 0, { owner: { instance: 'completed-owner' } });
   try {
     await quiet(async () => {
       const calls = []; require('../common/locks').ownerState = async o => { calls.push(o); return 'alive'; };
       await new Team(root).status(undefined, undefined, false, full);
-      assert.equal(calls.length, 3); assert(!calls.some(o => o?.instance === 'completed-owner'));
+      // install-gate-simple (ревью Codex п.7): краткая сводка судит о живости по общему снимку процессов запроса — живых по
+      // нему владельцев отдельно не опрашивает; полная по-прежнему спрашивает владельца для строки «Владелец: …».
+      if (full) assert.equal(calls.length, 3); else assert(calls.length <= 3);
+      assert(!calls.some(o => o?.instance === 'completed-owner'));
     });
   } finally { ids.forEach((id, i) => update(i === 1 ? 'antigravity' : 'codex', id, { status: 'done' })); }
 });
